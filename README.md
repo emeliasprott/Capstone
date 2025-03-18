@@ -3,7 +3,7 @@
 
 I. Introduction\
 II. Data\
-    a. Legislative Information (*ca_leg*)\
+\ta. Legislative Information (*ca_leg*)\
     b. Final Histories (*pdf_parsing*)\
     c. Lobbying and Campaign Finance (*calaccess*)\
 III. NLP\
