@@ -1,0 +1,6 @@
+ca_leg/etl_data
+ca_leg/legislation_data
+pdf_parsing/*.pdf
+pdf_parsing/*.csv
+.DS_Store
+docker-compose.yml
