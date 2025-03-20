@@ -42,7 +42,7 @@ process_lob() {
 export -f process_lob
 export DB_PASSWORD DB_HOST DB_USER DB_NAME
 for YEAR in ${YEARS}; do
-    ZIP_FILE="/etl_data/batch2/pubinfo_${YEAR}.zip"
+    ZIP_FILE="/etl_data/batch3/pubinfo_${YEAR}.zip"
     echo "Processing ${ZIP_FILE}..."
     DATA_DIR="${TEMP_DIR}/pubinfo_${YEAR}"
     unzip -q "${ZIP_FILE}" -d "${DATA_DIR}"

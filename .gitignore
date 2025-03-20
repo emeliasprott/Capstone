@@ -4,3 +4,4 @@ pdf_parsing/*.pdf
 pdf_parsing/*.csv
 .DS_Store
 docker-compose.yml
+lobbying/*.csv

@@ -1,18 +1,18 @@
 
 # Decoding the California Legislative Process
 
-I. Introduction
+## I. Introduction
 
-II. Data
+## II. Data
 
-    a. Legislative Information (*ca_leg*)
+### a. Legislative Information (*ca_leg*)
 
-    b. Final Histories (*pdf_parsing*)
+### b. Final Histories (*pdf_parsing*)
 
-    c. Lobbying and Campaign Finance (*calaccess*)
+### c. Lobbying and Campaign Finance (*calaccess*)
 
-III. NLP
+## III. NLP
 
-IV. Graph Construction
+## IV. Graph Construction
 
-V. Graph-Based Temporal Neural Network
+## V. Graph-Based Temporal Neural Network
