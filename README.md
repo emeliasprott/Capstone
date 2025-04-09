@@ -7,20 +7,20 @@ This project collects, cleans, and analyzes data related to California’s legis
 
 ### Repository Structure
 
-Capstone/
-├── ca_leg/
-│   ├── etl/                    # Downloaded zip files, PDFs, unprocessed XML
-│       ├── Dockerfile          # Dockerfile for PostgreSQL container
-│       ├── run_etl.sh          # Bash script to automate SQL loading
-│       ├── save-data.ipynb     # Notebook to save SQL data as CSVs
-│       └── xml_parse.ipynb     # Notebook to parse XML into JSON
-├── pdf_parsing/
-│   ├── data-collection-2.ipynb # Notebook to collect and process PDFs
-│   └── text_cleaning.ipynb     # Notebook to clean and standardize text
-├── combining.ipynb             # Notebook to combine data from different sources
-├── eda1.html                   # Exploratory data analysis project
-├── text-modeling.ipynb         # Creating text embeddings
-├── README.md
+Capstone/\
+├── ca_leg/\
+│   ├── etl/                    # Downloaded zip files, PDFs, unprocessed XML\
+│       ├── Dockerfile          # Dockerfile for PostgreSQL container\
+│       ├── run_etl.sh          # Bash script to automate SQL loading\
+│       ├── save-data.ipynb     # Notebook to save SQL data as CSVs\
+│       └── xml_parse.ipynb     # Notebook to parse XML into JSON\
+├── pdf_parsing/\
+│   ├── data-collection-2.ipynb # Notebook to collect and process PDFs\
+│   └── text_cleaning.ipynb     # Notebook to clean and standardize text\
+├── combining.ipynb             # Notebook to combine data from different sources\
+├── eda1.html                   # Exploratory data analysis project\
+├── text-modeling.ipynb         # Creating text embeddings\
+├── README.md\
 
 ## II. Data
 
