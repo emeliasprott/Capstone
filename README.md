@@ -20,7 +20,7 @@ Capstone/\
 ├── combining.ipynb             # Notebook to combine data from different sources\
 ├── eda1.html                   # Exploratory data analysis project\
 ├── text-modeling.ipynb         # Creating text embeddings\
-├── README.md\
+├── README.md
 
 ## II. Data
 
