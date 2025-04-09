@@ -5,3 +5,10 @@ pdf_parsing/*.csv
 .DS_Store
 docker-compose.yml
 calaccess/*.csv
+pdf_parsing/Untitled*.ipnyb
+FinalHistoryPDFs
+ca_leg/.python-version
+ca_leg/.legislation_data
+bill_motions_sample.csv
+eda1.qmd
+Icon
