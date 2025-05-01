@@ -17,7 +17,6 @@ district_demographics
 embeddings_w_oop.ipynb
 digest_text.json
 digests.pt
-clever.py
 gnn_clean.pt
 gnn_data.pt
 graph-construction.py
@@ -25,3 +24,6 @@ input_dims.pkl
 meta.pkl
 node_embeddings.pt
 node_embeddings_2.pt
+*.pt
+clever.ipynb
+node_id_map.json
