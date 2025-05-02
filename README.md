@@ -34,7 +34,7 @@ The project is structured into multiple phases:
 - LeGNN.py                  # Script to create and train the GNN
 - README.md                 # Current file
 
-## II. Data
+## II. [Data](https://ca-leg-eda.my.canva.site/preliminary)
 
 ### a. Data Sources
 
@@ -77,6 +77,8 @@ The California Automated Lobbyist and Campaign Contribution and Expenditure Sear
 2. Perform NLP-based and fuzzy matching to identify relationships and unify entity names.
 3. Resolve inconsistencies using multi-dimensional relationship matching (e.g. matching based on correlated features across different datasets).
 
+#### [EDA](https://ca-leg-eda.my.canva.site)
+
 ### III. Graph Construction
 
 The graph construction phase transforms cleaned legislative data into a rich, structured network. This graph is the core representation of legislative relationships and is built to capture both procedural flow and political influence.
@@ -102,7 +104,7 @@ The graph construction phase transforms cleaned legislative data into a rich, st
   - Lobbying (lobby firm efforts)
   - Donations (campaign contributions)
 
-### GNN
+### [GNN](https://ca-leg-eda.my.canva.site/emelia-sprott)
 
 The GNN transforms the graph into a format suitable for machine learning and trains a heterogeneous GNN to produce meaningful embeddings.
 
@@ -143,4 +145,3 @@ The trained GNN produces embeddings that enable downstream legislative intellige
 - The 2011 legislative SQL archive was corrupted and could not be processed.
 - The original MSSQL schema has been adapted for PostgreSQL compatibility.
 - OCR-extracted text contains minor noise, but has been mostly resolved through post-processing.
-
