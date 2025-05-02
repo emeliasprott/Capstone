@@ -134,9 +134,10 @@ The GNN transforms the graph into a format suitable for machine learning and tra
 #### Outputs
 
 The trained GNN produces embeddings that enable downstream legislative intelligence tasks:
-    - Bill similarity search based on content and context.
-    - Stakeholder alignment analysis, revealing connections between donors, lobbyists, committees, and legislators.
-    - Policy clustering and topic exploration, allowing unsupervised discovery of major themes.
+
+- Bill similarity search based on content and context.
+- Stakeholder alignment analysis, revealing connections between donors, lobbyists, committees, and legislators.
+- Policy clustering and topic exploration, allowing unsupervised discovery of major themes.
 
 ## Analysis
 
