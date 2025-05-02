@@ -4,17 +4,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-from torch_geometric.data import HeteroData
-from torch_geometric.nn import SAGEConv, GINEConv, LEConv, RGATConv
+from torch_geometric.nn import SAGEConv, GINEConv, LEConv
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 
 hidden_dim = 256
 n_layers = 2
 dropout_p = 0.15
 device = torch.device('mps')
-
 policy_topic_embs = torch.load('policy_embeddings.pt')
 num_topics = len(policy_topic_embs)
+
+# data preprocessing
 def compute_controversiality(data):
     edge_type = ('legislator_term', 'voted_on', 'bill_version')
     if edge_type not in data.edge_index_dict:
@@ -149,17 +149,7 @@ def load_and_preprocess_data(path='data2.pt'):
 
 data = load_and_preprocess_data()
 
-class TimeEncoder(nn.Module):
-    def __init__(self, dim=16):
-        super().__init__()
-        inv = 1. / 10 ** torch.linspace(0, 4, dim // 2)
-        self.register_buffer("inv", inv)
-
-    def forward(self, t: torch.Tensor):
-        t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-        freqs = torch.einsum("..., d -> ... d", t, self.inv)
-        return torch.cat([freqs.sin(), freqs.cos()], -1)
-
+# utilities
 def _init_linear(m: nn.Linear):
     nn.init.kaiming_uniform_(m.weight, a=0.01)
     if m.bias is not None:
@@ -173,6 +163,23 @@ def sanitize(t: torch.Tensor, clamp: float = 1e4) -> torch.Tensor:
 
 def safe_mse(pred, tgt):
     return F.mse_loss(pred, tgt, reduction="mean")
+
+def scaled_cosine(a, b):
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+    return a @ b.T
+
+# encoders
+class TimeEncoder(nn.Module):
+    def __init__(self, dim=16):
+        super().__init__()
+        inv = 1. / 10 ** torch.linspace(0, 4, dim // 2)
+        self.register_buffer("inv", inv)
+
+    def forward(self, t: torch.Tensor):
+        t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+        freqs = torch.einsum("..., d -> ... d", t, self.inv)
+        return torch.cat([freqs.sin(), freqs.cos()], -1)
 
 class FeatureProjector(nn.Module):
     def __init__(self, metadata, hidden, in_dims, t_dim=16):
@@ -204,52 +211,7 @@ class FeatureProjector(nn.Module):
             result[nt] = self.projectors[nt](x)
         return result
 
-def calculate_modularity(edge_index, cluster_assignment, num_nodes):
-    row, col = edge_index
-    degree = torch.bincount(row, minlength=num_nodes).float()
-    m = max(edge_index.size(1) // 2, 1)
-    same = cluster_assignment[row] == cluster_assignment[col]
-    exp = degree[row] * degree[col] / (2.0 * m)
-    modularity = (same.float() - exp[same]).sum() / (2.0 * m)
-    return modularity
-
-class UnsupervisedTopicClustering(nn.Module):
-    def __init__(self, in_channels, num_clusters=30, dropout_p=0.15):
-        super().__init__()
-        self.num_clusters = num_clusters
-
-        self.assignment_net = nn.Sequential(
-            nn.Linear(in_channels, in_channels),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            nn.Linear(in_channels, num_clusters)
-        )
-
-    def forward(self, x, edge_index=None):
-        s = self.assignment_net(x)
-        s = F.softmax(s, dim=-1) + 1e-8
-        s = s / (s.sum(dim=-1, keepdim=True) + 1e-10)
-        device = x.device
-        loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-
-        if edge_index is not None:
-            try:
-                hard_assignment = s.argmax(dim=-1)
-                mod_loss = calculate_modularity(edge_index, hard_assignment, s.size(0))
-                if not isinstance(mod_loss, torch.Tensor):
-                    mod_loss = torch.tensor(float(mod_loss), device=device)
-                loss = -mod_loss * (s.sum() / s.size(0))
-
-            except Exception as e:
-                print(f"Error in modularity calculation: {e}")
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-        return s, loss
-    def get_clusters(self, x):
-        s = self.assignment_net(x)
-        return s.argmax(dim=-1)
-
+# attention & convolution layers
 class PolarityAwareConv(nn.Module):
     def __init__(self, hidden_dim, edge_attr_dim, dropout_p, in_channels, out_channels):
         super().__init__()
@@ -286,54 +248,49 @@ class PolarityAwareConv(nn.Module):
         gated = e * (polarity + 0.01)
         return self.gine(x_to_use, edge_index, gated)
 
-class TopicProjector(nn.Module):
-    def __init__(self, hidden, num_topics):
+class TopicClusterHead(nn.Module):
+    def __init__(self, policy_topic_embs, hidden_dim):
         super().__init__()
-        self.proj = nn.Linear(hidden, num_topics)
-    def forward(self, z):
-        return self.proj(z)
+        raw_dim = policy_topic_embs.size(-1)
 
-class AggregatedInfluenceScorer(nn.Module):
-    def __init__(self, actor_dim, bill_dim):
+        self.topic_embs = nn.Parameter(policy_topic_embs)
+        self.proj = (
+            nn.Identity() if raw_dim == hidden_dim
+            else nn.Linear(raw_dim, hidden_dim, bias=False)
+        )
+
+    def forward(self, bill_z):
+        topic_z = self.proj(self.topic_embs)
+        topic_scores = scaled_cosine(bill_z, topic_z)
+        return topic_scores
+
+class InfluenceScorer(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.proj_actor = nn.Linear(actor_dim, actor_dim)
-        self.proj_bill = nn.Linear(bill_dim, actor_dim)
-        self.scorer = nn.Linear(actor_dim, 1)
+        self.query_proj = nn.Linear(dim, dim, bias=False)
+        self.key_proj = nn.Linear(dim, dim, bias=False)
+        self.score_vec = nn.Linear(dim, 1, bias=False)
 
-    def forward(self, actor_embeddings, bill_embeddings, bill_outcomes):
-        actor_proj = self.proj_actor(actor_embeddings)
-        bill_proj = self.proj_bill(bill_embeddings)
-
-        actor_proj = actor_proj.unsqueeze(1)
-        bill_proj = bill_proj.unsqueeze(0)
-
-        affinity = torch.tanh(actor_proj + bill_proj)
-        scores = self.scorer(affinity).squeeze(-1)
-
-        weighted_scores = scores * bill_outcomes.unsqueeze(0)
-
-        influence_scores = weighted_scores.mean(dim=1)
-
-        return influence_scores
+    def forward(self, actor_z, bill_z, bill_y):
+        q = self.query_proj(actor_z)
+        k = self.key_proj(bill_z)
+        attn = torch.tanh(q.unsqueeze(1) + k.unsqueeze(0))
+        scores = self.score_vec(attn).squeeze(-1)
+        weighted = scores * bill_y.unsqueeze(0)
+        return weighted.mean(dim=1)
 
 class ContextualTopicAligner(nn.Module):
     def __init__(self, actor_dim, bill_dim, num_topics):
         super().__init__()
-        self.proj_actor = nn.Linear(actor_dim, actor_dim)
-        self.proj_bill = nn.Linear(bill_dim, actor_dim)
-        self.topic_proj = nn.Linear(actor_dim, num_topics)
+        self.proj_actor = nn.Linear(actor_dim, actor_dim, bias=False)
+        self.proj_bill  = nn.Linear(bill_dim,  actor_dim, bias=False)
+        self.topic_proj = nn.Linear(actor_dim, num_topics, bias=False)
 
     def forward(self, actor_embeddings, bill_embeddings):
-        actor_proj = self.proj_actor(actor_embeddings)
-        bill_proj = self.proj_bill(bill_embeddings)
-
-        actor_proj = actor_proj.unsqueeze(1)
-        bill_proj = bill_proj.unsqueeze(0)
-
-        fusion = torch.tanh(actor_proj + bill_proj)
-        logits = self.topic_proj(fusion)
-
-        return logits
+        a = self.proj_actor(actor_embeddings).unsqueeze(1)
+        b = self.proj_bill(bill_embeddings).unsqueeze(0)
+        fusion = torch.tanh(a + b)
+        return self.topic_proj(fusion)
 
 class PolicyTopicMatcher(nn.Module):
     def __init__(self, bill_dim, topic_embs):
@@ -347,6 +304,16 @@ class PolicyTopicMatcher(nn.Module):
         probs = F.softmax(scores, dim=-1)
         return probs
 
+class ActorTopicAligner(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query_proj = nn.Linear(dim, dim, bias=False)
+        self.key_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, actor_z, bill_z, bill_topic_prob):
+        attn_logits = scaled_cosine(self.query_proj(actor_z), self.key_proj(bill_z))
+        alpha = attn_logits.softmax(dim=1)
+        return alpha @ bill_topic_prob
 
 class LegislativeGraphEncoder(nn.Module):
     def __init__(self, num_topics, metadata, hidden_dim, num_layers, dropout, device=device):
@@ -391,25 +358,6 @@ class LegislativeGraphEncoder(nn.Module):
         self.le_conv = LEConv(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout_p)
         self.final_linear = nn.Linear(hidden_dim, hidden_dim).to(self.device)
-        self.topic_clustering = UnsupervisedTopicClustering(
-            in_channels=hidden_dim,
-            num_clusters=int(num_topics),
-            dropout_p=float(dropout_p)
-        )
-        self.influence_scorer = AggregatedInfluenceScorer(hidden_dim, hidden_dim)
-        self.contextual_topic_head = ContextualTopicAligner(hidden_dim, hidden_dim, num_topics)
-
-        self.policy_topic_matcher = PolicyTopicMatcher(hidden_dim, policy_topic_embs).to(self.device)
-
-        self.controversy_head = nn.Linear(hidden_dim, 1)
-        _init_linear(self.controversy_head)
-
-        self.affinity_proj = nn.Linear(hidden_dim, hidden_dim)
-        _init_linear(self.affinity_proj)
-
-        self.denoise_proj = nn.ModuleDict({nt: nn.Linear(hidden_dim, data[nt].x.size(-1)) for nt in data.node_types})
-        for lin in self.denoise_proj.values():
-            _init_linear(lin)
 
     def process_edges(self, x_dict, data):
         for edge_type, edge_index in data.edge_index_dict.items():
@@ -498,45 +446,42 @@ class LegislativeGraphEncoder(nn.Module):
         x_dict = self.process_edges(x_dict, batch)
         x_dict = self.apply_normalization(x_dict)
 
-        bill_emb = x_dict['bill']
-        bill_outcomes = torch.from_numpy(np.vstack(batch['bill'].y)).to(self.device)
+        return x_dict
 
-        emb_list = []
-        offsets = {}
-        cursor = 0
-        for nt in batch.node_types:
-            if nt in ['legislator', 'committee', 'donor', 'lobby_firm']:
-                n = x_dict[nt].size(0)
-                offsets[nt] = (cursor, cursor + n)
-                emb_list.append(x_dict[nt])
-                cursor += n
-        flat_emb = torch.cat(emb_list, dim=0)
-        flat_emb = torch.nan_to_num(flat_emb, nan=0.0, posinf=1e4, neginf=-1e4)
+class LegislativeGraphModel(nn.Module):
+    def __init__(self, metadata, hidden_dim, policy_topic_embs, device=device):
+        super().__init__()
+        self.device = device
+        self.encoder = LegislativeGraphEncoder(num_topics, metadata, hidden_dim, n_layers, dropout_p, device)
+        self.topic_cluster = TopicClusterHead(policy_topic_embs, hidden_dim)
+        self.actor_types   = ["legislator", "committee", "donor", "lobby_firm"]
+        self.influence = nn.ModuleDict({
+            nt: InfluenceScorer(hidden_dim) for nt in self.actor_types
+        })
+        self.topic_align = nn.ModuleDict({
+            nt: ActorTopicAligner(hidden_dim) for nt in self.actor_types
+        })
 
-        flat_contextual_topic_scores = torch.nan_to_num(self.contextual_topic_head(flat_emb, bill_emb), nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-        flat_influence_scores = torch.nan_to_num(self.influence_scorer(flat_emb, bill_emb, bill_outcomes), nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-        flat_bill_topic_probs = torch.nan_to_num(self.policy_topic_matcher(bill_emb), nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-        controversy_pred = torch.nan_to_num(self.controversy_head(x_dict['bill_version']).squeeze(), nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
+    def forward(self, data):
+        z = self.encoder(data)
+        bill_z = z['bill']
+        bill_y = torch.from_numpy(np.vstack(data['bill'].y)).float().to(self.device)
+        bill_topic_logits = self.topic_cluster(bill_z)
+        bill_topic_prob = bill_topic_logits.softmax(dim=-1)
 
-        def get_offset_scores(offsets, scores):
-            result = {}
-            for nt in offsets.keys():
-                s,e = offsets[nt]
-                result[nt] = scores[s:e]
-            return result
-        influence_scores = get_offset_scores(offsets, flat_influence_scores)
-        contextual_topic_scores = get_offset_scores(offsets, flat_contextual_topic_scores)
-        bill_topic_probs = get_offset_scores(offsets, flat_bill_topic_probs)
+        influence_dict, actor_topic_dict = {}, {}
+        for nt in self.actor_types:
+            if nt in z:
+                actor_z = z[nt]
+                influence_dict[nt] = self.influence[nt](actor_z, bill_z, bill_y)
+                actor_topic_dict[nt] = self.topic_align[nt](actor_z, bill_z, bill_topic_prob)
 
         return {
-            'node_embeddings': x_dict,
-            'topic_scores': contextual_topic_scores,
-            'flat_topic_scores': flat_contextual_topic_scores,
-            'topic_dists': bill_topic_probs,
-            'flat_topic_dists': flat_bill_topic_probs,
-            'influence_scores': influence_scores,
-            'flat_influence_scores': flat_influence_scores,
-            'controversy_pred': controversy_pred
+            'node_embeddings': z,
+            'bill_topic_logits': bill_topic_logits,
+            'bill_topic_prob': bill_topic_prob,
+            'influence_dict': influence_dict,
+            'actor_topic_dict': actor_topic_dict
         }
 
     def compute_link_reconstruction_loss(self, z_dict, data, num_neg=1):
@@ -578,50 +523,28 @@ class LegislativeGraphEncoder(nn.Module):
             return torch.tensor(0.01, device=self.device, requires_grad=True)
         return loss
 
-    def compute_loss(self, z_dict, data):
-        z_dict = outputs['node_embeddings']
+    def compute_loss(self, data):
+        out = self.forward(data)
+        z = out['node_embeddings']
 
-        try:
-            link_loss = self.compute_link_reconstruction_loss(z_dict, data)
-        except Exception as e:
-            print(f"Error in link reconstruction: {e}")
-            link_loss = torch.tensor(0.0, device=self.device)
+        link_loss = self.compute_link_reconstruction_loss(z, data)
+        all_inf = torch.cat(list(out['influence_dict'].values()))
+        inf_reg = (all_inf ** 2).mean()
 
-        inf = torch.nan_to_num(outputs['flat_influence_scores'], nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-        influence_reg_loss = (inf.clamp(-1e3, 1e3) ** 2).mean()
+        ent = 0.0
+        for probs in out['actor_topic_dict'].values():
+            p = probs.clamp_min(1e-9)
+            ent += (-p * p.log()).sum(dim=-1).mean()
+        ent_reg = ent / max(len(out['actor_topic_dict']), 1)
 
-
-        topic_align_loss = torch.tensor(0.0, device=self.device)
-        for scores in outputs['topic_scores'].values():
-            probs = F.softmax(scores, dim=-1)
-            entropy = -(probs * probs.log()).sum(dim=-1).mean()
-            topic_align_loss += entropy
-
-        if "bill_version" in z_dict and hasattr(data["bill_version"], "controversy"):
-            tgt = data['bill_version'].controversy.float().to(self.device)
-            pred = outputs['controversy_pred']
-            tgt = torch.nan_to_num(tgt, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-            if pred.numel() == tgt.numel():
-                controversy_loss = F.mse_loss(pred, tgt, reduction='mean')
-            else:
-                controversy_loss = torch.tensor(0.0, device=self.device)
-        else:
-            controversy_loss = torch.tensor(0.0, device=self.device)
-
-        topic_align_loss = topic_align_loss / (len(outputs['topic_scores']) + 1e-6)
-
-        batch_size_factor = sum(x.size(0) for x in z_dict.values()) / sum(1 for _ in z_dict.values())
-        batch_size_factor = max(1.0, batch_size_factor / 100)
-
-        total_loss = (link_loss + (influence_reg_loss * 0.05) + (topic_align_loss * 0.05) + controversy_loss) / batch_size_factor
-
+        total = link_loss + (0.1 * inf_reg) + (0.1 * ent_reg)
         return {
-            'total_loss': total_loss,
+            'total_loss': total,
             'link_loss': link_loss,
-            'influence_reg_loss': influence_reg_loss,
-            'topic_align_loss': topic_align_loss,
-            'controversy_loss': controversy_loss
+            'inf_reg': inf_reg,
+            'ent_reg': ent_reg
         }
+
 
     def get_topic_clusters(self, batch=None):
         if batch is None:
@@ -664,19 +587,6 @@ class LegislativeGraphEncoder(nn.Module):
 
 best_loss = float('inf')
 best_embeddings = None
-model = LegislativeGraphEncoder(num_topics, data.metadata(), hidden_dim, n_layers, dropout_p).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-from torch_geometric.loader import RandomNodeLoader
-
-
-best_loss = float('inf')
-best_embeddings = None
-model = LegislativeGraphEncoder(num_topics, data.metadata(), hidden_dim, n_layers, dropout_p).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.0001)
-
-best_loss = float('inf')
-best_embeddings = None
-model = LegislativeGraphEncoder(num_topics, data.metadata(), hidden_dim, n_layers, dropout_p).to(device)
-
-state_dict = torch.load("best__model3.pt")
+model = LegislativeGraphModel(data.metadata(), hidden_dim, policy_topic_embs).to(device)
+state_dict = torch.load("best_model4.pt")
 model.load_state_dict(state_dict)
