@@ -28,10 +28,13 @@ The project is structured into multiple phases:
 - pdf_parsing/
   - data-collection.ipynb   # Notebook to collect and process PDFs
   - text_cleaning.ipynb     # Notebook to clean and standardize text
+- GNN/
+  - LeGNN.py                # Script to create and train the GNN
+  - LeGNN_output.py         # Script to output the GNN results
 - combining.ipynb           # Notebook to combine data from different sources
 - eda1.html                 # Exploratory data analysis project
 - graph-construction.ipynb  # Notebook to construct the graph
-- LeGNN.py                  # Script to create and train the GNN
+-
 - README.md                 # Current file
 
 ## II. [Data](https://ca-leg-eda.my.canva.site/preliminary) (*links to presentation*)
