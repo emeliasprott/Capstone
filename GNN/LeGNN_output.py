@@ -7,11 +7,11 @@ from tqdm import tqdm
 from torch_geometric.nn import SAGEConv, GINEConv, LEConv
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 
-hidden_dim = 256
+hidden_dim = 128
 n_layers = 2
 dropout_p = 0.15
 device = torch.device('mps')
-policy_topic_embs = torch.load('policy_embeddings.pt')
+policy_topic_embs = torch.load('GNN/policy_embeddings.pt')
 num_topics = len(policy_topic_embs)
 
 # data preprocessing
@@ -64,8 +64,14 @@ def safe_standardize_time_format(time_data) -> torch.Tensor:
                 td = datetime.datetime(int(t), 6, 15).timestamp()
             elif (isinstance(t, str) or (isinstance(t, float))) and (float(t) < 2100 and float(t) > 1900):
                 td = datetime.datetime(int(float(t)), 6, 15).timestamp()
-            elif float(t) > 17000000.0:
+            elif float(t) > 0 and float(t) < 1990:
                 td = t
+            elif float(t) > 17000000.0:
+                td = float(t)
+                while td > 10:
+                    td = td / 10
+            elif float(t) < 0:
+                td = -float(t)
             else:
                 td = t.timestamp()
         except:
@@ -127,16 +133,40 @@ def clean_features(data):
             std = x.std(dim=0, keepdim=True).clamp(min=1e-5)
             x_clean = (x - mean) / std
             x_clean = x_clean.clamp(-10.0, 10.0)
-
         data[nt].x = x_clean
         data[nt].x_mean = mean
         data[nt].x_std = std
     data = pull_timestamps(data)
     return data
 
-def load_and_preprocess_data(path='data2.pt'):
+def load_and_preprocess_data(path='GNN/data2.pt'):
     full_data = torch.load(path, weights_only=False)
-    data = ToUndirected(merge=True)(full_data)
+    for nt in full_data.node_types:
+        if hasattr(full_data[nt], 'x') and full_data[nt].x is not None:
+            full = torch.from_numpy(full_data[nt].x)
+            s = full.size()
+            full = torch.flatten(full, start_dim=1, end_dim=-1)
+            full_data[nt].x = full
+            full_data[nt].num_nodes = full.size(0)
+
+    # Check and fix edge indices before transformation
+    for edge_type, edge_index in full_data.edge_index_dict.items():
+        src_type, _, dst_type = edge_type
+
+        # Get max node indices
+        max_src_idx = edge_index[0].max().item() if edge_index.size(1) > 0 else -1
+        max_dst_idx = edge_index[1].max().item() if edge_index.size(1) > 0 else -1
+
+        # Ensure node counts are sufficient
+        if max_src_idx >= full_data[src_type].num_nodes:
+            print(f"Fixing {src_type} node count: {full_data[src_type].num_nodes} -> {max_src_idx + 1}")
+            full_data[src_type].num_nodes = max_src_idx + 1
+
+        if max_dst_idx >= full_data[dst_type].num_nodes:
+            print(f"Fixing {dst_type} node count: {full_data[dst_type].num_nodes} -> {max_dst_idx + 1}")
+            full_data[dst_type].num_nodes = max_dst_idx + 1
+
+    data = ToUndirected(merge=False)(full_data)
     del full_data
     gc.collect()
     data = RemoveIsolatedNodes()(data)
@@ -171,9 +201,9 @@ def scaled_cosine(a, b):
 
 # encoders
 class TimeEncoder(nn.Module):
-    def __init__(self, dim=16):
+    def __init__(self, dim=8):
         super().__init__()
-        inv = 1. / 10 ** torch.linspace(0, 4, dim // 2)
+        inv = 1. / 8 ** torch.linspace(0, 4, dim // 2)
         self.register_buffer("inv", inv)
 
     def forward(self, t: torch.Tensor):
@@ -182,7 +212,7 @@ class TimeEncoder(nn.Module):
         return torch.cat([freqs.sin(), freqs.cos()], -1)
 
 class FeatureProjector(nn.Module):
-    def __init__(self, metadata, hidden, in_dims, t_dim=16):
+    def __init__(self, metadata, hidden, in_dims, t_dim=8):
         super().__init__()
         self.t_dim = t_dim
         self.time_encoder = TimeEncoder(t_dim)
@@ -207,7 +237,6 @@ class FeatureProjector(nn.Module):
             if timestamp_dict is not None and nt in timestamp_dict and timestamp_dict[nt] is not None:
                 time_features = self.time_encoder(timestamp_dict[nt])
                 x = torch.cat([x, time_features], dim=-1)
-
             result[nt] = self.projectors[nt](x)
         return result
 
@@ -234,19 +263,39 @@ class PolarityAwareConv(nn.Module):
             edge_dim=hidden_dim
         )
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, edge_index, edge_attr):
         if isinstance(x, tuple):
             x_src, x_dst = x
             x_to_use = x_src
         else:
             x_to_use = x
         polarity = edge_attr[:, 0:1].clamp(0,1)
+
         raw = edge_attr[:, 1:]
         if raw.dim() == 1:
             raw = raw.unsqueeze(-1)
         e = self.edge_mlp(raw)
         gated = e * (polarity + 0.01)
-        return self.gine(x_to_use, edge_index, gated)
+        max_idx = x_to_use.size(0) - 1
+        if torch.any(edge_index[0] > max_idx) or torch.any(edge_index[0] < 0):
+            valid_mask = (edge_index[0] <= max_idx) & (edge_index[0] >= 0)
+            edge_index = edge_index[:, valid_mask]
+            gated = gated[valid_mask]
+
+            if edge_index.size(1) == 0:
+                if isinstance(x, tuple):
+                    return torch.zeros_like(x_dst)
+                else:
+                    return torch.zeros_like(x)
+
+        try:
+            return self.gine(x_to_use, edge_index, gated)
+        except Exception as e:
+            print(f"Error in GINEConv: {e}")
+            if isinstance(x, tuple):
+                return x_dst
+            else:
+                return x
 
 class TopicClusterHead(nn.Module):
     def __init__(self, policy_topic_embs, hidden_dim):
@@ -272,12 +321,13 @@ class InfluenceScorer(nn.Module):
         self.score_vec = nn.Linear(dim, 1, bias=False)
 
     def forward(self, actor_z, bill_z, bill_y):
+        bill_y = bill_y.flatten()
         q = self.query_proj(actor_z)
         k = self.key_proj(bill_z)
-        attn = torch.tanh(q.unsqueeze(1) + k.unsqueeze(0))
-        scores = self.score_vec(attn).squeeze(-1)
-        weighted = scores * bill_y.unsqueeze(0)
-        return weighted.mean(dim=1)
+        sim = torch.tanh(q.unsqueeze(1) + k.unsqueeze(0))
+        pair = self.score_vec(sim).squeeze(-1)
+        inf = (pair * bill_y.unsqueeze(0)).mean(dim=1)
+        return inf
 
 class ContextualTopicAligner(nn.Module):
     def __init__(self, actor_dim, bill_dim, num_topics):
@@ -339,7 +389,7 @@ class LegislativeGraphEncoder(nn.Module):
 
         self.in_dims = {nt: data[nt].x.shape[-1] for nt in data.node_types}
 
-        self.encoder = FeatureProjector(metadata=self.metadata, hidden=hidden_dim, in_dims=self.in_dims, t_dim=16)
+        self.encoder = FeatureProjector(metadata=self.metadata, hidden=hidden_dim, in_dims=self.in_dims, t_dim=8)
         self.sage_conv = SAGEConv(hidden_dim, hidden_dim, aggr='mean')
 
         vote_edge_type = ('legislator_term','voted_on','bill_version')
@@ -369,13 +419,52 @@ class LegislativeGraphEncoder(nn.Module):
             h_dst = x_dict[dst_type]
             if edge_type == ('legislator_term', 'voted_on', 'bill_version'):
                 edge_attr = data[edge_type].edge_attr.to(self.device)
-                msg = self.polarity_conv((h_src, h_dst), edge_index, edge_attr)
-                if msg.size(0) == h_dst.size(0):
-                    x_dict[dst_type] = h_dst + msg
-                else:
-                    x_dict[dst_type] = h_dst.clone()
-                    dst_nodes = edge_index[1]
-                    x_dict[dst_type].index_add_(0, dst_nodes, msg)
+                src_nodes = edge_index[0]
+                dst_nodes = edge_index[1]
+
+                # Make sure we're only using valid indices
+                valid_src = src_nodes < h_src.size(0)
+                valid_dst = dst_nodes < h_dst.size(0)
+                valid_mask = valid_src & valid_dst
+
+                if not valid_mask.any():
+                    continue
+
+                # Filter edge_index and edge_attr
+                filtered_edge_index = edge_index[:, valid_mask]
+                filtered_edge_attr = edge_attr[valid_mask]
+                filtered_dst_nodes = filtered_edge_index[1]
+
+                try:
+                    msg = self.polarity_conv((h_src, h_dst), filtered_edge_index, filtered_edge_attr)
+
+                    # Create a new destination embedding tensor
+                    new_dst = h_dst.clone()
+
+                    # Get unique destination nodes that received messages
+                    unique_dst_nodes = torch.unique(filtered_dst_nodes)
+
+                    # Only update nodes that received messages
+                    if msg.size(0) == unique_dst_nodes.size(0):
+                        # If we have one message per unique destination node
+                        new_dst[unique_dst_nodes] = new_dst[unique_dst_nodes] + msg
+                    elif msg.size(0) == filtered_dst_nodes.size(0):
+                        # If we have one message per edge, aggregate them
+                        for i, node_idx in enumerate(unique_dst_nodes):
+                            # Find all messages for this node
+                            node_mask = (filtered_dst_nodes == node_idx)
+                            # Aggregate messages (e.g., by taking the mean)
+                            node_msgs = msg[node_mask]
+                            if node_msgs.size(0) > 0:
+                                new_dst[node_idx] = new_dst[node_idx] + node_msgs.mean(dim=0)
+
+                    # Update the node embeddings
+                    x_dict[dst_type] = new_dst
+
+                except Exception as e:
+                    print(f"Error in polarity_conv: {e}")
+                    # Keep original embeddings if there's an error
+                    x_dict[dst_type] = h_dst
 
             elif edge_type in [
                     ('donor', 'donated_to', 'legislator_term'),
@@ -506,7 +595,7 @@ class LegislativeGraphModel(nn.Module):
             try:
                 max_dst_idx = z_dict[d_t].size(0) - 1
                 if max_dst_idx > 0:
-                    n_samples = min(valid_src_idx.size(0) * num_neg, 10000)
+                    n_samples = min(valid_src_idx.size(0) * num_neg, 5000)
                     neg_dst = torch.randint(0, max_dst_idx + 1, (n_samples,), device=self.device)
                     neg_src_indices = torch.randint(0, valid_src_idx.size(0), (n_samples,), device=self.device)
                     neg_src = valid_src_idx[neg_src_indices]
@@ -590,3 +679,43 @@ best_embeddings = None
 model = LegislativeGraphModel(data.metadata(), hidden_dim, policy_topic_embs).to(device)
 state_dict = torch.load("best_model4.pt")
 model.load_state_dict(state_dict)
+from torch_geometric.loader import RandomNodeLoader
+import pandas as pd
+
+emb_buf = {nt: [] for nt in data.node_types}
+bill_topic_logits = []
+bill_topic_prob = []
+infl_buf = {}
+actor_topic_dict = {}
+loader = RandomNodeLoader(data, num_parts=20, shuffle=True)
+
+for batch in loader:
+    batch = batch.to(device)
+    with torch.no_grad():
+        out = model(batch)
+    for nt, z in out['node_embeddings'].items():
+        emb_buf[nt].append(z.cpu().numpy())
+    bill_topic_logits.append(out['bill_topic_logits'].cpu().numpy())
+    bill_topic_prob.append(out['bill_topic_prob'].cpu().numpy())
+    for nt, z in out['influence_dict'].items():
+        if nt not in infl_buf:
+            infl_buf[nt] = []
+        infl_buf[nt].append(z.cpu().numpy())
+    for nt, z in out['actor_topic_dict'].items():
+        if nt not in actor_topic_dict:
+            actor_topic_dict[nt] = []
+        actor_topic_dict[nt].append(z.cpu().numpy())
+    torch.mps.empty_cache()
+    del batch
+    gc.collect()
+
+# Concatenate
+for nt in emb_buf:
+    full = np.vstack(emb_buf[nt])
+    pd.DataFrame(full).to_parquet(f"GNN/{nt}_embeddings.parquet", index=True)
+pd.DataFrame(np.vstack(bill_topic_logits)).to_parquet("GNN/bill_topic_logits.parquet", index=True)
+pd.DataFrame(np.vstack(bill_topic_prob)).to_parquet("GNN/bill_topic_prob.parquet", index=True)
+for nt in infl_buf:
+    pd.DataFrame(np.hstack(infl_buf[nt])).to_parquet(f"GNN/{nt}_infl.parquet", index=True)
+for nt in actor_topic_dict:
+    pd.DataFrame(np.concat(actor_topic_dict[nt])).to_parquet(f"GNN/{nt}_topic.parquet", index=True)
