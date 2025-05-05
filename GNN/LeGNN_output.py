@@ -3,9 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
+from pathlib import Path
 from tqdm import tqdm
 from torch_geometric.nn import SAGEConv, GINEConv, LEConv
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
+from torch_geometric.loader import RandomNodeLoader
 
 hidden_dim = 128
 n_layers = 2
@@ -673,49 +676,144 @@ class LegislativeGraphModel(nn.Module):
 
         return attention_heads
 
+def bill_kpis(bill_ids, p_topic, actor_topic, influence):
+    dom = p_topic.argmax(1)
+    entr = (-p_topic * p_topic.clamp(min=1e-9).log()).sum(1)
 
-best_loss = float('inf')
-best_embeddings = None
+    cos_sim = F.cosine_similarity(
+        p_topic.unsqueeze(1),
+        actor_topic.unsqueeze(0),
+        dim=-1
+    )
+    inf = influence.view(-1)
+    total_inf = inf.sum()
+
+    align_sup = (cos_sim * inf).sum(1) / total_inf
+
+    mean = align_sup.unsqueeze(1)
+    var = ((cos_sim - mean)**2 * inf).sum(1) / total_inf
+    polar = var.sqrt()
+
+    risk = torch.sigmoid(3 * align_sup + 1 * inf.mean() - 2 * polar)
+
+    return pd.DataFrame({
+        "bill_id": bill_ids.cpu().numpy(),
+        "dominant_topic": dom.cpu().numpy(),
+        "topic_entropy": entr.cpu().numpy(),
+        "alignment_support": align_sup.cpu().numpy(),
+        "polarisation_score": polar.cpu().numpy(),
+        "success_risk": risk.cpu().numpy(),
+    })
+
+
+def actor_kpis(node_ids, p_topic, influence, ideology_index=(0,1)):
+    focus = (p_topic**2).sum(1)
+    lever = focus * influence.view(-1)
+
+    if p_topic.size(1) > max(ideology_index):
+        bipartisan = 1 - torch.abs(
+            p_topic[:, ideology_index[0]] - p_topic[:, ideology_index[1]]
+        )
+    else:
+        bipartisan = torch.ones_like(lever)
+
+    return pd.DataFrame({
+        "node_id": node_ids.cpu().numpy(),
+        "top_topic": p_topic.argmax(1).cpu().numpy(),
+        "topic_focus": focus.cpu().numpy(),
+        "influence": influence.view(-1).cpu().numpy(),
+        "leverage": lever.cpu().numpy(),
+        "bipartisan_score": bipartisan.cpu().numpy(),
+    })
+
+
+def topic_snapshot(p_topic_bills, bill_dates, actor_topic_all, influence_all):
+    df = pd.DataFrame({
+        "date": pd.to_datetime(bill_dates),
+        "topic": p_topic_bills.argmax(1).cpu().numpy()
+    })
+    weekly = df.groupby(["topic", pd.Grouper(key="date", freq="W")]).size()
+
+    momentum = {}
+    for topic, group in weekly.groupby(level=0):
+        counts = group.values
+        if len(counts) < 2:
+            slope = 0.0
+        else:
+            try:
+                slope = np.polyfit(np.arange(len(counts)), counts, 1)[0]
+            except Exception:
+                slope = 0.0
+        momentum[topic] = slope
+
+    power = torch.matmul(actor_topic_all.t(), influence_all.view(-1))
+    num_topics = p_topic_bills.size(1)
+    if power.numel() >= 2:
+        diff = float((power[0] - power[1]).item())
+        balance_vals = np.full(num_topics, diff, dtype=float)
+    else:
+        balance_vals = power.cpu().numpy().astype(float)
+
+    return pd.DataFrame({
+        "topic_id": np.arange(num_topics),
+        "recent_momentum": [momentum.get(t, 0.0) for t in range(num_topics)],
+        "power_balance": balance_vals
+    })
+
+torch.mps.empty_cache()
+gc.collect()
 model = LegislativeGraphModel(data.metadata(), hidden_dim, policy_topic_embs).to(device)
-state_dict = torch.load("best_model4.pt")
+state_dict = torch.load("best_model5.pt")
 model.load_state_dict(state_dict)
-from torch_geometric.loader import RandomNodeLoader
-import pandas as pd
 
-emb_buf = {nt: [] for nt in data.node_types}
-bill_topic_logits = []
-bill_topic_prob = []
-infl_buf = {}
-actor_topic_dict = {}
-loader = RandomNodeLoader(data, num_parts=20, shuffle=True)
+loader = RandomNodeLoader(data, num_parts=25, shuffle=True)
 
-for batch in loader:
+embs = {nt: [] for nt in data.node_types}
+bill_probs_parts = []
+influence_parts = {nt: [] for nt in data.node_types}
+actor_topic_parts = {nt: [] for nt in data.node_types}
+OUT_DIR = Path("dashboard/backend")
+for i, batch in tqdm(enumerate(loader)):
     batch = batch.to(device)
     with torch.no_grad():
         out = model(batch)
-    for nt, z in out['node_embeddings'].items():
-        emb_buf[nt].append(z.cpu().numpy())
-    bill_topic_logits.append(out['bill_topic_logits'].cpu().numpy())
-    bill_topic_prob.append(out['bill_topic_prob'].cpu().numpy())
-    for nt, z in out['influence_dict'].items():
-        if nt not in infl_buf:
-            infl_buf[nt] = []
-        infl_buf[nt].append(z.cpu().numpy())
-    for nt, z in out['actor_topic_dict'].items():
-        if nt not in actor_topic_dict:
-            actor_topic_dict[nt] = []
-        actor_topic_dict[nt].append(z.cpu().numpy())
-    torch.mps.empty_cache()
-    del batch
-    gc.collect()
+    z_dict = out['node_embeddings']
+    bill_prob = out['bill_topic_prob']
+    infl_dict = out['influence_dict']
+    actor_topic = out['actor_topic_dict']
 
-# Concatenate
-for nt in emb_buf:
-    full = np.vstack(emb_buf[nt])
-    pd.DataFrame(full).to_parquet(f"GNN/{nt}_embeddings.parquet", index=True)
-pd.DataFrame(np.vstack(bill_topic_logits)).to_parquet("GNN/bill_topic_logits.parquet", index=True)
-pd.DataFrame(np.vstack(bill_topic_prob)).to_parquet("GNN/bill_topic_prob.parquet", index=True)
-for nt in infl_buf:
-    pd.DataFrame(np.hstack(infl_buf[nt])).to_parquet(f"GNN/{nt}_infl.parquet", index=True)
-for nt in actor_topic_dict:
-    pd.DataFrame(np.concat(actor_topic_dict[nt])).to_parquet(f"GNN/{nt}_topic.parquet", index=True)
+    actor_topic_all = torch.cat([actor_topic[nt] for nt in actor_topic], dim=0)
+    influence_all = torch.cat([infl_dict[nt].view(-1) for nt in infl_dict], dim=0)
+
+    bill_ids = torch.arange(z_dict['bill'].size(0))
+    bill_dates = pd.to_datetime(
+        data['bill'].timestamp.cpu().numpy(), unit='s'
+    )
+
+    # Compute KPI tables
+    bills_df = bill_kpis(
+        bill_ids, bill_prob.cpu(), actor_topic_all.cpu(), influence_all.cpu()
+    )
+    bills_df.to_parquet(OUT_DIR / f"bills_kpis_{i}.parquet", index=False)
+
+    for nt in infl_dict:
+        node_ids = torch.arange(z_dict[nt].size(0))
+        df = actor_kpis(
+            node_ids,
+            actor_topic[nt].cpu(),
+            infl_dict[nt].cpu(),
+        )
+        df.to_parquet(OUT_DIR / f"{nt}_kpis_{i}.parquet", index=False)
+
+    topic_df = topic_snapshot(
+        bill_prob.cpu(), bill_dates, actor_topic_all.cpu(), influence_all.cpu()
+    )
+    topic_df.to_parquet(OUT_DIR / f"topic_snapshot_{i}.parquet", index=False)
+
+    # Save embeddings with implicit ID ordering
+    for nt, emb in z_dict.items():
+        df = pd.DataFrame({
+            "node_id": np.arange(emb.size(0)),
+            "embedding": list(emb.cpu().numpy())
+        })
+        df.to_parquet(OUT_DIR / f"{nt}_embeddings_{i}.parquet", index=False)

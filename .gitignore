@@ -41,3 +41,4 @@ GNN/model_output.py
 GNN/LeGNN_outout.py
 GNN/__pycache__
 __pycache__
+dashboard/backend/*.parquet

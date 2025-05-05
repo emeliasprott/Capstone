@@ -681,16 +681,17 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
 from torch_geometric.loader import RandomNodeLoader
 
 loader = RandomNodeLoader(data, num_parts=10, shuffle=True)
-epochs = 1
-patience = 5
+epochs = 25
+patience = 8
 counter = 0
 loss_count = 0
 start_epoch = 0
-best_loss = float('inf')
-best_weights = model.state_dict()
-best_opt_state = optimizer.state_dict()
+best_loss = 22.9020
+best_weights = torch.load("best_model5.pt")
+model.load_state_dict(best_weights)
+optimizer.load_state_dict(torch.load("best_opt5.pt"))
 
-for epoch in range(start_epoch, start_epoch + epochs + 1):
+for epoch in range(start_epoch, start_epoch + epochs):
     model.train()
     epoch_loss = 0.0
     batch_count = 0
@@ -724,8 +725,8 @@ for epoch in range(start_epoch, start_epoch + epochs + 1):
     if avg_loss < best_loss:
         best_loss = avg_loss
         counter = 0
-        torch.save(model.state_dict(), "best_model4.pt")
-        torch.save(optimizer.state_dict(), "best_opt4.pt")
+        torch.save(model.state_dict(), "best_model5.pt")
+        torch.save(optimizer.state_dict(), "best_opt5.pt")
         print(f"  New best loss; resetting patience counter.")
     else:
         counter += 1
