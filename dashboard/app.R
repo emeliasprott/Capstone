@@ -16,10 +16,10 @@ donor <- read_parquet(file.path(dpath, "donor_kpis.parquet")) %>% as.data.table(
 lobby <- read_parquet(file.path(dpath, "lobby_firm_kpis.parquet")) %>% as.data.table()
 topic_sn <- read_parquet(file.path(dpath, "topic_snapshot.parquet")) %>% as.data.table()
 policy_topics <- c(
-    "K-12 school finance teacher retention student performance education equity",
-    "California public universities tuition affordability financial aid access higher education funding",
-    "Career technical education workforce training vocational pathways job readiness programs",
-    "Affordable housing development zoning density bonus housing supply homelessness prevention",
+    "K-12 Education",
+    "Public Universities",
+    "Technical Education and Job Readiness",
+    "Affordable Housing",
     "Tenant rights eviction protections rent control rental housing affordability",
     "Homelessness supportive housing unhoused populations shelter access wraparound services",
     "Water rights drought management agricultural water use groundwater sustainability urban conservation",
