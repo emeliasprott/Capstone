@@ -31,10 +31,17 @@ The project is structured into multiple phases:
 - GNN/
   - LeGNN.py                # Script to create and train the GNN
   - LeGNN_output.py         # Script to output the GNN results
+  - policy_embs.py          # Script to create policy embeddings
+- dashboard/
+  - backend/
+    - scripts/
+      - backend.ipynb       # Notebook to extract metrics for dashboard
+      - combining_data.py   # Script to combine output from batches
+      - faiss_creator.py    # Script to create FAISS index
+  - app.R                   # R Shiny app for the dashboard
 - combining.ipynb           # Notebook to combine data from different sources
 - eda1.html                 # Exploratory data analysis project
 - graph-construction.ipynb  # Notebook to construct the graph
--
 - README.md                 # Current file
 
 ## II. [Data](https://ca-leg-eda.my.canva.site/preliminary) (*links to presentation*)
