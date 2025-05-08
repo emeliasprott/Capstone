@@ -1,4 +1,4 @@
-import datetime, gc
+import datetime, gc, json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 from torch_geometric.nn import SAGEConv, GINEConv, LEConv
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
-from torch_geometric.loader import RandomNodeLoader
+from torch_geometric.loader import NeighborLoader
 
 hidden_dim = 128
 n_layers = 2
@@ -93,7 +93,7 @@ def pull_timestamps(data):
         ('bill_version', 'rev_voted_on', 'legislator_term'),
         ('legislator_term', 'voted_on', 'bill_version'),
     ]
-    timestamp_nodes = ['legislator_term', 'bill_version', 'bill', 'committee']
+    timestamp_nodes = ['legislator_term', 'bill_version', 'bill']
 
     for et in timestamp_edges:
         if hasattr(data[et], 'edge_attr') and data[et].edge_attr is not None and len(data[et].edge_attr.size()) > 1:
@@ -152,15 +152,12 @@ def load_and_preprocess_data(path='GNN/data2.pt'):
             full_data[nt].x = full
             full_data[nt].num_nodes = full.size(0)
 
-    # Check and fix edge indices before transformation
     for edge_type, edge_index in full_data.edge_index_dict.items():
         src_type, _, dst_type = edge_type
 
-        # Get max node indices
         max_src_idx = edge_index[0].max().item() if edge_index.size(1) > 0 else -1
         max_dst_idx = edge_index[1].max().item() if edge_index.size(1) > 0 else -1
 
-        # Ensure node counts are sufficient
         if max_src_idx >= full_data[src_type].num_nodes:
             print(f"Fixing {src_type} node count: {full_data[src_type].num_nodes} -> {max_src_idx + 1}")
             full_data[src_type].num_nodes = max_src_idx + 1
@@ -707,6 +704,7 @@ def bill_kpis(bill_ids, p_topic, actor_topic, influence):
 
 
 def actor_kpis(node_ids, p_topic, influence, ideology_index=(0,1)):
+    assert len(node_ids) == p_topic.size(0)
     focus = (p_topic**2).sum(1)
     lever = focus * influence.view(-1)
 
@@ -762,18 +760,34 @@ def topic_snapshot(p_topic_bills, bill_dates, actor_topic_all, influence_all):
 
 torch.mps.empty_cache()
 gc.collect()
+for nt in data.node_types:
+    data[nt].node_id = torch.arange(data[nt].num_nodes, dtype=torch.long)
+
 model = LegislativeGraphModel(data.metadata(), hidden_dim, policy_topic_embs).to(device)
 state_dict = torch.load("best_model5.pt")
 model.load_state_dict(state_dict)
 
-loader = RandomNodeLoader(data, num_parts=25, shuffle=True)
+loader = NeighborLoader(
+    data,
+    num_neighbors={k: [25] * 2 for k in data.edge_types},
+    batch_size=128,
+    shuffle=False,
+    input_nodes=('legislator_term')
+)
 
 embs = {nt: [] for nt in data.node_types}
 bill_probs_parts = []
 influence_parts = {nt: [] for nt in data.node_types}
 actor_topic_parts = {nt: [] for nt in data.node_types}
-OUT_DIR = Path("dashboard/backend")
-for i, batch in tqdm(enumerate(loader)):
+OUT_DIR = Path("dashboard/backend/data")
+
+shared_paths = {tbl: [] for tbl in [
+    "bill_kpis", "topic_snapshot",
+    *[f"{nt}_kpis" for nt in data.node_types],
+    *[f"{nt}_embeddings" for nt in data.node_types]
+]}
+
+for i, batch in tqdm(enumerate(loader), total=len(loader), desc="Processing batches"):
     batch = batch.to(device)
     with torch.no_grad():
         out = model(batch)
@@ -782,38 +796,53 @@ for i, batch in tqdm(enumerate(loader)):
     infl_dict = out['influence_dict']
     actor_topic = out['actor_topic_dict']
 
-    actor_topic_all = torch.cat([actor_topic[nt] for nt in actor_topic], dim=0)
-    influence_all = torch.cat([infl_dict[nt].view(-1) for nt in infl_dict], dim=0)
-
-    bill_ids = torch.arange(z_dict['bill'].size(0))
-    bill_dates = pd.to_datetime(
-        data['bill'].timestamp.cpu().numpy(), unit='s'
+    bill_ids = batch['bill'].node_id.cpu()
+    p_topic_bills = bill_prob.index_select(0, bill_ids.to(bill_prob.device))
+    timestamp_full = data['bill'].timestamp
+    bill_dates = timestamp_full[bill_ids].cpu().numpy()
+    actor_topic_all = torch.cat([actor_topic[nt] for nt in actor_topic], 0)
+    influence_all = torch.cat([infl_dict[nt].view(-1) for nt in infl_dict], 0)
+    bill_df = bill_kpis(
+        bill_ids,
+        p_topic_bills.cpu(),
+        actor_topic_all.cpu(),
+        influence_all.cpu()
     )
-
-    # Compute KPI tables
-    bills_df = bill_kpis(
-        bill_ids, bill_prob.cpu(), actor_topic_all.cpu(), influence_all.cpu()
-    )
-    bills_df.to_parquet(OUT_DIR / f"bills_kpis_{i}.parquet", index=False)
+    bill_df.to_parquet(OUT_DIR / f"bill_kpis_{i}.parquet", index=False)
+    shared_paths['bill_kpis'].append(f"{OUT_DIR}/bill_kpis_{i}.parquet")
 
     for nt in infl_dict:
-        node_ids = torch.arange(z_dict[nt].size(0))
+        node_ids = batch[nt].node_id
         df = actor_kpis(
-            node_ids,
+            node_ids.cpu(),
             actor_topic[nt].cpu(),
-            infl_dict[nt].cpu(),
+            infl_dict[nt].cpu()
         )
-        df.to_parquet(OUT_DIR / f"{nt}_kpis_{i}.parquet", index=False)
+        p = OUT_DIR / f"{nt}_kpis_{i}.parquet"
+        df.to_parquet(p, index=False)
+        shared_paths[f"{nt}_kpis"].append(str(p))
+        pd.DataFrame({
+            "node_id": node_ids.cpu().numpy(),
+            "topic_probs": list(actor_topic[nt].cpu().numpy())
+        }).to_parquet(OUT_DIR / f"{nt}_topic_probs_{i}.parquet", index=False)
 
-    topic_df = topic_snapshot(
-        bill_prob.cpu(), bill_dates, actor_topic_all.cpu(), influence_all.cpu()
-    )
-    topic_df.to_parquet(OUT_DIR / f"topic_snapshot_{i}.parquet", index=False)
 
-    # Save embeddings with implicit ID ordering
-    for nt, emb in z_dict.items():
-        df = pd.DataFrame({
-            "node_id": np.arange(emb.size(0)),
-            "embedding": list(emb.cpu().numpy())
+        e = OUT_DIR / f"{nt}_embeddings_{i}.parquet"
+        emb_df = pd.DataFrame({
+            "node_id": node_ids.cpu().numpy(),
+            "embedding": list(z_dict[nt].cpu().numpy())
         })
-        df.to_parquet(OUT_DIR / f"{nt}_embeddings_{i}.parquet", index=False)
+        emb_df.to_parquet(e, index=False)
+        shared_paths[f"{nt}_embeddings"].append(str(e))
+    snap_df = topic_snapshot(
+        p_topic_bills.cpu(),
+        bill_dates,
+        actor_topic_all.cpu(),
+        influence_all.cpu()
+    )
+    s = OUT_DIR / f"topic_snapshot_{i}.parquet"
+    snap_df.to_parquet(s, index=False)
+    shared_paths['topic_snapshot'].append(str(s))
+
+with open(OUT_DIR / "shared_paths.json", "w") as f:
+    json.dump(shared_paths, f)

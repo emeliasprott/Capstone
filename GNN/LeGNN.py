@@ -68,12 +68,10 @@ def safe_standardize_time_format(time_data) -> torch.Tensor:
                 td = t
             elif float(t) > 17000000.0:
                 td = float(t)
-                while td > 10:
-                    td = td / 10
-            elif float(t) < 0:
-                td = -float(t)
-            else:
+            elif isinstance(t, datetime.datetime):
                 td = t.timestamp()
+            else:
+                td = float(t) * 1e9
         except:
             td = datetime.datetime(2000, 6, 15).timestamp()
         times.append(td)
@@ -360,9 +358,17 @@ class ActorTopicAligner(nn.Module):
         self.query_proj = nn.Linear(dim, dim, bias=False)
         self.key_proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, actor_z, bill_z, bill_topic_prob):
+    def forward(self, actor_z, bill_z, bill_topic_prob, reach_mask=None):
         attn_logits = scaled_cosine(self.query_proj(actor_z), self.key_proj(bill_z))
-        alpha = attn_logits.softmax(dim=1)
+        if reach_mask is not None:
+            if reach_mask.size(1) != attn_logits.size(1):
+                reach_mask = reach_mask[:, :attn_logits.size(1)]
+            if reach_mask.size(0) != attn_logits.size(0):
+                reach_mask = reach_mask[:attn_logits.size(0)]
+            reach_mask = reach_mask.to(attn_logits.device)
+            attn_logits = attn_logits.masked_fill(~reach_mask, -1e9)
+        alpha = attn_logits.softmax(1)
+        alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
         return alpha @ bill_topic_prob
 
 class LegislativeGraphEncoder(nn.Module):
@@ -430,40 +436,29 @@ class LegislativeGraphEncoder(nn.Module):
                 if not valid_mask.any():
                     continue
 
-                # Filter edge_index and edge_attr
                 filtered_edge_index = edge_index[:, valid_mask]
                 filtered_edge_attr = edge_attr[valid_mask]
                 filtered_dst_nodes = filtered_edge_index[1]
 
                 try:
                     msg = self.polarity_conv((h_src, h_dst), filtered_edge_index, filtered_edge_attr)
-
-                    # Create a new destination embedding tensor
                     new_dst = h_dst.clone()
-
-                    # Get unique destination nodes that received messages
                     unique_dst_nodes = torch.unique(filtered_dst_nodes)
 
                     # Only update nodes that received messages
                     if msg.size(0) == unique_dst_nodes.size(0):
-                        # If we have one message per unique destination node
                         new_dst[unique_dst_nodes] = new_dst[unique_dst_nodes] + msg
                     elif msg.size(0) == filtered_dst_nodes.size(0):
-                        # If we have one message per edge, aggregate them
                         for i, node_idx in enumerate(unique_dst_nodes):
-                            # Find all messages for this node
                             node_mask = (filtered_dst_nodes == node_idx)
-                            # Aggregate messages (e.g., by taking the mean)
                             node_msgs = msg[node_mask]
                             if node_msgs.size(0) > 0:
                                 new_dst[node_idx] = new_dst[node_idx] + node_msgs.mean(dim=0)
 
-                    # Update the node embeddings
                     x_dict[dst_type] = new_dst
 
                 except Exception as e:
                     print(f"Error in polarity_conv: {e}")
-                    # Keep original embeddings if there's an error
                     x_dict[dst_type] = h_dst
 
             elif edge_type in [
@@ -538,7 +533,7 @@ class LegislativeGraphEncoder(nn.Module):
         return x_dict
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(self, metadata, hidden_dim, policy_topic_embs, device=device):
+    def __init__(self, metadata, hidden_dim, allowed_paths, policy_topic_embs, device=device):
         super().__init__()
         self.device = device
         self.encoder = LegislativeGraphEncoder(num_topics, metadata, hidden_dim, n_layers, dropout_p, device)
@@ -550,6 +545,11 @@ class LegislativeGraphModel(nn.Module):
         self.topic_align = nn.ModuleDict({
             nt: ActorTopicAligner(hidden_dim) for nt in self.actor_types
         })
+        self.meta_mask = build_metapath_mask(
+            data,
+            actor_types=["donor","lobby_firm","committee","legislator"],
+            bill_type="bill_version",
+            allowed_paths=allowed_paths)
 
     def forward(self, data):
         z = self.encoder(data)
@@ -563,7 +563,9 @@ class LegislativeGraphModel(nn.Module):
             if nt in z:
                 actor_z = z[nt]
                 influence_dict[nt] = self.influence[nt](actor_z, bill_z, bill_y)
-                actor_topic_dict[nt] = self.topic_align[nt](actor_z, bill_z, bill_topic_prob)
+                reach = self.meta_mask[nt]
+                actor_topic_dict[nt] = self.topic_align[nt](actor_z, bill_z, bill_topic_prob, reach_mask=reach)
+
 
         return {
             'node_embeddings': z,
@@ -573,58 +575,55 @@ class LegislativeGraphModel(nn.Module):
             'actor_topic_dict': actor_topic_dict
         }
 
-    def compute_link_reconstruction_loss(self, z_dict, data, num_neg=1):
-        loss = torch.tensor(0., device=self.device)
+    def compute_link_reconstruction_loss(self, z_dict, batch, neg_k=1, temp=0.1):
+        device = self.device
+        total_pos, total_neg = 0.0, 0.0
+        bce = nn.BCEWithLogitsLoss()
 
-        for rel, ei in data.edge_index_dict.items():
-            s_t, t, d_t = rel
+        for et, edge_index in batch.edge_index_dict.items():
+            s_t, _, d_t = et
             if s_t not in z_dict or d_t not in z_dict:
                 continue
-            src, dst = ei
-            valid_src = (src < z_dict[s_t].size(0))
-            valid_dst = (dst < z_dict[d_t].size(0))
-            valid_mask = valid_src & valid_dst
-            if not valid_mask.any():
+
+            src, dst = edge_index
+            if src.numel() == 0:
                 continue
-            valid_src_idx = src[valid_mask]
-            valid_dst_idx = dst[valid_mask]
-            src_emb = F.normalize(z_dict[s_t][valid_src_idx], p=2, dim=-1)
-            dst_emb = F.normalize(z_dict[d_t][valid_dst_idx], p=2, dim=-1)
-            pos_score = torch.clamp((src_emb * dst_emb).sum(dim=-1), -10, 10)
-            pos_loss = nn.BCEWithLogitsLoss()(pos_score, torch.ones_like(pos_score, device=self.device))
-            try:
-                max_dst_idx = z_dict[d_t].size(0) - 1
-                if max_dst_idx > 0:
-                    n_samples = min(valid_src_idx.size(0) * num_neg, 5000)
-                    neg_dst = torch.randint(0, max_dst_idx + 1, (n_samples,), device=self.device)
-                    neg_src_indices = torch.randint(0, valid_src_idx.size(0), (n_samples,), device=self.device)
-                    neg_src = valid_src_idx[neg_src_indices]
-                    neg_src_emb = F.normalize(z_dict[s_t][neg_src], p=2, dim=-1)
-                    neg_dst_emb = F.normalize(z_dict[d_t][neg_dst], p=2, dim=-1)
-                    neg_score = torch.clamp((neg_src_emb * neg_dst_emb).sum(dim=-1), -10, 10)
-                    neg_loss = nn.BCEWithLogitsLoss()(neg_score, torch.zeros_like(neg_score, device=self.device))
-                    loss += pos_loss + neg_loss
-            except Exception as e:
-                print(f"Error in negative sampling: {e}")
-                loss += pos_loss
-        if torch.isnan(loss) or torch.isinf(loss):
-            print("NaN/Inf detected in final link reconstruction loss")
-            return torch.tensor(0.01, device=self.device, requires_grad=True)
+
+            src_emb = F.normalize(z_dict[s_t][src], p=2, dim=-1)
+            dst_emb = F.normalize(z_dict[d_t][dst], p=2, dim=-1)
+            pos_log = (src_emb * dst_emb).sum(-1) / temp
+            pos_lbl = torch.ones_like(pos_log)
+            total_pos = total_pos + bce(pos_log, pos_lbl)
+
+            if neg_k > 0:
+                # random permutation from batch
+                perm = torch.randperm(dst.size(0), device=device)
+                neg_dst = dst_emb[perm][:pos_log.size(0) * neg_k]
+                neg_src = src_emb.repeat(neg_k, 1)
+
+                neg_log = (neg_src * neg_dst).sum(-1) / temp
+                neg_lbl = torch.zeros_like(neg_log)
+                total_neg = total_neg + bce(neg_log, neg_lbl)
+
+        loss = total_pos + total_neg
+        if not torch.isfinite(loss):
+            loss = torch.tensor(0.001, device=device, requires_grad=True)
         return loss
 
-    def compute_loss(self, data):
-        out = self.forward(data)
+    def compute_loss(self, out, data):
         z = out['node_embeddings']
-
         link_loss = self.compute_link_reconstruction_loss(z, data)
         all_inf = torch.cat(list(out['influence_dict'].values()))
         inf_reg = (all_inf ** 2).mean()
 
         ent = 0.0
         for probs in out['actor_topic_dict'].values():
-            p = probs.clamp_min(1e-9)
+            p = torch.nan_to_num(probs, nan=0.0)
+            p = p.clamp_min(1e-9)
             ent += (-p * p.log()).sum(dim=-1).mean()
         ent_reg = ent / max(len(out['actor_topic_dict']), 1)
+        if torch.isnan(ent_reg):
+            ent_reg = torch.tensor(0.0, device=device, requires_grad=True)
 
         total = link_loss + (0.1 * inf_reg) + (0.1 * ent_reg)
         return {
@@ -658,7 +657,6 @@ class LegislativeGraphModel(nn.Module):
             batch = self.data
 
         outputs = self.forward(batch)
-        z_dict = outputs['node_embeddings']
 
         attention_heads = {}
 
@@ -673,47 +671,160 @@ class LegislativeGraphModel(nn.Module):
 
         return attention_heads
 
+    def _slice_mask(self, nt, batch):
+        if nt not in self.meta_mask:
+            return None
+
+        rows = getattr(batch[nt], "node_id", None)
+        if rows is None:
+            rows = torch.arange(batch[nt].num_nodes, device=self.dev)
+
+        bill_store = batch["bill_version"]
+        cols = getattr(bill_store, "node_id", None)
+        if cols is None:
+            cols = torch.arange(bill_store.num_nodes, device=self.dev)
+
+        return self.meta_mask[nt][rows][:, cols]
+
+def _adj(data, et):
+    row, col = data.edge_index_dict[et]
+    n_src = data[et[0]].num_nodes
+    n_dst = data[et[2]].num_nodes
+    A = torch.sparse_coo_tensor(
+            torch.stack([row, col]),
+            torch.ones_like(row, dtype=torch.float32),
+            (n_src, n_dst)).coalesce()
+    return A
+
+def build_metapath_mask(data, actor_types, allowed_paths, bill_type = "bill_version"):
+
+    device = next(iter(data.edge_index_dict.values())).device
+    cache  = {et: _adj(data, et).to(device) for et in data.edge_index_dict}
+
+    masks  = {}
+    n_bill = data[bill_type].num_nodes
+
+    for actor in actor_types:
+        n_actor = data[actor].num_nodes
+        reach = torch.sparse_coo_tensor(torch.empty(2, 0, device=device, dtype=torch.long), torch.empty(0, device=device), (n_actor, n_bill)).coalesce()
+
+        for path in allowed_paths.get(actor, []):
+            M = cache[path[0]]
+            for et in path[1:]:
+                N = cache[et]
+                if M.size(1) != N.size(0):
+                    if M.size(1) == N.size(1):
+                        N = N.t()
+                    else:
+                        raise ValueError(
+                            f"Cannot compose {et} after previous edge; "
+                            f"dim mismatch {M.size()} vs {N.size()}")
+                M = torch.sparse.mm(M, N).coalesce()
+
+            reach = (reach + M).coalesce()
+
+        dense = (reach.to_dense() > 0)
+        if dense.sum() == 0:
+            print(f"[WARN] meta-path mask for {actor} is empty.")
+        masks[actor] = dense
+
+    return masks
+
+ALLOWED = {
+    "donor": [
+        ( ('donor','donated_to','legislator_term'),
+          ('legislator_term','voted_on','bill_version') ),
+        (
+          ('donor', 'donated_to','legislator_term'),
+          ('legislator_term','wrote','bill_version') ),
+    ],
+    "lobby_firm": [
+        ( ('lobby_firm','lobbied','legislator_term'),
+          ('legislator_term','voted_on','bill_version') ),
+        ( ('lobby_firm','lobbied','committee'),
+          ('committee','rev_member_of','legislator_term'),
+          ('legislator_term','voted_on','bill_version') ),
+        ( ('lobby_firm','lobbied','committee'),
+          ('committee','rev_member_of','legislator_term'),
+          ('legislator_term','wrote','bill_version') ),
+        ( ('lobby_firm','lobbied','legislator_term'),
+          ('legislator_term', 'wrote','bill_version') )
+    ],
+    "committee": [
+        ( ('committee','rev_member_of','legislator_term'),
+         ('legislator_term','voted_on','bill_version') ),
+        ( ('committee','rev_member_of','legislator_term'),
+         ('legislator_term','wrote','bill_version') )
+    ],
+    "legislator": [
+        ( ('legislator', 'samePerson', 'legislator_term'),
+         ('legislator_term','voted_on','bill_version') ),
+        ( ('legislator', 'samePerson', 'legislator_term'),
+         ('legislator_term','wrote','bill_version') )
+    ]
+}
+
 
 best_loss = float('inf')
 best_embeddings = None
-model = LegislativeGraphModel(data.metadata(), hidden_dim, policy_topic_embs).to(device)
+model = LegislativeGraphModel(data.metadata(), hidden_dim, ALLOWED, policy_topic_embs).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-from torch_geometric.loader import RandomNodeLoader
 
-loader = RandomNodeLoader(data, num_parts=10, shuffle=True)
-epochs = 25
-patience = 8
+from torch_geometric.loader import HGTLoader
+
+torch.mps.empty_cache()
+gc.collect()
+loader = HGTLoader(
+    data,
+    num_samples={
+        'legislator_term': [48] * 2,
+        'legislator': [48] * 2,
+        'committee': [96] * 2,
+        'lobby_firm': [192] * 2,
+        'donor': [192] * 2,
+        'bill_version': [384] * 2,
+        'bill': [384] * 2,
+    },
+    batch_size=64,
+    shuffle=True,
+    input_nodes='legislator_term',
+    num_workers=2
+)
+
+epochs = 1
+patience = 5
 counter = 0
 loss_count = 0
 start_epoch = 0
-best_loss = 22.9020
-best_weights = torch.load("best_model5.pt")
-model.load_state_dict(best_weights)
-optimizer.load_state_dict(torch.load("best_opt5.pt"))
+best_loss = float('inf')
+best_weights = model.state_dict()
 
 for epoch in range(start_epoch, start_epoch + epochs):
     model.train()
     epoch_loss = 0.0
     batch_count = 0
+    torch.mps.empty_cache()
 
     for batch_idx, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
-        try:
-            batch = batch.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            loss_dict = model.compute_loss(batch)
-            loss = loss_dict['total_loss']
+        batch = batch.to(device)
+        outputs = model(batch)
+        loss_dict = model.compute_loss(outputs, batch)
+        loss = loss_dict['total_loss']
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(loss_dict)
-                raise ValueError(f"Batch {batch_idx}: NaN/Inf loss detected!")
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(loss_dict)
+            raise ValueError(f"Batch {batch_idx}: NaN/Inf loss detected!")
 
-            loss.backward()
-            optimizer.step()
-            epoch_loss += float(loss.item())
-            batch_count += 1
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        del outputs, loss_dict
 
-        except Exception as e:
-            raise ValueError(f"Error in batch {batch_idx}: {e}")
+        epoch_loss += float(loss)
+        del loss
+        batch_count += 1
+        torch.mps.empty_cache()
+        gc.collect()
 
 
     if batch_count > 0:
