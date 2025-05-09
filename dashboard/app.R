@@ -1,21 +1,28 @@
-if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
-pacman::p_load(
-    shiny, bslib, arrow, data.table, dplyr, plotly, DT, lubridate,
-    reticulate, fontawesome, htmltools, scales
-)
-reticulate::use_condaenv("faiss", required = TRUE)
-
 # ======================================================
 # preprocessing
 # ======================================================
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+    shiny, bslib, arrow, data.table, dplyr, plotly, DT, lubridate,
+    reticulate, scales, RColorBrewer
+)
+
+reticulate::use_condaenv("faiss", required = FALSE)
+faiss <- reticulate::import("faiss", delay_load = TRUE)
+pickle <- reticulate::import("pickle", delay_load = TRUE)
+builtins <- reticulate::import_builtins()
+
 dpath <- "backend/data"
-bill <- read_parquet(file.path(dpath, "bill.parquet")) %>% as.data.table()
-leg <- read_parquet(file.path(dpath, "legislator_term.parquet")) %>% as.data.table()
-committee <- read_parquet(file.path(dpath, "committee.parquet")) %>% as.data.table()
-donor <- read_parquet(file.path(dpath, "donor.parquet")) %>% as.data.table()
-lobby <- read_parquet(file.path(dpath, "lobby_firm.parquet")) %>% as.data.table()
-topics <- read_parquet(file.path(dpath, "topic_summary.parquet")) %>% as.data.table()
-policy <- read_parquet(file.path(dpath, "policy_session.parquet")) %>% as.data.table()
+safe <- \(f) tryCatch(read_parquet(f) |> as.data.table(), error = \(e) data.table())
+
+bill <- safe(file.path(dpath, "bill.parquet"))
+leg <- safe(file.path(dpath, "legislator_term.parquet"))
+committee <- safe(file.path(dpath, "committee.parquet"))
+donor <- safe(file.path(dpath, "donor.parquet"))
+lobby <- safe(file.path(dpath, "lobby_firm.parquet"))
+topics <- safe(file.path(dpath, "topic_summary.parquet"))
+policy <- safe(file.path(dpath, "policy_session.parquet"))
+
 policy_topics <- c(
     "K-12 Education",
     "Public Universities",
@@ -115,164 +122,119 @@ policy_topics <- c(
     "Sea Level Rise Adaptation"
 )
 
-label_map <- data.table(topic_id = seq_along(policy_topics) - 1L, topic = policy_topics)
+idx_file <- file.path(dpath, "bill_sim.faiss")
+pkl_file <- file.path(dpath, "bill_sim_ids.pkl")
+emb_files <- list.files(dpath, "bill_embeddings_.*\\.parquet", full.names = TRUE)
 
-bill <- merge(bill, label_map, by.x = "dominant_topic", by.y = "topic_id", all.x = TRUE)
+if (file.exists(idx_file) && file.exists(pkl_file) && length(emb_files)) {
+    idx <- faiss$read_index(idx_file)
+    id_map <- pickle$load(builtins$open(pkl_file, "rb"))
+    emb_ds <- open_dataset(emb_files)
 
-topics <- merge(topics, label_map, by.x = "topic", by.y = "topic_id", all.x = TRUE)
-
-add_topic_label <- function(dt, id_col = "top_topic") {
-    if (id_col %in% names(dt)) {
-        merge(dt, label_map, by.x = id_col, by.y = "topic_id", all.x = TRUE)
-    } else {
-        dt
+    get_vec <- \(bid){
+        row <- emb_ds %>%
+            filter(node_id == bid) %>%
+            collect()
+        if (!nrow(row)) NULL else unlist(row$embedding[[1]])
     }
-}
-leg <- add_topic_label(leg)
-committee <- add_topic_label(committee)
-donor <- add_topic_label(donor)
-lobby <- add_topic_label(lobby)
-
-faiss <- import("faiss", delay_load = TRUE)
-pickle <- import("pickle", delay_load = TRUE)
-builtins <- import_builtins()
-idx <- faiss$read_index(file.path("backend/data", "bill_sim.faiss"))
-f <- builtins$open(file.path("backend/data", "bill_sim_ids.pkl"), "rb")
-id_map <- pickle$load(f)
-f$close()
-emb_files <- list.files("backend/data", "bill_embeddings_.*\\.parquet", full.names = TRUE)
-emb_ds <- open_dataset(emb_files)
-get_vec <- function(bid) {
-    row <- emb_ds %>%
-        filter(node_id == bid) %>%
-        collect()
-    if (nrow(row) == 0) {
-        return(NULL)
+    nearest <- \(bid, k = 10){
+        v <- get_vec(bid)
+        if (is.null(v)) {
+            return(integer(0))
+        }
+        v <- v / sqrt(sum(v * v))
+        idx$search(matrix(v, 1), k)[[2]][1, ] + 1L |> (\(I) id_map[I])()
     }
-    unlist(row$embedding[[1]])
+} else {
+    nearest <- \(...) integer(0)
 }
-nearest <- function(bid, k = 10) {
-    v <- get_vec(bid)
-    if (is.null(v)) {
-        return(integer(0))
-    }
-    v <- v / sqrt(sum(v * v))
-    I <- idx$search(matrix(v, nrow = 1), k)[[2]][1, ] + 1L
-    id_map[I]
-}
+topics[, `:=`(
+    success_pct = round(avg_success * 100, 2),
+    polar_pct = round(avg_polar * 100, 2)
+)]
+bill <- bill %>%
+    mutate(outcome = if_else(outcome > 0, 1, 0))
+avg_outcome <- bill %>%
+    group_by(topic) %>%
+    summarise(avg_outcome = mean(outcome, na.rm = TRUE))
+nbills_per_topic <- bill %>%
+    group_by(topic) %>%
+    summarise(nbills = n()) %>%
+    ungroup()
 
-topics[, avg_success := round(avg_success * 100, 2)]
-topics[, avg_polar := round(avg_polar * 100, 2)]
+topics <- topics %>%
+    left_join(nbills_per_topic, by = "topic")
 
-recent_cut <- max(bill$intro_date) - 90
-recent <- bill[intro_date >= recent_cut]
+topics$avg_outcome <- avg_outcome$avg_outcome[match(topics$topic, avg_outcome$topic)]
+topics$success_pct <- round(topics$avg_outcome * 100, 2)
 
+contro <- scale(topics$polar_pct, center = TRUE, scale = TRUE)
+topics$controversiality <- (contro + 2) * 1.25
 # ======================================================
 # UI
 # ======================================================
 theme <- bs_theme(
+    version = 5,
     base_font = font_google("Open Sans"),
     heading_font = font_google("Inter"),
-    primary = "#0061A8",
-    secondary = "#4FB3BF",
-    "body-bg" = "#f4f7fa",
-    "card-bg" = "rgba(255,255,255,.55)",
-    "card-border-width" = "0"
+    primary = "#004E89",
+    secondary = "#A7C957",
+    "body-bg" = "#f4f7fa"
 )
-theme <- bs_add_rules(theme, "
-.card-glass{
-  backdrop-filter:blur(12px) saturate(180%);
-  -webkit-backdrop-filter:blur(12px) saturate(180%);
-  box-shadow:0 8px 18px rgba(0,0,0,.07)!important;
-  border-radius:1rem!important;
-  transition:transform .3s ease;
+
+vbox <- function(title, value, subtitle = NULL, icon = NULL, color = NULL) {
+    bslib::value_box(
+        title = title, value = value, showcase = icon,
+        footer = subtitle, theme_color = color %||% "secondary"
+    )
 }
-.card-glass:hover{ transform:translateY(-5px); }
-.btn-pill{ border-radius:9999px!important; }
-")
 
 ui <- navbarPage(
-    title = tags$span(class = "fw-bold text-uppercase small", "California Legislative Monitor"),
-    theme = theme, id = "nav",
-
-    # -------- Overview ------------------------------------------------------
+    title = "California Legislative Monitor", theme = theme, id = "nav",
     tabPanel(
         "Overview",
         div(
-            class = "container-xl py-5",
-            h1(class = "display-5 fw-bold text-primary mb-4", "Legislative Snapshot"),
-            h3(class = "mt-5 mb-3", "Top Topics by Bill Count"),
-            {
-                topN <- topics[order(-n_bills)][1:10]
-                plot_ly(topN,
-                    x = ~ reorder(topic, n_bills), y = ~n_bills, type = "bar",
-                    marker = list(color = "#4FB3BF")
-                ) |>
-                    layout(
-                        xaxis = list(title = "", tickangle = -45),
-                        yaxis = list(title = "Bills")
+            class = "container-xl py-4",
+            h3("Overview of Policy Areas"),
+            p(
+                "Controversiality is a measure of how much support and opposition a topic receives in the legislature, compared to other topics. On this scale, 0 is the least controversial and 5 is the most controversial.",
+                style = "font-size: 12px; margin-top: 10px;"
+            ),
+            plotlyOutput("bubble_topics", height = 400)
+        ),
+        div(
+            class = "container-xl py-4",
+            h3("Funding and Lobbying Overview"),
+            fluidRow(
+                column(
+                    3,
+                    selectInput(
+                        "metric", "Choose Metric:",
+                        choices = c(
+                            "Total Bills Authored" = "num_authored_bills",
+                            "Percent Bills Passed" = "pct_passed",
+                            "Influence Score" = "leverage"
+                        ),
+                        selected = "leverage"
                     )
-            }
+                ),
+                column(
+                    9,
+                    plotlyOutput("leg_metrics_bar", height = "500px")
+                )
+            )
         )
     ),
-
-    # -------- Trends --------------------------------------------------------
     tabPanel(
-        "Trends",
+        "Bill search",
         div(
-            class = "container-xl py-5",
-            h2("Bills & Funding by Session"),
-            selectInput("tr_topic", NULL,
-                choices = sort(unique(policy$topic)),
-                selected = head(sort(unique(policy$topic)), 3),
-                multiple = TRUE, class = "form-select btn-pill mb-4 fs-6"
-            ),
-            plotlyOutput("trend_plot", height = 450)
-        )
-    ),
-
-    # -------- Topic ---------------------------------------------------------
-    tabPanel(
-        "Topic",
-        div(
-            class = "container-xl py-5",
-            selectInput("ex_topic", NULL,
-                choices = sort(unique(topics$topic)),
-                class = "form-select btn-pill fs-5 mb-4"
-            ),
-            h4("Sessions"),
-            plotlyOutput("topic_plot", height = 300),
-            hr(class = "my-4"),
-            h4("Top Actors"),
-            DTOutput("actor_tbl"),
-            hr(class = "my-4"),
-            h4("Recent Bills"),
-            DTOutput("recent_tbl")
-        )
-    ),
-
-    # -------- Search --------------------------------------------------------
-    tabPanel(
-        "Search",
-        div(
-            class = "container-xl py-5",
-            textInput("kw", NULL,
-                placeholder = "keyword in title",
-                class = "form-control w-50 d-inline"
-            ),
-            actionButton("btn_kw", tagList(icon("magnifying-glass"), "Search"),
-                class = "btn btn-primary btn-pill ms-2 px-4"
-            ),
-            hr(),
-            DTOutput("kw_results"),
-            hr(class = "my-5"),
-            h3("Find Similar Bills"),
-            numericInput("sim_id", "Bill ID", 1, min = 1, width = "25%"),
-            actionButton("btn_sim", tagList(icon("sparkles"), "Find"),
-                class = "btn btn-secondary btn-pill"
-            ),
-            hr(),
-            DTOutput("sim_results")
+            class = "container-xl py-4",
+            textInput("kw", "Keyword in title"),
+            actionButton("btn_kw", "Search"),
+            DTOutput("kw_results"), hr(),
+            numericInput("search_billId", "Bill ID", min = min(bill$bill_id), value = head(bill$bill_id, 1)),
+            actionButton("btn_find", "Find similar"),
+            DTOutput("tbl_similar")
         )
     )
 )
@@ -281,102 +243,114 @@ ui <- navbarPage(
 # Server
 # ======================================================
 server <- function(input, output, session) {
-    # ---- Trends -----------------------------------------------------------
-    output$trend_plot <- renderPlotly({
-        req(input$tr_topic)
-        df <- policy[topic %in% input$tr_topic]
-        pal <- RColorBrewer::brewer.pal(8, "Set2")
-        p <- plot_ly()
-        i <- 1
-        for (t in input$tr_topic) {
-            sub <- df[topic == t]
-            p <- add_lines(p,
-                x = sub$session, y = sub$n_bills,
-                name = paste(t, "Bills"), line = list(color = pal[i], width = 2)
+    output$bubble_topics <- renderPlotly({
+        plot_ly(
+            topics,
+            x = ~controversiality, y = ~ avg_outcome * 100, type = "scatter",
+            mode = "markers",
+            size = 45,
+            text = ~topic,
+            hovertemplate = "<b>%{text}</b><br>Chaptered % %{y:.2f}<br>Polarisation % %{x:.2f}",
+            marker = list(color = "#A7C957", opacity = .7, line = list(width = 1, color = "#004E89"))
+        ) |> layout(
+            xaxis = list(title = "Relative Controversiality<br><sup>(On a scale from 0 to 5)</sup>"),
+            yaxis = list(title = "Successful legislation (%)")
+        )
+    })
+    output$leg_metrics_bar <- renderPlotly({
+        req(input$metric)
+        dt <- leg %>%
+            filter(!is.na(topic_focus_y))
+
+        if (input$metric == "leverage") {
+            dt <- dt %>%
+                rename(
+                    "Topic Focus" = topic_focus_y
+                )
+            ggplotly(
+                ggplot(dt, aes(x = !!sym(input$metric), y = `Topic Focus`, fill = `Topic Focus`, text = name)) +
+                    annotate(
+                        "rect",
+                        xmin = -1e-4, xmax = 0, ymin = 0, ymax = 18,
+                        fill = "red", alpha = 0.15
+                    ) +
+                    annotate(
+                        "rect",
+                        xmin = 0, xmax = 1e-4, ymin = 0, ymax = 18,
+                        fill = "green", alpha = 0.15
+                    ) +
+                    scale_x_continuous(
+                        limits = c(-1e-4, 1e-4)
+                    ) +
+                    geom_jitter() +
+                    guides(fill = "none") +
+                    labs(x = input$metric, y = "Topic Focus") +
+                    theme_minimal() +
+                    theme(
+                        axis.title.y = element_blank(),
+                        axis.text.y = element_text(size = 8, margin = margin(r = 0, l = 0))
+                    ),
+                tooltip = c("text", "x", "y"),
+                hovertemplate = "<b>%{text}</b><br>%{x:.2f} %{y}"
             )
-            p <- add_lines(p,
-                x = sub$session, y = sub$total_funding / 1e6,
-                name = paste(t, "Funding $M"), yaxis = "y2",
-                line = list(color = pal[i], dash = "dot")
+        } else if (input$metric == "num_authored_bills") {
+            ggplotly(
+                ggplot(dt, aes(x = !!sym(input$metric), y = topic_focus_y, fill = topic_focus_y, text = name)) +
+                    geom_jitter() +
+                    guides(fill = "none") +
+                    labs(x = input$metric, y = "Topic Focus") +
+                    theme_minimal() +
+                    theme(
+                        axis.title.y = element_blank(),
+                        axis.text.y = element_text(size = 8, margin = margin(r = 0, l = 0))
+                    ),
+                tooltip = c("text", "x", "y"),
+                hovertemplate = "<b>%{text}</b><br>%{x:.2f} %{y}"
             )
-            i <- i + 1
+        } else {
+            dt <- dt %>%
+                mutate(
+                    pct_passed = if_else(
+                        is.na(as.numeric(pct_passed)),
+                        0,
+                        as.numeric(pct_passed) * 100
+                    )
+                )
+            ggplotly(
+                ggplot(dt, aes(x = pct_passed, y = topic_focus_y, fill = topic_focus_y, text = name)) +
+                    geom_jitter() +
+                    guides(fill = "none") +
+                    labs(x = "% Passed", y = "Topic Focus") +
+                    theme_minimal() +
+                    theme(
+                        axis.title.y = element_blank(),
+                        axis.text.y = element_text(size = 8, margin = margin(r = 0, l = 0))
+                    ),
+                tooltip = c("text", "x", "y"),
+                hovertemplate = "<b>%{text}</b><br>%{x} %{y}"
+            )
         }
-        layout(p, yaxis2 = list(
-            title = "$ Millions",
-            overlaying = "y", side = "right"
-        ))
     })
 
-    # ---- Topic KPIs ------------------------------------------------------
-    tp_row <- reactive(topics[topic == input$ex_topic])
-
-    lapply(c("n_bills", "total_dollars", "avg_success", "avg_polar"), \(col){
-        output[[paste0("kpi_", col)]] <- renderText({
-            v <- tp_row()[[col]]
-            switch(col,
-                total_dollars = dollar(v),
-                avg_success   = percent(v),
-                avg_polar     = percent(v),
-                v
-            )
-        })
-    })
-
-    output$topic_plot <- renderPlotly({
-        sub <- policy[topic == input$ex_topic]
-        plot_ly(sub, x = ~session) |>
-            add_bars(y = ~n_bills, name = "Bills", marker = list(color = "#168aad")) |>
-            add_lines(
-                y = ~ total_funding / 1e6, name = "Funding $M",
-                line = list(color = "#f49f0a", width = 2), yaxis = "y2"
-            ) |>
-            layout(yaxis2 = list(overlaying = "y", side = "right", title = "$ Millions"))
-    })
-
-
-    output$recent_tbl <- DT::renderDT(
-        {
-            recent[topic == input$ex_topic][order(-intro_date)][
-                , .(intro_date, bill_id, title, success_risk, polarisation_score)
-            ]
-        },
-        options = list(pageLength = 8, scrollX = TRUE)
-    )
-
-    # ---- Keyword search --------------------------------------------------
     observeEvent(input$btn_kw, {
         kw <- tolower(trimws(input$kw))
-        res <- if (nchar(kw)) {
+        res <- if (nzchar(kw)) {
             bill[
                 grepl(kw, tolower(title)),
-                .(
-                    intro_date, bill_id, title, topic,
-                    success_risk, polarisation_score
-                )
+                .(bill_id, title, topic, success_risk, polarisation_score)
             ]
         } else {
             data.table()
         }
-        output$kw_results <- DT::renderDT(res,
-            options = list(pageLength = 12, scrollX = TRUE)
-        )
+        output$kw_results <- DT::renderDT(res, options = list(pageLength = 15, scrollX = TRUE))
     })
 
-    # ---------- SEARCH ----------------------------------
     observeEvent(input$btn_find, {
-        ids <- nearest(input$search_billId, k = 10)
-        df <- rv()$bill[bill_id %in% ids]
-        output$tbl_similar <- renderDT(datatable(df, options = list(scrollX = TRUE)))
-
-        main <- rv()$bill[bill_id == input$search_billId]
-        if (nrow(main)) {
-            output$txt_bill_profile <- renderText({
-                sprintf(
-                    "Bill %s • Topic: %s • Success Risk %.2f • Polarisation %.2f",
-                    main$bill_id, main$topic, main$success_risk, main$polarisation_score
-                )
-            })
-        }
+        ids <- nearest(input$search_billId, 10)
+        output$tbl_similar <- DT::renderDT(
+            bill[bill_id %in% ids, .(bill_id, title, topic, success_risk, polarisation_score)],
+            options = list(pageLength = 10, scrollX = TRUE)
+        )
     })
 }
 

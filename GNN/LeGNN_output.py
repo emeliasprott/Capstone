@@ -8,7 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 from torch_geometric.nn import SAGEConv, GINEConv, LEConv
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
-from torch_geometric.loader import NeighborLoader
+from torch_geometric.loader import HGTLoader
 
 hidden_dim = 128
 n_layers = 2
@@ -19,37 +19,37 @@ num_topics = len(policy_topic_embs)
 
 # data preprocessing
 def compute_controversiality(data):
-    edge_type = ('legislator_term', 'voted_on', 'bill_version')
-    if edge_type not in data.edge_index_dict:
-        raise ValueError("Missing 'voted_on' edges in data.")
+        edge_type = ('legislator_term', 'voted_on', 'bill_version')
+        if edge_type not in data.edge_index_dict:
+            raise ValueError("Missing 'voted_on' edges in data.")
 
-    ei = data[edge_type].edge_index
-    ea = data[edge_type].edge_attr
+        ei = data[edge_type].edge_index
+        ea = data[edge_type].edge_attr
 
-    vote_signal = ea[:, 0]
+        vote_signal = ea[:, 0]
 
-    src_nodes = ei[0]
-    tgt_nodes = ei[1]
+        src_nodes = ei[0]
+        tgt_nodes = ei[1]
 
-    num_bills = data['bill_version'].num_nodes
-    device = tgt_nodes.device
+        num_bills = data['bill_version'].num_nodes
+        device = tgt_nodes.device
 
-    yes_votes = torch.zeros(num_bills, device=device)
-    no_votes = torch.zeros(num_bills, device=device)
+        yes_votes = torch.zeros(num_bills, device=device)
+        no_votes = torch.zeros(num_bills, device=device)
 
-    yes_votes.index_add_(0, tgt_nodes, (vote_signal > 0).float())
-    no_votes.index_add_(0, tgt_nodes, (vote_signal < 0).float())
+        yes_votes.index_add_(0, tgt_nodes, (vote_signal > 0).float())
+        no_votes.index_add_(0, tgt_nodes, (vote_signal < 0).float())
 
-    total_votes = yes_votes + no_votes + 1e-6
+        total_votes = yes_votes + no_votes + 1e-6
 
-    yes_ratio = yes_votes / total_votes
-    no_ratio = no_votes / total_votes
+        yes_ratio = yes_votes / total_votes
+        no_ratio = no_votes / total_votes
 
-    controversy = 4 * yes_ratio * no_ratio
-    controversy = controversy.clamp(0, 1)
-    data['bill_version'].controversy = controversy
+        controversy = 4 * yes_ratio * no_ratio
+        controversy = controversy.clamp(0, 1)
+        data['bill_version'].controversy = controversy
 
-    return data
+        return data
 
 def safe_normalize_timestamps(timestamps: torch.Tensor) -> torch.Tensor:
     timestamps = torch.nan_to_num(timestamps, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -71,12 +71,10 @@ def safe_standardize_time_format(time_data) -> torch.Tensor:
                 td = t
             elif float(t) > 17000000.0:
                 td = float(t)
-                while td > 10:
-                    td = td / 10
-            elif float(t) < 0:
-                td = -float(t)
-            else:
+            elif isinstance(t, datetime.datetime):
                 td = t.timestamp()
+            else:
+                td = float(t) * 1e9
         except:
             td = datetime.datetime(2000, 6, 15).timestamp()
         times.append(td)
@@ -93,7 +91,7 @@ def pull_timestamps(data):
         ('bill_version', 'rev_voted_on', 'legislator_term'),
         ('legislator_term', 'voted_on', 'bill_version'),
     ]
-    timestamp_nodes = ['legislator_term', 'bill_version', 'bill']
+    timestamp_nodes = ['legislator_term', 'bill_version', 'bill', 'committee']
 
     for et in timestamp_edges:
         if hasattr(data[et], 'edge_attr') and data[et].edge_attr is not None and len(data[et].edge_attr.size()) > 1:
@@ -152,12 +150,15 @@ def load_and_preprocess_data(path='GNN/data2.pt'):
             full_data[nt].x = full
             full_data[nt].num_nodes = full.size(0)
 
+    # Check and fix edge indices before transformation
     for edge_type, edge_index in full_data.edge_index_dict.items():
         src_type, _, dst_type = edge_type
 
+        # Get max node indices
         max_src_idx = edge_index[0].max().item() if edge_index.size(1) > 0 else -1
         max_dst_idx = edge_index[1].max().item() if edge_index.size(1) > 0 else -1
 
+        # Ensure node counts are sufficient
         if max_src_idx >= full_data[src_type].num_nodes:
             print(f"Fixing {src_type} node count: {full_data[src_type].num_nodes} -> {max_src_idx + 1}")
             full_data[src_type].num_nodes = max_src_idx + 1
@@ -360,9 +361,17 @@ class ActorTopicAligner(nn.Module):
         self.query_proj = nn.Linear(dim, dim, bias=False)
         self.key_proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, actor_z, bill_z, bill_topic_prob):
+    def forward(self, actor_z, bill_z, bill_topic_prob, reach_mask=None):
         attn_logits = scaled_cosine(self.query_proj(actor_z), self.key_proj(bill_z))
-        alpha = attn_logits.softmax(dim=1)
+        if reach_mask is not None:
+            if reach_mask.size(1) != attn_logits.size(1):
+                reach_mask = reach_mask[:, :attn_logits.size(1)]
+            if reach_mask.size(0) != attn_logits.size(0):
+                reach_mask = reach_mask[:attn_logits.size(0)]
+            reach_mask = reach_mask.to(attn_logits.device)
+            attn_logits = attn_logits.masked_fill(~reach_mask, -1e9)
+        alpha = attn_logits.softmax(1)
+        alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
         return alpha @ bill_topic_prob
 
 class LegislativeGraphEncoder(nn.Module):
@@ -430,40 +439,29 @@ class LegislativeGraphEncoder(nn.Module):
                 if not valid_mask.any():
                     continue
 
-                # Filter edge_index and edge_attr
                 filtered_edge_index = edge_index[:, valid_mask]
                 filtered_edge_attr = edge_attr[valid_mask]
                 filtered_dst_nodes = filtered_edge_index[1]
 
                 try:
                     msg = self.polarity_conv((h_src, h_dst), filtered_edge_index, filtered_edge_attr)
-
-                    # Create a new destination embedding tensor
                     new_dst = h_dst.clone()
-
-                    # Get unique destination nodes that received messages
                     unique_dst_nodes = torch.unique(filtered_dst_nodes)
 
                     # Only update nodes that received messages
                     if msg.size(0) == unique_dst_nodes.size(0):
-                        # If we have one message per unique destination node
                         new_dst[unique_dst_nodes] = new_dst[unique_dst_nodes] + msg
                     elif msg.size(0) == filtered_dst_nodes.size(0):
-                        # If we have one message per edge, aggregate them
                         for i, node_idx in enumerate(unique_dst_nodes):
-                            # Find all messages for this node
                             node_mask = (filtered_dst_nodes == node_idx)
-                            # Aggregate messages (e.g., by taking the mean)
                             node_msgs = msg[node_mask]
                             if node_msgs.size(0) > 0:
                                 new_dst[node_idx] = new_dst[node_idx] + node_msgs.mean(dim=0)
 
-                    # Update the node embeddings
                     x_dict[dst_type] = new_dst
 
                 except Exception as e:
                     print(f"Error in polarity_conv: {e}")
-                    # Keep original embeddings if there's an error
                     x_dict[dst_type] = h_dst
 
             elif edge_type in [
@@ -538,7 +536,7 @@ class LegislativeGraphEncoder(nn.Module):
         return x_dict
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(self, metadata, hidden_dim, policy_topic_embs, device=device):
+    def __init__(self, metadata, hidden_dim, allowed_paths, policy_topic_embs, device=device):
         super().__init__()
         self.device = device
         self.encoder = LegislativeGraphEncoder(num_topics, metadata, hidden_dim, n_layers, dropout_p, device)
@@ -550,6 +548,11 @@ class LegislativeGraphModel(nn.Module):
         self.topic_align = nn.ModuleDict({
             nt: ActorTopicAligner(hidden_dim) for nt in self.actor_types
         })
+        self.meta_mask = build_metapath_mask(
+            data,
+            actor_types=["donor","lobby_firm","committee","legislator"],
+            bill_type="bill_version",
+            allowed_paths=allowed_paths)
 
     def forward(self, data):
         z = self.encoder(data)
@@ -563,7 +566,9 @@ class LegislativeGraphModel(nn.Module):
             if nt in z:
                 actor_z = z[nt]
                 influence_dict[nt] = self.influence[nt](actor_z, bill_z, bill_y)
-                actor_topic_dict[nt] = self.topic_align[nt](actor_z, bill_z, bill_topic_prob)
+                reach = self.meta_mask[nt]
+                actor_topic_dict[nt] = self.topic_align[nt](actor_z, bill_z, bill_topic_prob, reach_mask=reach)
+
 
         return {
             'node_embeddings': z,
@@ -573,58 +578,55 @@ class LegislativeGraphModel(nn.Module):
             'actor_topic_dict': actor_topic_dict
         }
 
-    def compute_link_reconstruction_loss(self, z_dict, data, num_neg=1):
-        loss = torch.tensor(0., device=self.device)
+    def compute_link_reconstruction_loss(self, z_dict, batch, neg_k=1, temp=0.1):
+        device = self.device
+        total_pos, total_neg = 0.0, 0.0
+        bce = nn.BCEWithLogitsLoss()
 
-        for rel, ei in data.edge_index_dict.items():
-            s_t, t, d_t = rel
+        for et, edge_index in batch.edge_index_dict.items():
+            s_t, _, d_t = et
             if s_t not in z_dict or d_t not in z_dict:
                 continue
-            src, dst = ei
-            valid_src = (src < z_dict[s_t].size(0))
-            valid_dst = (dst < z_dict[d_t].size(0))
-            valid_mask = valid_src & valid_dst
-            if not valid_mask.any():
+
+            src, dst = edge_index
+            if src.numel() == 0:
                 continue
-            valid_src_idx = src[valid_mask]
-            valid_dst_idx = dst[valid_mask]
-            src_emb = F.normalize(z_dict[s_t][valid_src_idx], p=2, dim=-1)
-            dst_emb = F.normalize(z_dict[d_t][valid_dst_idx], p=2, dim=-1)
-            pos_score = torch.clamp((src_emb * dst_emb).sum(dim=-1), -10, 10)
-            pos_loss = nn.BCEWithLogitsLoss()(pos_score, torch.ones_like(pos_score, device=self.device))
-            try:
-                max_dst_idx = z_dict[d_t].size(0) - 1
-                if max_dst_idx > 0:
-                    n_samples = min(valid_src_idx.size(0) * num_neg, 5000)
-                    neg_dst = torch.randint(0, max_dst_idx + 1, (n_samples,), device=self.device)
-                    neg_src_indices = torch.randint(0, valid_src_idx.size(0), (n_samples,), device=self.device)
-                    neg_src = valid_src_idx[neg_src_indices]
-                    neg_src_emb = F.normalize(z_dict[s_t][neg_src], p=2, dim=-1)
-                    neg_dst_emb = F.normalize(z_dict[d_t][neg_dst], p=2, dim=-1)
-                    neg_score = torch.clamp((neg_src_emb * neg_dst_emb).sum(dim=-1), -10, 10)
-                    neg_loss = nn.BCEWithLogitsLoss()(neg_score, torch.zeros_like(neg_score, device=self.device))
-                    loss += pos_loss + neg_loss
-            except Exception as e:
-                print(f"Error in negative sampling: {e}")
-                loss += pos_loss
-        if torch.isnan(loss) or torch.isinf(loss):
-            print("NaN/Inf detected in final link reconstruction loss")
-            return torch.tensor(0.01, device=self.device, requires_grad=True)
+
+            src_emb = F.normalize(z_dict[s_t][src], p=2, dim=-1)
+            dst_emb = F.normalize(z_dict[d_t][dst], p=2, dim=-1)
+            pos_log = (src_emb * dst_emb).sum(-1) / temp
+            pos_lbl = torch.ones_like(pos_log)
+            total_pos = total_pos + bce(pos_log, pos_lbl)
+
+            if neg_k > 0:
+                # random permutation from batch
+                perm = torch.randperm(dst.size(0), device=device)
+                neg_dst = dst_emb[perm][:pos_log.size(0) * neg_k]
+                neg_src = src_emb.repeat(neg_k, 1)
+
+                neg_log = (neg_src * neg_dst).sum(-1) / temp
+                neg_lbl = torch.zeros_like(neg_log)
+                total_neg = total_neg + bce(neg_log, neg_lbl)
+
+        loss = total_pos + total_neg
+        if not torch.isfinite(loss):
+            loss = torch.tensor(0.001, device=device, requires_grad=True)
         return loss
 
-    def compute_loss(self, data):
-        out = self.forward(data)
+    def compute_loss(self, out, data):
         z = out['node_embeddings']
-
         link_loss = self.compute_link_reconstruction_loss(z, data)
         all_inf = torch.cat(list(out['influence_dict'].values()))
         inf_reg = (all_inf ** 2).mean()
 
         ent = 0.0
         for probs in out['actor_topic_dict'].values():
-            p = probs.clamp_min(1e-9)
+            p = torch.nan_to_num(probs, nan=0.0)
+            p = p.clamp_min(1e-9)
             ent += (-p * p.log()).sum(dim=-1).mean()
         ent_reg = ent / max(len(out['actor_topic_dict']), 1)
+        if torch.isnan(ent_reg):
+            ent_reg = torch.tensor(0.0, device=device, requires_grad=True)
 
         total = link_loss + (0.1 * inf_reg) + (0.1 * ent_reg)
         return {
@@ -658,7 +660,6 @@ class LegislativeGraphModel(nn.Module):
             batch = self.data
 
         outputs = self.forward(batch)
-        z_dict = outputs['node_embeddings']
 
         attention_heads = {}
 
@@ -672,6 +673,99 @@ class LegislativeGraphModel(nn.Module):
             attention_heads['alignment_loss'] = outputs['alignment_loss']
 
         return attention_heads
+
+    def _slice_mask(self, nt, batch):
+        if nt not in self.meta_mask:
+            return None
+
+        rows = getattr(batch[nt], "node_id", None)
+        if rows is None:
+            rows = torch.arange(batch[nt].num_nodes, device=self.dev)
+
+        bill_store = batch["bill_version"]
+        cols = getattr(bill_store, "node_id", None)
+        if cols is None:
+            cols = torch.arange(bill_store.num_nodes, device=self.dev)
+
+        return self.meta_mask[nt][rows][:, cols]
+
+def _adj(data, et):
+    row, col = data.edge_index_dict[et]
+    n_src = data[et[0]].num_nodes
+    n_dst = data[et[2]].num_nodes
+    A = torch.sparse_coo_tensor(
+            torch.stack([row, col]),
+            torch.ones_like(row, dtype=torch.float32),
+            (n_src, n_dst)).coalesce()
+    return A
+
+def build_metapath_mask(data, actor_types, allowed_paths, bill_type = "bill_version"):
+
+    device = next(iter(data.edge_index_dict.values())).device
+    cache  = {et: _adj(data, et).to(device) for et in data.edge_index_dict}
+
+    masks  = {}
+    n_bill = data[bill_type].num_nodes
+
+    for actor in actor_types:
+        n_actor = data[actor].num_nodes
+        reach = torch.sparse_coo_tensor(torch.empty(2, 0, device=device, dtype=torch.long), torch.empty(0, device=device), (n_actor, n_bill)).coalesce()
+
+        for path in allowed_paths.get(actor, []):
+            M = cache[path[0]]
+            for et in path[1:]:
+                N = cache[et]
+                if M.size(1) != N.size(0):
+                    if M.size(1) == N.size(1):
+                        N = N.t()
+                    else:
+                        raise ValueError(
+                            f"Cannot compose {et} after previous edge; "
+                            f"dim mismatch {M.size()} vs {N.size()}")
+                M = torch.sparse.mm(M, N).coalesce()
+
+            reach = (reach + M).coalesce()
+
+        dense = (reach.to_dense() > 0)
+        if dense.sum() == 0:
+            print(f"[WARN] meta-path mask for {actor} is empty.")
+        masks[actor] = dense
+
+    return masks
+
+ALLOWED = {
+    "donor": [
+        ( ('donor','donated_to','legislator_term'),
+        ('legislator_term','voted_on','bill_version') ),
+        (
+        ('donor', 'donated_to','legislator_term'),
+        ('legislator_term','wrote','bill_version') ),
+    ],
+    "lobby_firm": [
+        ( ('lobby_firm','lobbied','legislator_term'),
+        ('legislator_term','voted_on','bill_version') ),
+        ( ('lobby_firm','lobbied','committee'),
+        ('committee','rev_member_of','legislator_term'),
+        ('legislator_term','voted_on','bill_version') ),
+        ( ('lobby_firm','lobbied','committee'),
+        ('committee','rev_member_of','legislator_term'),
+        ('legislator_term','wrote','bill_version') ),
+        ( ('lobby_firm','lobbied','legislator_term'),
+        ('legislator_term', 'wrote','bill_version') )
+    ],
+    "committee": [
+        ( ('committee','rev_member_of','legislator_term'),
+        ('legislator_term','voted_on','bill_version') ),
+        ( ('committee','rev_member_of','legislator_term'),
+        ('legislator_term','wrote','bill_version') )
+    ],
+    "legislator": [
+        ( ('legislator', 'samePerson', 'legislator_term'),
+        ('legislator_term','voted_on','bill_version') ),
+        ( ('legislator', 'samePerson', 'legislator_term'),
+        ('legislator_term','wrote','bill_version') )
+    ]
+}
 
 def bill_kpis(bill_ids, p_topic, actor_topic, influence):
     dom = p_topic.argmax(1)
@@ -696,10 +790,10 @@ def bill_kpis(bill_ids, p_topic, actor_topic, influence):
     return pd.DataFrame({
         "bill_id": bill_ids.cpu().numpy(),
         "dominant_topic": dom.cpu().numpy(),
-        "topic_entropy": entr.cpu().numpy(),
-        "alignment_support": align_sup.cpu().numpy(),
-        "polarisation_score": polar.cpu().numpy(),
-        "success_risk": risk.cpu().numpy(),
+        "topic_entropy": entr.detach().numpy(),
+        "alignment_support": align_sup.detach().numpy(),
+        "polarisation_score": polar.detach().numpy(),
+        "success_risk": risk.detach().numpy(),
     })
 
 
@@ -718,17 +812,17 @@ def actor_kpis(node_ids, p_topic, influence, ideology_index=(0,1)):
     return pd.DataFrame({
         "node_id": node_ids.cpu().numpy(),
         "top_topic": p_topic.argmax(1).cpu().numpy(),
-        "topic_focus": focus.cpu().numpy(),
-        "influence": influence.view(-1).cpu().numpy(),
-        "leverage": lever.cpu().numpy(),
-        "bipartisan_score": bipartisan.cpu().numpy(),
+        "topic_focus": focus.detach().numpy(),
+        "influence": influence.view(-1).detach().numpy(),
+        "leverage": lever.detach().numpy(),
+        "bipartisan_score": bipartisan.detach().numpy(),
     })
 
 
 def topic_snapshot(p_topic_bills, bill_dates, actor_topic_all, influence_all):
     df = pd.DataFrame({
         "date": pd.to_datetime(bill_dates),
-        "topic": p_topic_bills.argmax(1).cpu().numpy()
+        "topic": p_topic_bills.argmax(1).detach().numpy()
     })
     weekly = df.groupby(["topic", pd.Grouper(key="date", freq="W")]).size()
 
@@ -763,16 +857,26 @@ gc.collect()
 for nt in data.node_types:
     data[nt].node_id = torch.arange(data[nt].num_nodes, dtype=torch.long)
 
-model = LegislativeGraphModel(data.metadata(), hidden_dim, policy_topic_embs).to(device)
+model = LegislativeGraphModel(data.metadata(), hidden_dim, ALLOWED, policy_topic_embs).to(device)
 state_dict = torch.load("best_model5.pt")
 model.load_state_dict(state_dict)
 
-loader = NeighborLoader(
+torch.mps.empty_cache()
+gc.collect()
+loader = HGTLoader(
     data,
-    num_neighbors={k: [25] * 2 for k in data.edge_types},
-    batch_size=128,
-    shuffle=False,
-    input_nodes=('legislator_term')
+    num_samples={
+        'legislator_term': [48] * 2,
+        'legislator': [48] * 2,
+        'committee': [96] * 2,
+        'lobby_firm': [192] * 2,
+        'donor': [192] * 2,
+        'bill_version': [384] * 2,
+        'bill': [384] * 2,
+    },
+    batch_size=64,
+    shuffle=True,
+    input_nodes='legislator_term'
 )
 
 embs = {nt: [] for nt in data.node_types}
@@ -789,8 +893,7 @@ shared_paths = {tbl: [] for tbl in [
 
 for i, batch in tqdm(enumerate(loader), total=len(loader), desc="Processing batches"):
     batch = batch.to(device)
-    with torch.no_grad():
-        out = model(batch)
+    out = model(batch)
     z_dict = out['node_embeddings']
     bill_prob = out['bill_topic_prob']
     infl_dict = out['influence_dict']
@@ -823,14 +926,14 @@ for i, batch in tqdm(enumerate(loader), total=len(loader), desc="Processing batc
         shared_paths[f"{nt}_kpis"].append(str(p))
         pd.DataFrame({
             "node_id": node_ids.cpu().numpy(),
-            "topic_probs": list(actor_topic[nt].cpu().numpy())
+            "topic_probs": list(actor_topic[nt].detach().cpu().numpy())
         }).to_parquet(OUT_DIR / f"{nt}_topic_probs_{i}.parquet", index=False)
 
 
         e = OUT_DIR / f"{nt}_embeddings_{i}.parquet"
         emb_df = pd.DataFrame({
             "node_id": node_ids.cpu().numpy(),
-            "embedding": list(z_dict[nt].cpu().numpy())
+            "embedding": list(z_dict[nt].detach().cpu().numpy())
         })
         emb_df.to_parquet(e, index=False)
         shared_paths[f"{nt}_embeddings"].append(str(e))
