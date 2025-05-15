@@ -665,7 +665,7 @@ def main():
             gc.collect()
 
 
-        avg_loss = epoch_loss / max(1, len(loader))
+        avg_loss = epoch_loss / 23
         print(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
 
         if avg_loss < best_loss:
