@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-from torch_geometric.nn import SAGEConv, GINEConv, LEConv
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 from torch_geometric.utils import softmax
 from torch_scatter import scatter_add, scatter_mean
@@ -29,6 +28,24 @@ def sanitize(t, clamp=1e4):
 def _global_to_local(sorted_global, query):
     pos = torch.searchsorted(sorted_global, query)
     return pos
+
+def alarm():
+    import sounddevice as sd
+    import time
+
+    fs = 25500
+    duration = 0.6
+    frequency = 435
+
+    t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+    x = 1.05 * np.sin(2 * np.pi * frequency * t)
+
+    for j in range(3):
+        for i in range(3):
+            sd.play(x, fs)
+            sd.wait()
+
+        time.sleep(0.5)
 
 # preprocessing
 def safe_normalize_timestamps(timestamps):
@@ -145,7 +162,7 @@ def compute_controversiality(data):
 
     return data
 
-def load_and_preprocess_data(path='GNN/data2.pt'):
+def load_and_preprocess_data(path='data3.pt'):
     full_data = torch.load(path, weights_only=False)
     for nt in full_data.node_types:
         if hasattr(full_data[nt], 'x') and full_data[nt].x is not None:
@@ -164,6 +181,7 @@ def load_and_preprocess_data(path='GNN/data2.pt'):
         if max_dst_idx >= full_data[dst_type].num_nodes:
             print(f"Fixing {dst_type} node count: {full_data[dst_type].num_nodes} -> {max_dst_idx + 1}")
             full_data[dst_type].num_nodes = max_dst_idx + 1
+    full_data['bill'].y[np.where(full_data['bill'].y < 0)[0]] = 0
 
     data = ToUndirected(merge=False)(full_data)
     del full_data
@@ -198,7 +216,7 @@ class FeatureProjector(nn.Module):
         self.t2v = Time2Vec(t_dim)
         self.prj = nn.ModuleDict()
         for nt in metadata[0]:
-            use_t = nt in ['bill_version','legislator_term', 'bill']
+            use_t = nt in ['legislator_term', 'bill', 'bill_version']
             d_in  = in_dims[nt] + (t_dim if use_t else 0)
             self.prj[nt] = nn.Sequential(
                 nn.LayerNorm(d_in),
@@ -216,7 +234,7 @@ class FeatureProjector(nn.Module):
 
 
 class RGTLayer(nn.Module):
-    def __init__(self, d=hidden_dim, h=4, p=0.1, device=device):
+    def __init__(self, d=hidden_dim, h=8, p=0.1, time_decay=True, device=device):
         super().__init__()
         self.h = h
         self.dk = d // h
@@ -225,6 +243,7 @@ class RGTLayer(nn.Module):
         self.Q = nn.Linear(self.d, self.d, bias=False)
         self.K = nn.Linear(self.d, self.d, bias=False)
         self.V = nn.Linear(self.d, self.d, bias=False)
+        self.time_decay = time_decay
         self.rel = nn.ParameterDict()
         self.ffn = nn.Sequential(
             nn.LayerNorm(d),
@@ -245,7 +264,7 @@ class RGTLayer(nn.Module):
                 param.data = param.data.to(self.device)
         return param
 
-    def forward(self, h, ei, ew):
+    def forward(self, h, ei, ew, ts=None):
         msg = {k: torch.zeros_like(v) for k, v in h.items()}
         for r, e in ei.items():
             s, t = e
@@ -254,19 +273,22 @@ class RGTLayer(nn.Module):
             v = self.V(h[r[0]])[s].view(-1, self.h, self.dk)
             R = self._r(r)
             l = ((q * (k + R)).sum(-1)) / np.sqrt(self.dk)
-            a = softmax(F.leaky_relu(l), t, num_nodes=h[r[2]].size(0))
-            if (w := ew.get(r)) is not None:
-                a = a * (1. + w.unsqueeze(-1))
-            m = (a.unsqueeze(-1) * v).view(-1, self.h * self.dk)
-            msg[r[2]] += scatter_add(m, t, dim=0, dim_size=h[r[2]].size(0))
+            if self.time_decay and ts is not None:
+                dt = 1.0 - ts[s]
+                l = l - dt.unsqueeze(-1)
+            if ew and ew.get(r) is not None:
+                l = l + ew[r].unsqueeze(-1)
+                p = F.softmax(l, dim=-1)
+                m = (p.unsqueeze(-1) * v).view(-1, self.d)
+                msg[r[2]].index_add_(0, t, m)
         o = {}
         for nt in h:
             h_res = h[nt] + msg[nt]
-            o[nt] = h_res + self.ffn(F.layer_norm(h_res, (h_res.size(1),)))
+            o[nt] = h_res + self.ffn(h_res)
         return o
 
 class PolarityAwareConv(nn.Module):
-    def __init__(self, h_dim, e_dim, p, inc, outc):
+    def __init__(self, h_dim, e_dim, p):
         super().__init__()
         self.edge_mlp = nn.Sequential(
             nn.Linear(e_dim - 1, h_dim),
@@ -290,11 +312,30 @@ class PolarityAwareConv(nn.Module):
 
         return scatter_add(m, dst, dim=0, dim_size=x_dst.size(0))
 
-class ActorTopicAligner(nn.Module):
-    def __init__(self, d):
+class ActorHead(nn.Module):
+    def __init__(self, d, h=4):
         super().__init__()
+        self.h = h
+        dk = d // h
         self.Q = nn.Linear(d, d, bias=False)
         self.K = nn.Linear(d, d, bias=False)
+        self.V = nn.Linear(d, d, bias=False)
+        self.dk = dk
+
+    def forward(self, a_z, bv_z, mask, weight=None):
+        q = self.Q(a_z).view(-1, self.h, self.dk).transpose(0, 1)
+        k = self.K(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
+        v = self.V(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
+        att = (q @ k.transpose(-1, -2)) / np.sqrt(self.dk)
+        att = att.transpose(0, 1)
+        att = att.masked_fill(~mask.unsqueeze(1), -1e9)
+        if weight is not None:
+            att = att + weight.unsqueeze(1)
+        p = att.softmax(dim=-1)
+        context = torch.matmul(p.transpose(0, 1), v)
+        topic_align = context.mean(0)
+        influence = p.mean(1).sum(-1)
+        return topic_align, influence
 
 class BillTopicHead(nn.Module):
     def __init__(self, hidden_dim, k):
@@ -302,12 +343,6 @@ class BillTopicHead(nn.Module):
         self.fc = nn.Linear(hidden_dim, k, bias=False)
     def forward(self, z):
         return self.fc(z)
-
-class InfluenceScorer(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.Q = nn.Linear(d, d, bias=False)
-        self.K = nn.Linear(d, d, bias=False)
 
 class SuccessHead(nn.Module):
     def __init__(self, d):
@@ -344,18 +379,15 @@ class LegislativeGraphEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.node_types = metadata[0]
 
-        in_dims = {nt: c for nt, c in zip(self.node_types, [389, 769, 385, 2, 385, 384, 384])}
+        in_dims = {nt: c for nt, c in zip(self.node_types, [769, 389, 385, 2, 385, 384, 384])}
         self.proj = FeatureProjector(metadata, in_dims, d_out=hidden_dim, t_dim=12)
 
-        self.rgt_layers = nn.ModuleList([RGTLayer(hidden_dim, 4, dropout)
-                                        for _ in range(n_layers)])
+        self.rgt_layers = nn.ModuleList([RGTLayer(hidden_dim, 4, dropout) for _ in range(n_layers)])
 
         vote_e_dim = 385
-        self.vote_conv = PolarityAwareConv(hidden_dim, vote_e_dim,
-                                            dropout, hidden_dim, hidden_dim)
+        self.vote_conv = PolarityAwareConv(hidden_dim, vote_e_dim, dropout)
 
-        self.norm = nn.ModuleDict({nt: nn.LayerNorm(hidden_dim).to(device)
-                                    for nt in self.node_types})
+        self.norm = nn.ModuleDict({nt: nn.LayerNorm(hidden_dim).to(device) for nt in self.node_types})
         self.drop = nn.Dropout(dropout)
 
     def forward(self, batch):
@@ -388,8 +420,12 @@ class LegislativeGraphModel(nn.Module):
         self.success = SuccessHead(hidden_dim)
 
         self.actor_types = ['legislator', 'committee', 'donor', 'lobby_firm']
-        self.align = nn.ModuleDict({nt: ActorTopicAligner(hidden_dim) for nt in self.actor_types})
-        self.inf = nn.ModuleDict({nt: InfluenceScorer(hidden_dim) for nt in self.actor_types})
+        self.actor_head = nn.ModuleDict({nt: ActorHead(hidden_dim) for nt in self.actor_types})
+        k_topics = topic_onehot.size(1)
+        dk = hidden_dim // self.actor_head['legislator'].h
+        self.actor_topic_proj = nn.ModuleDict({
+            nt: nn.Linear(dk, k_topics, bias=False) for nt in self.actor_types
+        })
 
         self.register_buffer('cluster_id',  cluster_id)
         self.register_buffer('topic_onehot', topic_onehot)
@@ -397,54 +433,42 @@ class LegislativeGraphModel(nn.Module):
     def forward(self, batch, mask_weight_dict):
         z = self.hier(self.encoder(batch), batch)
         bill_nodes = batch['bill'].node_id.to(self.device)
-        bv_nid = batch['bill_version'].node_id.to(self.device)
-        z_bv = z['bill_version'][bv_nid]
-        z_actor = {nt: z[nt] for nt in self.actor_types if nt in z}
+        bv_nodes = batch['bill_version'].node_id.to(self.device)
 
         bill_embed = z['bill'][bill_nodes]
+        z_bv = z['bill_version'][bv_nodes]
+
         bill_logits = self.topic_head(bill_embed)
         bill_labels = self.cluster_id[bill_nodes]
         bill_prob = self.topic_onehot[bill_nodes]
-        success_log = self.success(bill_embed)[bill_nodes]
 
-        ev2b = batch.edge_index_dict[('bill_version', 'is_version', 'bill')]
-        av2b = batch[('bill_version', 'is_version', 'bill')].edge_attr[:, 0].clamp(1e-2, 1e2).to(self.device)
-        B_vb = bv_nid.size(0)
-        Bb = bill_nodes.size(0)
-        W_vb = torch.zeros(B_vb, Bb, device=self.device)
-        rows, cols = ev2b
-        rows = rows.to(self.device)
-        cols = cols.to(self.device)
-        W_vb[rows, bill_nodes[cols]] = av2b
+        rows_g, cols_g = batch.edge_index_dict[('bill_version','is_version','bill')]
+        bv_pos = {nid: i for i, nid in enumerate(bv_nodes.tolist())}
+        bill_pos = {nid: i for i, nid in enumerate(bill_nodes.tolist())}
 
-        align_dict, infl_dict = {}, {}
+        mask = (torch.isin(rows_g, bv_nodes) & torch.isin(cols_g, bill_nodes))
+        if mask.any():
+            r_idx = torch.tensor([bv_pos[int(r)]   for r in rows_g[mask]],
+                                device=self.device, dtype=torch.long)
+            c_idx = torch.tensor([bill_pos[int(c)] for c in cols_g[mask]],
+                                device=self.device, dtype=torch.long)
+
+            W_vb = torch.zeros(len(bv_nodes), len(bill_nodes), device=self.device)
+            W_vb[r_idx, c_idx] = 1.0
+        else:
+            W_vb = torch.zeros(len(bv_nodes), len(bill_nodes), device=self.device)
+        z_actor = {nt: z[nt] for nt in self.actor_types if nt in z}
+        success_log = self.success(bill_embed)
+        succ_scalar = torch.sigmoid(success_log).mean()
+
+        align_dict, infl_dict = {},{}
         for nt, az in z_actor.items():
             mvb, wvb = mask_weight_dict[nt]
-            mvb = mvb.to(self.device, non_blocking=True)
-            wvb = wvb.to(self.device, non_blocking=True)
-
-            q_t = F.normalize(self.align[nt].Q(az))
-            k_t = F.normalize(self.align[nt].K(z_bv))
-            sim_t = (q_t @ k_t.T) / math.sqrt(az.size(-1))
-            sim_t = sim_t.masked_fill(~mvb, -1e9)
-            if wvb is not None:
-                sim_t = sim_t + wvb
-            Pav = sim_t.softmax(1)
-            Pab = Pav @ W_vb
-            Pab = Pab / Pab.sum(1, keepdim=True).clamp(min=1e-9)
-            align_dict[nt] = Pab @ bill_prob
-
-            q_i = F.normalize(self.inf[nt].Q(az))
-            k_i = F.normalize(self.inf[nt].K(z_bv))
-            sim_i = (q_i @ k_i.T) / math.sqrt(az.size(-1))
-            sim_i = sim_i.masked_fill(~mvb, -1e9)
-            if wvb is not None:
-                sim_i = sim_i + wvb
-            Pav_i = sim_i.softmax(1)
-            Pab_i = Pav_i @ W_vb
-            infl_dict[nt] = (
-                Pab_i * torch.sigmoid(success_log).unsqueeze(0)
-            ).sum(dim=1)
+            mvb, wvb = mvb.to(self.device), wvb.to(self.device)
+            ta, inf = self.actor_head[nt](az, z_bv, mvb, wvb)
+            logits = self.actor_topic_proj[nt](ta)
+            align_dict[nt] = logits.softmax(-1)
+            infl_dict[nt] = inf * succ_scalar
 
         return {
             "node_embeddings": z,
@@ -510,7 +534,7 @@ def _adj(data, et):
         torch.stack([row, col]), torch.ones_like(row, dtype=torch.float32), (ns, nd)
     ).coalesce()
 
-def build_masks_weights(d, acts, A_by, BV2B, paths, device=device):
+def build_masks_weights(d, acts, A_by, paths, device=device):
     dev = torch.device('cpu')
     rows = {nt: d[nt].node_id.cpu() for nt in acts}
     cols = d['bill_version'].node_id.cpu()
@@ -556,26 +580,22 @@ def build_masks_weights(d, acts, A_by, BV2B, paths, device=device):
     return out
 
 def main():
-    with open('node_id_map.json', 'r') as f:
-        node_id_map = json.load(f)
-
     with open('bill_labels.json', 'r') as f:
         topic_cluster_labels_dict = json.load(f)
 
     data = load_and_preprocess_data()
-    bv2bill = data.edge_index_dict[("bill_version", "is_version", "bill")]
-    parent_bill = torch.full((data["bill_version"].num_nodes,), -1, dtype=torch.long)
-    parent_bill[bv2bill[0]] = bv2bill[1]
+    num_topics = len(list(set([v for v in topic_cluster_labels_dict.values()]))) + 1
+    cluster_bill = torch.full((data['bill'].num_nodes,), num_topics, dtype=torch.long)
+    key1 = data['bill'].n_id.tolist()
+    key2 = data['bill'].node_id.tolist()
+    key = {k1: k2 for k1, k2 in zip(key1, key2)}
+    for bill_nid, lab in topic_cluster_labels_dict.items():
+        if bill_nid in key:
+            cluster_bill[key[bill_nid]] = lab
 
-    num_topics = max(topic_cluster_labels_dict.values()) + 1
-    cluster_bv = torch.full_like(parent_bill, -1)
-    for bill_id, bill_node in node_id_map['bill_version'].items():
-        cluster_bv[parent_bill == bill_node] = topic_cluster_labels_dict.get(bill_id, num_topics)
-
-    topic_onehot_bv = F.one_hot(cluster_bv.clamp(min=0), num_classes=num_topics+1).float()
-    cluster_bv, topic_onehot_bv = cluster_bv.to(device), topic_onehot_bv.to(device)
+    topic_onehot_bill = F.one_hot(cluster_bill.clamp(max=num_topics-1), num_classes=num_topics).float()
+    cluster_bill, topic_onehot_bill = cluster_bill.to(device), topic_onehot_bill.to(device)
     A_by = {et: _adj(data, et).coalesce() for et in data.edge_types}
-    BV2B = _adj(data, ('bill_version', 'is_version', 'bill')).coalesce()
 
     ALLOWED = {
         "donor": [
@@ -611,50 +631,53 @@ def main():
         ]
     }
 
-    best_loss = float('inf')
-    model = LegislativeGraphModel(data.metadata(), cluster_bv, topic_onehot_bv, hidden_dim, dropout_p).to(device)
+    model = LegislativeGraphModel(data.metadata(), cluster_bill, topic_onehot_bill, hidden_dim, dropout_p).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
     torch.mps.empty_cache()
     gc.collect()
+    for nt in data.node_types:
+        del data[nt].n_id
     loader = HGTLoader(
         data,
         num_samples={
-            'legislator_term': [48] * 2,
-            'legislator': [48] * 2,
+            'legislator_term': [64] * 2,
+            'legislator': [64] * 2,
             'committee': [96] * 2,
-            'lobby_firm': [192] * 2,
-            'donor': [192] * 2,
-            'bill_version': [384] * 2,
-            'bill': [384] * 2,
+            'lobby_firm': [86] * 2,
+            'donor': [86] * 2,
+            'bill_version': [832] * 2,
+            'bill': [684] * 2,
         },
-        batch_size=64,
+        batch_size=128,
         shuffle=True,
         input_nodes='legislator_term'
     )
 
-    epochs = 1
+    epochs = 25
     patience = 5
     counter = 0
     start_epoch = 0
     best_loss = float('inf')
-    # model.load_state_dict(torch.load("best_model5.pt"))
+    # model.load_state_dict(torch.load("best_model5.pt"), strict=False)
     # optimizer.load_state_dict(torch.load("best_opt5.pt"))
 
     for epoch in tqdm(range(start_epoch, start_epoch + epochs), position=0, total=epochs):
         model.train()
         epoch_loss = 0.0
         torch.mps.empty_cache()
+        batch_count = 0
 
         for batch_idx, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}", position=1)):
             batch = batch.to(device)
-            mw_dict = build_masks_weights(batch, ['legislator','committee','donor','lobby_firm'], A_by, BV2B, ALLOWED)
+            mw_dict = build_masks_weights(batch, ['legislator','committee','donor','lobby_firm'], A_by, ALLOWED)
             outputs = model(batch, mw_dict)
             loss_dict = model.compute_loss(outputs, batch)
             loss = loss_dict['total_loss'].float()
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(loss_dict)
+                alarm()
                 raise ValueError(f"Batch {batch_idx}: NaN/Inf loss detected!")
 
             loss.backward()
@@ -663,9 +686,9 @@ def main():
             del outputs, loss_dict, loss
             torch.mps.empty_cache()
             gc.collect()
+            batch_count += 1
 
-
-        avg_loss = epoch_loss / 23
+        avg_loss = epoch_loss / max(1, batch_count)
         print(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
 
         if avg_loss < best_loss:
