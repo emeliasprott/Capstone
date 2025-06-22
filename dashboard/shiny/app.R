@@ -13,24 +13,28 @@ library(leaflet)
 
 nyt_theme <- bs_theme(version = 5, base_font = font_google("Open Sans"), heading_font = font_google("Libre Baskerville"), bg = "#ffffff", fg = "#111111", primary = "#000000", secondary = "#555555", base_font_size = "16px", line_height_base = 1.6)
 
-bills <- read_parquet("data/bills.parquet")
+bills <- read_parquet("./data/bills.parquet")
 
-reg_funds <- read_csv("data/ca_legislator_funding.csv") %>%
-    rename(county_name = NAMELSAD, chamber = house)
+reg_funds <- read_csv("./data/ca_legislator_funding.csv") %>%
+    rename(chamber = house)
 
-reg_topics <- read_csv("data/ca_legislator_topics.csv") %>%
-    rename(county_name = NAMELSAD, chamber = house)
+reg_topics <- read_csv("./data/ca_legislator_topics.csv") %>%
+    rename(chamber = house)
 
-county_geoms <- read_sf("data/ca_counties/CA_Counties.shp") %>%
+reg_funds <- reg_funds %>%
+    left_join(reg_topics, by = c("chamber", "county_id")) %>%
+    rename(county_name = NAMELSAD)
+
+county_geoms <- read_sf("./data/ca_counties/CA_Counties.shp") %>%
     st_set_crs(3857) %>%
     st_transform(4326) %>%
     rename(county_name = NAMELSAD)
 
-donor_topics <- read_csv("data/donor_lobby_topics.csv")
+donor_topics <- read_csv("./data/donor_lobby_topics.csv")
 
-topics <- read_csv("data/topics_aggregated.csv")
+topics <- read_csv("./data/topics_agg.csv")
 
-leg_topics <- read_csv("data/legislator_terms.csv")
+leg_topics <- read_csv("./data/legislator_terms.csv")
 
 ui <- fluidPage(
     theme = nyt_theme,
@@ -217,14 +221,12 @@ ui <- fluidPage(
 server <- function(input, output, session) {
     table_opts <- list(pageLength = 25, autoWidth = TRUE, dom = "tp", class = "stripe hover compact nowrap")
     wide_data <- reactive({
-        req(input$term_select)
         reg_funds %>%
-            filter(Term %in% input$term_select) %>%
             group_by(county_name, chamber) %>%
             summarise(
-                donations = sum(donations_total, na.rm = TRUE),
-                lobbying = sum(lobbying_total, na.rm = TRUE),
-                total = sum(Total, na.rm = TRUE),
+                donations = sum(total_donations, na.rm = TRUE),
+                lobbying = sum(total_lobbying, na.rm = TRUE),
+                total = sum(total_received, na.rm = TRUE),
             ) %>%
             pivot_wider(
                 names_from = chamber,
@@ -302,8 +304,8 @@ server <- function(input, output, session) {
 
     dtl <- reactive({
         df <- donor_topics %>%
-            rename("Area 1" = topic_1, "Area 2" = topic_2, "Area 3" = topic_3, "Area 4" = topic_4, "Area 5" = topic_5, Name = name, Total = total) %>%
-            mutate(Total = round(Total, 2))
+            rename("Top Topics" = top_topics, Name = name, Total = total_spent) %>%
+            mutate(Total = scales::dollar(round(Total, 2)))
 
         if (input$donor_lobby_select == "donor") {
             df <- df %>%
@@ -318,9 +320,6 @@ server <- function(input, output, session) {
                 mutate(type = ifelse(type == "donor", "Donor", "Lobbyist")) %>%
                 rename(Type = type)
         }
-        df %>%
-            relocate(`Area 1`:`Area 5`, .after = Total) %>%
-            select(-c(topic_0, topic_6, topic_7, topic_8, topic_9))
     })
     output$donor_lobby_tbl <- renderDT({
         datatable(
@@ -356,7 +355,7 @@ server <- function(input, output, session) {
         }
         if (nchar(trimws(input$topic_text)) > 0) {
             df <- df %>%
-                mutate(dist_topic = stringdist(str_to_lower(C150), str_to_lower(trimws(input$topic_text)), method = "jw")) %>%
+                mutate(dist_topic = stringdist(str_to_lower(topic), str_to_lower(trimws(input$topic_text)), method = "jw")) %>%
                 filter(dist_topic < 0.4)
         } else {
             df <- df %>% mutate(dist_topic = 0)
@@ -372,12 +371,12 @@ server <- function(input, output, session) {
         df %>%
             arrange(dist_topic, dist_author, dist_id) %>%
             mutate(link = paste0('<a href="https://leginfo.legislature.ca.gov/faces/billTextClient.xhtml?bill_id=', bill_id, '" target="_blank">view</a>')) %>%
-            mutate(vote_signal = if_else(vote_signal > 0.5 & outcome == 0, 1 - vote_signal, vote_signal)) %>%
+            mutate(vote_signal = if_else(vote_signal > 0.5 & outcome_x == 0, 1 - vote_signal, vote_signal)) %>%
             mutate(
                 Introduced = as.Date(First_action),
                 Lifespan = paste0(longevity, " days"),
-                Topic = C75,
-                Outcome = if_else(outcome == 1, "Passed", "Failed"),
+                Topic = topic,
+                Outcome = if_else(outcome_x == 1, "Passed", "Failed"),
                 Support = scales::percent(vote_signal, accuracy = 0.1)
             ) %>%
             rename(Bill = bill_id, Authors = authors) %>%
@@ -397,9 +396,8 @@ server <- function(input, output, session) {
 
     topic_choices <- reactive({
         topics %>%
-            distinct(C75) %>%
-            filter(C75 != "Acupuncture Licensing and Oversight") %>%
-            pull(C75) %>%
+            distinct(topic_cluster) %>%
+            pull(topic_cluster) %>%
             sort()
     })
 
@@ -413,7 +411,7 @@ server <- function(input, output, session) {
     topic_score_data <- reactive({
         req(input$topic_select)
 
-        term_bills <- bills %>% filter(C75 == input$topic_select)
+        term_bills <- bills %>% filter(topic_cluster == input$topic_select)
         leg_set <- leg_topics %>% filter(top_0 == input$topic_select)
         ent_set <- donor_topics %>% filter(topic_1 == input$topic_select)
 
@@ -516,13 +514,12 @@ server <- function(input, output, session) {
     leg_tbl <- reactive({
         leg_topics %>%
             mutate(
-                total_funding = donations_total + lobbying_total,
-                lobbying_term = scales::dollar(lobbying_total, accuracy = 1),
-                donations_term = scales::dollar(donations_total, accuracy = 1),
-                total_funding = scales::dollar(total_funding, accuracy = 1),
+                lobbying_term = scales::dollar(total_lobbying, accuracy = 1),
+                donations_term = scales::dollar(total_donations, accuracy = 1),
+                total_funding = scales::dollar(total_received, accuracy = 1),
                 outcome = scales::percent(outcome, accuracy = 0.1)
             ) %>%
-            rename(Legislator = legislator, Term = term, House = chamber, "Area 1" = top_0, "Area 2" = top_1, "Area 3" = top_2, "Area 4" = top_3, "Area 5" = top_4, "Area 6" = top_5, "Area 7" = top_6, "Area 8" = top_7, "Area 9" = top_8, "Area 10" = top_9, Outcome = outcome, "Lead Author" = author_type, "Number of Bills" = bill_version, Donations = donations_term, Lobbying = lobbying_term, "Total Funding" = total_funding) %>%
+            rename(Legislator = legislator, Term = term, House = chamber, "Top Topics" = top_topics, Outcome = outcome, "Lead Author" = author_type, "Number of Bills" = bill_version, Donations = total_donations, Lobbying = total_lobbying, "Total Funding" = total_funding) %>%
             select(Legislator, Term, House, Outcome, "Lead Author", "Number of Bills", Donations, Lobbying, "Total Funding", "Area 1":"Area 10")
     })
 

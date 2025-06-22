@@ -14,10 +14,14 @@ RUN rm -rf /app/etl_data/*
 COPY etl/run_etl.sh /app/run_etl.sh
 # Optional: restrict data copied to container
 # CHANGE DATASETS USED
-# COPY etl_data/ /etl_data/
-# COPY etl_data/batch2 /app/etl_data/
-# COPY etl_data/pubinfo_2025.zip /etl_data/pubinfo_2025.zip
-# COPY etl_data/format_files /app/format_files
+# COPY etl_data/batch /etl_data/batch
+# ENV BATCH_DIR=/etl_data/batch
+# COPY etl_data/batch2 /etl_data/batch2
+# ENV BATCH_DIR=/etl_data/batch2
+COPY etl_data/batch3 /etl_data/batch3
+ENV BATCH_DIR=/etl_data/batch3
+
+RUN chmod +x /app/run_etl.sh
 
 # RUN chmod +x /app/run_etl.sh
 

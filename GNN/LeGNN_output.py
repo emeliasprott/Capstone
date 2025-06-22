@@ -1,18 +1,62 @@
-import datetime, gc, json, os
+import datetime, gc, json, torch, logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from tqdm import tqdm
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
-from torch_scatter import scatter_add, scatter_mean
+from torch_scatter import scatter_mean
 from torch_geometric.loader import HGTLoader
+from torch_geometric.nn import SAGEConv
+from contextlib import contextmanager
+from pathlib import Path
+
+# utilities
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('training.log'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+_EDGE_SEP = '∷'
+def _et_to_key(et):
+    return _EDGE_SEP.join(et)
+def _key_to_et(k):
+    return tuple(k.split(_EDGE_SEP))
+
+@contextmanager
+def error_context(operation_name: str, logger: logging.Logger):
+    try:
+        logger.info(f"Starting {operation_name}")
+        yield
+        logger.info(f"Completed {operation_name}")
+    except Exception as e:
+        logger.error(f"Error in {operation_name}: {str(e)}")
+        raise
+
+def safe_tensor_operation(func, *args, default_value=0.0, clamp_range=(-1e3, 1e3), **kwargs):
+    try:
+        result = func(*args, **kwargs)
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            logging.warning(f"NaN/Inf detected in {func.__name__}, replacing with {default_value}")
+            result = torch.full_like(result, default_value)
+        return torch.clamp(result, *clamp_range)
+    except Exception as e:
+        logging.error(f"Error in {func.__name__}: {e}")
+        return torch.tensor(default_value)
 
 hidden_dim = 192
 n_layers = 3
 dropout_p = 0.10
-device = torch.device('mps')
+device = 'mps'
+inf_reg_weight = 0.1
+ent_reg_weight = 0.1
 
-# utilities
 def _init_linear(m: nn.Linear):
     nn.init.kaiming_uniform_(m.weight, a=0.01)
     if m.bias is not None:
@@ -46,13 +90,17 @@ def alarm():
         time.sleep(0.5)
 
 # preprocessing
-def safe_normalize_timestamps(timestamps):
+def safe_normalize_timestamps(timestamps, eps=1e-8):
     timestamps = torch.nan_to_num(timestamps, nan=0.0, posinf=1e4, neginf=-1e4)
-    min_time = timestamps.min()
-    max_time = timestamps.max()
-    if (max_time - min_time) < 1e-4:
+    p5 = torch.quantile(timestamps, 0.05)
+    p95 = torch.quantile(timestamps, 0.95)
+
+    if (p95 - p5) < eps:
         return torch.zeros_like(timestamps)
-    return (timestamps - min_time) / (max_time - min_time)
+
+    timestamps = torch.clamp(timestamps, p5, p95)
+    normalized = (timestamps - p5) / (p95 - p5)
+    return torch.nan_to_num(normalized, nan=0.0)
 
 def safe_standardize_time_format(time_data):
     times = []
@@ -180,6 +228,7 @@ def load_and_preprocess_data(path='data3.pt'):
             print(f"Fixing {dst_type} node count: {full_data[dst_type].num_nodes} -> {max_dst_idx + 1}")
             full_data[dst_type].num_nodes = max_dst_idx + 1
     full_data['bill'].y[np.where(full_data['bill'].y < 0)[0]] = 0
+    full_data['bill'].y = torch.as_tensor(full_data['bill'].y, dtype=torch.float32)
 
     data = ToUndirected(merge=False)(full_data)
     del full_data
@@ -188,102 +237,52 @@ def load_and_preprocess_data(path='data3.pt'):
     data = compute_controversiality(clean_features(data))
 
     for nt in data.node_types:
-        ids = torch.arange(data[nt].num_nodes, device=device)
+        ids = torch.arange(data[nt].num_nodes, device='mps')
         data[nt].node_id = ids
     for store in data.stores:
         for key, value in store.items():
             if isinstance(value, torch.Tensor) and value.dtype == torch.float64:
                 store[key] = value.float()
+
+
     return data
 
 # encoders
-class Time2Vec(nn.Module):
-    def __init__(self, d=12):
+class LegislativeTemporalEncoder(nn.Module):
+    def __init__(self, d=hidden_dim):
         super().__init__()
-        self.w0 = nn.Parameter(torch.randn(()))
-        self.w = nn.Parameter(torch.randn(d - 1))
-        self.b = nn.Parameter(torch.randn(d))
-    def forward(self, t):
-        v0 = self.w0 * t + self.b[0]
-        v = torch.sin(self.w * t.unsqueeze(-1) + self.b[1:])
-        return torch.cat([v0.unsqueeze(-1), v], -1)
+        self.hidden_dim = d
+        for h in ['vote_temporal', 'donation_temporal', 'lobbying_temporal']:
+            setattr(self, h, nn.Sequential(
+                nn.Linear(1, d // 4),
+                nn.ReLU(),
+                nn.Linear(d // 4, d),
+            ))
+
+        self.vote_temporal = getattr(self, 'vote_temporal')
+        self.donation_temporal = getattr(self, 'donation_temporal')
+        self.lobbying_temporal = getattr(self, 'lobbying_temporal')
+
+    def forward(self, timestamps, process_type):
+        if process_type == 'vote':
+            return self.vote_temporal(timestamps.unsqueeze(-1))
+        elif process_type == 'donation':
+            return self.donation_temporal(timestamps.unsqueeze(-1))
+        elif process_type == 'lobbying':
+            return self.lobbying_temporal(timestamps.unsqueeze(-1))
+        else:
+            return self.vote_temporal(timestamps.unsqueeze(-1))
 
 class FeatureProjector(nn.Module):
-    def __init__(self, metadata, in_dims, d_out=hidden_dim, t_dim=12):
+    def __init__(self, in_dims, d_out=hidden_dim):
         super().__init__()
-        self.t2v = Time2Vec(t_dim)
-        self.prj = nn.ModuleDict()
-        for nt in metadata[0]:
-            use_t = nt in ['legislator_term', 'bill', 'bill_version']
-            d_in  = in_dims[nt] + (t_dim if use_t else 0)
-            self.prj[nt] = nn.Sequential(
-                nn.LayerNorm(d_in),
-                nn.Linear(d_in, d_out, bias=False),
-                nn.GELU())
-            _init_linear(self.prj[nt][1])
+        self.prj = nn.Sequential(
+            nn.LayerNorm(in_dims),
+            nn.Linear(in_dims, d_out, bias=False),
+            nn.GELU())
 
-    def forward(self, x, ts):
-        out={}
-        for nt,xn in x.items():
-            if ts and ts[nt] is not None:
-                xn = torch.cat([xn, self.t2v(ts[nt])], dim=1)
-            out[nt]=self.prj[nt](xn)
-        return out
-
-
-class RGTLayer(nn.Module):
-    def __init__(self, d=hidden_dim, h=8, p=0.1, time_decay=True, device=device):
-        super().__init__()
-        self.h = h
-        self.dk = d // h
-        self.d = d
-        self.device = device
-        self.Q = nn.Linear(self.d, self.d, bias=False)
-        self.K = nn.Linear(self.d, self.d, bias=False)
-        self.V = nn.Linear(self.d, self.d, bias=False)
-        self.time_decay = time_decay
-        self.rel = nn.ParameterDict()
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, 4*d, bias=False),
-            nn.GELU(),
-            nn.Linear(4*d, d, bias=False),
-            nn.Dropout(p))
-
-    def _r(self,r):
-        k='__'.join(r)
-        if k not in self.rel:
-            param = nn.Parameter(torch.randn(self.h, self.dk, device=self.device))
-            self.register_parameter(k, param)
-            self.rel[k] = param
-        else:
-            param = self.rel[k]
-            if param.device != self.device:
-                param.data = param.data.to(self.device)
-        return param
-
-    def forward(self, h, ei, ew, ts=None):
-        msg = {k: torch.zeros_like(v) for k, v in h.items()}
-        for r, e in ei.items():
-            s, t = e
-            q = self.Q(h[r[2]])[t].view(-1, self.h, self.dk)
-            k = self.K(h[r[0]])[s].view(-1, self.h, self.dk)
-            v = self.V(h[r[0]])[s].view(-1, self.h, self.dk)
-            R = self._r(r)
-            l = ((q * (k + R)).sum(-1)) / np.sqrt(self.dk)
-            if self.time_decay and ts is not None:
-                dt = 1.0 - ts[s]
-                l = l - dt.unsqueeze(-1)
-            if ew and ew.get(r) is not None:
-                l = l + ew[r].unsqueeze(-1)
-                p = F.softmax(l, dim=-1)
-                m = (p.unsqueeze(-1) * v).view(-1, self.d)
-                msg[r[2]].index_add_(0, t, m)
-        o = {}
-        for nt in h:
-            h_res = h[nt] + msg[nt]
-            o[nt] = h_res + self.ffn(h_res)
-        return o
+    def forward(self, x):
+        return self.prj(x)
 
 class PolarityAwareConv(nn.Module):
     def __init__(self, h_dim, e_dim, p):
@@ -295,20 +294,14 @@ class PolarityAwareConv(nn.Module):
             nn.Dropout(p),
         )
 
-    def forward(self, x, ei, ea):
-        x_src, x_dst = x
-        src, dst = ei
-
+    def forward(self, ea):
         pol = ea[:, :1].clamp(0, 1)
         raw = ea[:, 1:]
         if raw.dim() == 1:
             raw = raw.unsqueeze(-1)
 
         e_feat = self.edge_mlp(raw) * (pol + 0.01)
-        src_emb = x_src[src]
-        m = src_emb * e_feat
-
-        return scatter_add(m, dst, dim=0, dim_size=x_dst.size(0))
+        return e_feat
 
 class ActorHead(nn.Module):
     def __init__(self, d, h=4):
@@ -321,15 +314,38 @@ class ActorHead(nn.Module):
         self.dk = dk
 
     def forward(self, a_z, bv_z, mask, weight=None):
+        if torch.isnan(a_z).any() or torch.isinf(a_z).any():
+            a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(bv_z).any() or torch.isinf(bv_z).any():
+            bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
+
         q = self.Q(a_z).view(-1, self.h, self.dk).transpose(0, 1)
         k = self.K(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
         v = self.V(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
+
         att = (q @ k.transpose(-1, -2)) / np.sqrt(self.dk)
         att = att.transpose(0, 1)
-        att = att.masked_fill(~mask.unsqueeze(1), -1e9)
+
+        if mask.numel() == 0 or (~mask).all():
+            context = torch.zeros_like(v.transpose(0, 1))
+            topic_align = context.mean(0)
+            influence = torch.zeros(mask.size(0), device=mask.device)
+            return topic_align, influence
+
+        att = att.masked_fill(~mask.unsqueeze(1), -1e4)
+
         if weight is not None:
+            weight = torch.nan_to_num(weight, nan=0.0, posinf=1.0, neginf=-1.0)
             att = att + weight.unsqueeze(1)
-        p = att.softmax(dim=-1)
+
+        att = torch.clamp(att, -10, 10)
+        att_max = att.max(dim=-1, keepdim=True)[0]
+        att_stable = att - att_max
+        p = F.softmax(att_stable, dim=-1)
+        if torch.isnan(p).any():
+            p = torch.nan_to_num(p, nan=1.0/p.size(-1))
+            p = p / p.sum(dim=-1, keepdim=True)
+
         context = torch.matmul(p.transpose(0, 1), v)
         topic_align = context.mean(0)
         influence = p.mean(1).sum(-1)
@@ -346,90 +362,143 @@ class SuccessHead(nn.Module):
     def __init__(self, d):
         super().__init__()
         self.l = nn.Linear(d, 1)
+        nn.init.xavier_uniform_(self.l.weight, gain=0.1)
+        nn.init.constant_(self.l.bias, 0.0)
 
     def forward(self, z):
-        return self.l(z).squeeze(-1)
+        z = torch.clamp(z, -10, 10)
+        logits = self.l(z).squeeze(-1)
+        return torch.clamp(logits, -10, 10)
 
-class HierarchyAggregator(nn.Module):
-    def forward(self, z, b):
-        s, d = b.edge_index_dict[('bill_version', 'is_version', 'bill')]
-        bill_agg = scatter_mean(
-            z['bill_version'][s],
-            d,
-            dim=0,
-            dim_size=z['bill'].size(0)
-        )
-        z['bill'] = 0.7 * z['bill'] + 0.3 * bill_agg
-        d2, s2 = b.edge_index_dict[('legislator', 'samePerson', 'legislator_term')]
-        leg_agg = scatter_mean(
-            z['legislator_term'][s2],
-            d2,
-            dim=0,
-            dim_size=z['legislator'].size(0)
-        )
-        z['legislator'] = 0.7 * z['legislator'] + 0.3 * leg_agg
-        return z
 
 class LegislativeGraphEncoder(nn.Module):
-    def __init__(self, metadata, hidden_dim, n_layers, dropout, device=device):
+    def __init__(self, hidden_dim, dropout, device=device):
         super().__init__()
         self.device = device
         self.hidden_dim = hidden_dim
-        self.node_types = metadata[0]
 
-        in_dims = {nt: c for nt, c in zip(self.node_types, [769, 389, 385, 2, 385, 384, 384])}
-        self.proj = FeatureProjector(metadata, in_dims, d_out=hidden_dim, t_dim=12)
+        self.process_map = {
+            ('donor', 'donated_to', 'legislator_term'): 'donation',
+            ('lobby_firm', 'lobbied', 'legislator_term'): 'lobbying',
+            ('bill_version', 'is_version', 'bill'): 'hierarchy'
+        }
 
-        self.rgt_layers = nn.ModuleList([RGTLayer(hidden_dim, 4, dropout) for _ in range(n_layers)])
+        self.convs = nn.ModuleDict({
+            _et_to_key(et): SAGEConv((hidden_dim, hidden_dim), hidden_dim, normalize=True)
+            for et in self.process_map.keys()
+        })
 
-        vote_e_dim = 385
-        self.vote_conv = PolarityAwareConv(hidden_dim, vote_e_dim, dropout)
+        self.temporal_encoder = LegislativeTemporalEncoder(hidden_dim)
+        self.vote_conv = PolarityAwareConv(hidden_dim, 385, dropout)
 
-        self.norm = nn.ModuleDict({nt: nn.LayerNorm(hidden_dim).to(device) for nt in self.node_types})
-        self.drop = nn.Dropout(dropout)
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict, ts_dict):
+        out = {nt: torch.zeros_like(x, device=x.device) for nt, x in x_dict.items()}
 
-    def forward(self, batch):
-        ts_dict = {nt: getattr(batch[nt], 'timestamp', None) for nt in self.node_types}
-        h = self.proj({nt: batch[nt].x.to(self.device) for nt in self.node_types}, ts_dict)
+        for key, conv in self.convs.items():
+            et = _key_to_et(key)
+            src, rel, dst = et
+            if et not in edge_index_dict:
+                continue
 
-        edge_w = {et: getattr(batch[et], 'edge_weight', None) for et in batch.edge_types}
-        for layer in self.rgt_layers:
-            h = layer(h, batch.edge_index_dict, edge_w)
+            edge_index = edge_index_dict[et]
+            if edge_index.numel() == 0:
+                continue
+            x_src = x_dict[src]
+            if ts_dict is not None and et in ts_dict and ts_dict[et] is not None:
+                edge_temp = self.temporal_encoder(ts_dict[et], self.process_map.get(et, 'vote'))
+                if edge_index[0].max() < x_dict[src].size(0):
+                    node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
+                    x_src = x_src + node_temp
 
-        vote_ei = batch.edge_index_dict[('legislator_term', 'voted_on', 'bill_version')]
-        vote_attr = batch[('legislator_term', 'voted_on', 'bill_version')].edge_attr
-        vote_msg = self.vote_conv(
-            (h["legislator_term"], h["bill_version"]),
-            vote_ei,
-            vote_attr,
-        )
-        h["bill_version"] += vote_msg
+            if (edge_index[0].max() < x_src.size(0) and
+                edge_index[1].max() < x_dict[dst].size(0)):
+                conv_out = conv((x_src, x_dict[dst]), edge_index)
+                out[dst] += conv_out
 
-        h = {nt: self.drop(F.relu(self.norm[nt](h[nt]))) for nt in h}
-        return h
+        vote_et = ('legislator_term', 'voted_on', 'bill_version')
+        if vote_et in edge_attr_dict and vote_et in edge_index_dict:
+            vote_attr = edge_attr_dict[vote_et]
+            if vote_attr.numel() > 0:
+                vote_edges = self.vote_conv(vote_attr)
+                dst = edge_index_dict[vote_et][1]
+
+                if dst.max() < out['bill_version'].size(0):
+                    vote_msg_agg = scatter_mean(
+                        vote_edges, dst, dim=0, dim_size=out['bill_version'].size(0)
+                    )
+                    out['bill_version'] += vote_msg_agg
+
+        for nt in out:
+            if nt in x_dict:
+                out[nt] += x_dict[nt]
+
+        return out
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(self, metadata, cluster_id, topic_onehot, hidden_dim, dropout, device=device):
+    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, device=device):
         super().__init__()
         self.device = device
-        self.encoder = LegislativeGraphEncoder(metadata, hidden_dim, n_layers, dropout, device)
-        self.hier = HierarchyAggregator()
+
+        self.node_types = in_dims.keys()
+
+        self.feature_proj = nn.ModuleDict({
+            nt: nn.Sequential(
+                    nn.LayerNorm(in_dims[nt]),
+                    nn.Linear(in_dims[nt], hidden_dim, bias=False),
+                    nn.GELU(),
+                )
+            for nt in in_dims
+        })
+        self.cluster_id = cluster_id
+
+        self.encoders = nn.ModuleList([LegislativeGraphEncoder(hidden_dim, dropout, device) for _ in range(n_layers)])
+
+        self.bill_alpha = nn.Parameter(torch.tensor(0.7))
+        self.leg_alpha  = nn.Parameter(torch.tensor(0.7))
+
         self.topic_head = BillTopicHead(hidden_dim, topic_onehot.size(1))
         self.success = SuccessHead(hidden_dim)
+        self.topic_onehot = topic_onehot
 
         self.actor_types = ['legislator', 'committee', 'donor', 'lobby_firm']
         self.actor_head = nn.ModuleDict({nt: ActorHead(hidden_dim) for nt in self.actor_types})
+
         k_topics = topic_onehot.size(1)
         dk = hidden_dim // self.actor_head['legislator'].h
         self.actor_topic_proj = nn.ModuleDict({
             nt: nn.Linear(dk, k_topics, bias=False) for nt in self.actor_types
         })
 
-        self.register_buffer('cluster_id',  cluster_id)
-        self.register_buffer('topic_onehot', topic_onehot)
+        self.loss_computer = StableLossComputer(device=device)
+
+    def _aggregate_hierarchy(self, z, b):
+        s, d = b.edge_index_dict[('bill_version', 'is_version', 'bill')]
+        bill_agg = scatter_mean(z['bill_version'][s], d,
+                                dim=0, dim_size=z['bill'].size(0))
+        z['bill'] = self.bill_alpha * z['bill'] + (1 - self.bill_alpha) * bill_agg
+
+        d2, s2 = b.edge_index_dict[('legislator', 'samePerson', 'legislator_term')]
+        leg_agg = scatter_mean(z['legislator_term'][s2], d2,
+                               dim=0, dim_size=z['legislator'].size(0))
+        z['legislator'] = self.leg_alpha * z['legislator'] + (1 - self.leg_alpha) * leg_agg
+        return z
+
+    def encoder(self, batch):
+        x_dict = {
+            nt: self.feature_proj[nt](batch[nt].x)
+            for nt in self.feature_proj if hasattr(batch[nt], 'x')
+        }
+
+        ts_dict = {et: batch[et].timestamp for et in batch.edge_types
+                   if hasattr(batch[et], 'timestamp')}
+
+        for encoder in self.encoders:
+            x_dict = encoder(x_dict, batch.edge_index_dict, batch.edge_attr_dict, ts_dict)
+
+        return x_dict
 
     def forward(self, batch, mask_weight_dict):
-        z = self.hier(self.encoder(batch), batch)
+        z = self._aggregate_hierarchy(self.encoder(batch), batch)
         bill_nodes = batch['bill'].node_id.to(self.device)
         bv_nodes = batch['bill_version'].node_id.to(self.device)
 
@@ -438,35 +507,18 @@ class LegislativeGraphModel(nn.Module):
 
         bill_logits = self.topic_head(bill_embed)
         bill_labels = self.cluster_id[bill_nodes]
-        bill_prob = self.topic_onehot[bill_nodes]
 
-        rows_g, cols_g = batch.edge_index_dict[('bill_version','is_version','bill')]
-        bv_pos = {nid: i for i, nid in enumerate(bv_nodes.tolist())}
-        bill_pos = {nid: i for i, nid in enumerate(bill_nodes.tolist())}
-
-        mask = (torch.isin(rows_g, bv_nodes) & torch.isin(cols_g, bill_nodes))
-        if mask.any():
-            r_idx = torch.tensor([bv_pos[int(r)]   for r in rows_g[mask]],
-                                device=self.device, dtype=torch.long)
-            c_idx = torch.tensor([bill_pos[int(c)] for c in cols_g[mask]],
-                                device=self.device, dtype=torch.long)
-
-            W_vb = torch.zeros(len(bv_nodes), len(bill_nodes), device=self.device)
-            W_vb[r_idx, c_idx] = 1.0
-        else:
-            W_vb = torch.zeros(len(bv_nodes), len(bill_nodes), device=self.device)
-        z_actor = {nt: z[nt] for nt in self.actor_types if nt in z}
         success_log = self.success(bill_embed)
         succ_scalar = torch.sigmoid(success_log).mean()
 
-        align_dict, infl_dict = {},{}
-        for nt, az in z_actor.items():
+        align_dict, infl_dict = {}, {}
+        for nt in self.actor_types:
+            if nt not in z:
+                continue
             mvb, wvb = mask_weight_dict[nt]
-            mvb, wvb = mvb.to(self.device), wvb.to(self.device)
-            ta, inf = self.actor_head[nt](az, z_bv, mvb, wvb)
-            logits = self.actor_topic_proj[nt](ta)
-            align_dict[nt] = logits.softmax(-1)
-            infl_dict[nt] = inf * succ_scalar
+            ta, inf  = self.actor_head[nt](z[nt], z_bv, mvb.to(self.device), wvb.to(self.device))
+            align_dict[nt] = self.actor_topic_proj[nt](ta).softmax(-1)
+            infl_dict[nt]  = inf * succ_scalar
 
         return {
             "node_embeddings": z,
@@ -476,55 +528,99 @@ class LegislativeGraphModel(nn.Module):
             "actor_topic_dict": align_dict,
             "influence_dict" : infl_dict
         }
+    def compute_loss(self, outputs, batch):
+        loss_dict = {}
 
-    def compute_loss(self, out, batch, neg_k=1, temp=0.1):
-        ce = F.cross_entropy(out["bill_logits"], out["bill_labels"])
-        if torch.isnan(ce) or torch.isinf(ce):
-            ce = torch.tensor(0.0, device=self.device)
-        link = 0.0
-        bce = nn.BCEWithLogitsLoss()
-        z = out['node_embeddings']
-        for (s_t, _, d_t), ei in batch.edge_index_dict.items():
-            s, d = ei
-            pos = (F.normalize(z[s_t][s], -1) * F.normalize(z[d_t][d], -1)).sum(-1) / temp
-            link += bce(pos, torch.ones_like(pos))
-            if neg_k:
-                perm = d[torch.randperm(d.size(0), device=self.device)][: pos.size(0) * neg_k]
-                neg = (
-                    F.normalize(z[s_t][s].repeat(neg_k, 1), -1)
-                    * F.normalize(z[d_t][perm], -1)
-                ).sum(-1) / temp
-                link += bce(neg, torch.zeros_like(neg))
+        bill_logits = outputs["bill_logits"]
+        bill_labels = outputs["bill_labels"]
+        topic_loss = self.loss_computer.compute_topic_loss(bill_logits, bill_labels)
+        loss_dict['topic_loss'] = topic_loss
 
-        infl_vals = []
-        for v in out['influence_dict'].values():
-            v = v[torch.isfinite(v)]
-            if v.numel() > 0:
-                infl_vals.append(v.pow(2).mean())
-        inf_reg = torch.stack(infl_vals).mean() if infl_vals else torch.tensor(0., device=self.device)
+        embeddings = outputs["node_embeddings"]
+        link_loss = self.loss_computer.compute_link_loss(embeddings, batch.edge_index_dict)
+        loss_dict['link_loss'] = link_loss
 
-        ent_values = []
-        for probs in out['actor_topic_dict'].values():
-            p = torch.nan_to_num(probs, nan=0.0, posinf=1e8, neginf=-1e2)
-            if p.sum() == 0:
+        success_loss = torch.tensor(0.0, device=self.device)
+        if 'success_logit' in outputs and hasattr(batch['bill'], 'y'):
+            success_logits = outputs['success_logit']
+            success_targets = torch.nan_to_num(batch['bill'].y[batch['bill'].node_id], nan=0.0).float()
+            success_loss = F.binary_cross_entropy_with_logits(success_logits, success_targets)
+        loss_dict['success_loss'] = success_loss
+
+        influence_reg = torch.tensor(0.0, device=self.device)
+        if 'influence_dict' in outputs:
+            for nt, inf in outputs['influence_dict'].items():
+                influence_reg += outputs['influence_dict'][nt].mean()
+        loss_dict['influence_reg'] = influence_reg
+
+        total_loss = (topic_loss + link_loss + success_loss + influence_reg)
+        loss_dict['total_loss'] = total_loss
+
+        return loss_dict
+
+class StableLossComputer:
+    def __init__(self, device=device, temp=0.1, neg_sampling_ratio=1):
+        self.device = device
+        self.temp = temp
+        self.neg_sampling_ratio = neg_sampling_ratio
+        self.bce = nn.BCEWithLogitsLoss()
+        self.eps = 1e-8
+
+    def compute_topic_loss(self, logits, labels):
+        logits = torch.clamp(logits, -10, 10)
+
+        num_classes = logits.size(-1)
+        smooth_labels = F.one_hot(labels, num_classes).float()
+        smooth_labels = smooth_labels * 0.9 + 0.1 / num_classes
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss = -(smooth_labels * log_probs).sum(dim=-1).mean()
+
+        return safe_tensor_operation(lambda: loss, default_value=0.0).clamp(0, 1000)
+
+    def compute_link_loss(self, embeddings, edge_index_dict):
+        total_loss = 0.0
+        num_edges = 0
+
+        for (s_t, _, d_t), ei in edge_index_dict.items():
+            if ei.numel() == 0:
                 continue
-            row_sum = p.sum(dim=1, keepdim=True)
-            mask = (row_sum.squeeze(-1) > 0)
-            p_norm = torch.zeros_like(p)
-            p_norm[mask] = p[mask] / row_sum[mask]
-            entropy = (-p_norm[mask] * (p_norm[mask] + 1e-9).log()).sum(dim=1)
-            if entropy.numel() > 0:
-                ent_values.append(entropy.mean())
-        ent_reg = torch.stack(ent_values).mean() if ent_values else torch.tensor(0., device=self.device)
+            s, d = ei
+            if s.numel() == 0 or d.numel() == 0:
+                continue
+            z_s = embeddings[s_t][s]
+            z_d = embeddings[d_t][d]
+            if torch.isnan(z_s).any() or torch.isinf(z_s).any():
+                continue
+            if torch.isnan(z_d).any() or torch.isinf(z_d).any():
+                continue
+            z_s = F.normalize(torch.clamp(z_s, -10, 10), dim=-1, eps=1e-8)
+            z_d = F.normalize(torch.clamp(z_d, -10, 10), dim=-1, eps=1e-8)
 
-        total = ce + link + 0.1 * inf_reg + 0.1 * ent_reg
-        return {
-            'total_loss': total,
-            'ce_loss': ce,
-            'link_loss': link,
-            'inf_reg': inf_reg,
-            'ent_reg': ent_reg
-        }
+            pos_scores = torch.clamp((z_s * z_d).sum(-1) / self.temp, -10, 10)
+            pos_loss = self.bce(pos_scores, torch.ones_like(pos_scores))
+
+
+            if self.neg_sampling_ratio > 0:
+                n_neg = min(s.size(0) * self.neg_sampling_ratio, embeddings[d_t].size(0))
+                neg_indices = torch.randperm(embeddings[d_t].size(0), device=self.device)[:n_neg]
+
+                z_s_neg = z_s[:n_neg] if n_neg <= s.size(0) else z_s.repeat(n_neg // s.size(0) + 1, 1)[:n_neg]
+                z_d_neg = F.normalize(torch.clamp(embeddings[d_t][neg_indices], -10, 10), dim=-1, eps=1e-8)
+
+                neg_scores = torch.clamp((z_s_neg * z_d_neg).sum(-1) / self.temp, -10, 10)
+                neg_loss = self.bce(neg_scores, torch.zeros_like(neg_scores))
+
+                if not torch.isnan(neg_loss) and not torch.isinf(neg_loss):
+                    total_loss += pos_loss + neg_loss
+                else:
+                    total_loss += pos_loss
+            else:
+                total_loss += pos_loss
+
+            num_edges += 1
+
+        return torch.clamp(total_loss / max(num_edges, 1), 0, 1000)
 def _adj(data, et):
     row, col = data.edge_index_dict[et]
     ns, nd = data[et[0]].num_nodes, data[et[2]].num_nodes
@@ -577,61 +673,123 @@ def build_masks_weights(d, acts, A_by, paths, device=device):
         out[nt] = (m.to(device), w.to(device))
     return out
 
-def export_gnn_outputs(model, data, A_by, ALLOWED, batch_size=512, out_dir="dashboard/raw_model_outputs"):
-    model.eval()
-    os.makedirs(out_dir, exist_ok=True)
-    node_emb = {nt: torch.empty(data[nt].num_nodes, hidden_dim, dtype=torch.float32, device='cpu') for nt in data.node_types}
-    k_topics = model.topic_head.fc.out_features
-    bill_topic_logits = torch.empty(data['bill'].num_nodes, k_topics, dtype=torch.float32, device='cpu')
-    bill_success_logit = torch.empty(data['bill'].num_nodes, dtype=torch.float32, device='cpu')
-    actor_topic_prob = {nt: torch.empty(data[nt].num_nodes, k_topics, dtype=torch.float32, device='cpu') for nt in model.actor_types}
-    actor_influence = {nt: torch.empty(data[nt].num_nodes, dtype=torch.float32, device='cpu') for nt in model.actor_types}
-    for nt in data.node_types:
-        del data[nt].n_id
-    loader = HGTLoader(
-        data,
-        num_samples={nt: [data[nt].num_nodes] for nt in data.node_types},
-        batch_size=batch_size,
-        shuffle=False,
-        input_nodes="legislator_term",
-    )
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            mw = build_masks_weights(
-                batch,
-                ["legislator", "committee", "donor", "lobby_firm"],
-                A_by,
-                ALLOWED,
+class FinalOutputSaver:
+    def __init__(self, checkpoint_path, model, data, loader, A_by, ALLOWED, device = "mps", out_dir = "outputs"):
+        self.device = torch.device(device)
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        ckpt = torch.load(checkpoint_path, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        model.eval().to(self.device)
+        self.model = model
+
+        h_dim = hidden_dim
+        k_topics = model.topic_onehot.size(1)
+
+        self.emb_sum = {
+            nt: torch.zeros(data[nt].num_nodes, h_dim, dtype=torch.float32)
+            for nt in data.node_types
+        }
+        self.emb_cnt = {
+            nt: torch.zeros(data[nt].num_nodes, dtype=torch.long)
+            for nt in data.node_types
+        }
+
+        n_bill = data["bill"].num_nodes
+        self.bill_logit_sum = torch.zeros(n_bill, k_topics)
+        self.bill_logit_cnt = torch.zeros(n_bill, dtype=torch.long)
+        self.success_sum = torch.zeros(n_bill)
+        self.success_cnt = torch.zeros(n_bill, dtype=torch.long)
+
+        self.actor_align_sum = {
+            nt: torch.zeros(data[nt].num_nodes, k_topics)
+            for nt in model.actor_types
+        }
+        self.actor_align_cnt = {
+            nt: torch.zeros(data[nt].num_nodes, dtype=torch.long)
+            for nt in model.actor_types
+        }
+        self.actor_infl_sum = {
+            nt: torch.zeros(data[nt].num_nodes)
+            for nt in model.actor_types
+        }
+        self.actor_infl_cnt = {
+            nt: torch.zeros(data[nt].num_nodes, dtype=torch.long)
+            for nt in model.actor_types
+        }
+
+        self.loader = loader
+        self.A_by = A_by
+        self.ALLOWED = ALLOWED
+
+    @torch.no_grad()
+    def run(self):
+        for batch in tqdm(self.loader, desc="Saving final outputs"):
+            batch = batch.to(self.device, non_blocking=True)
+            mw_dict = build_masks_weights(
+                batch, self.model.actor_types, self.A_by, self.ALLOWED, device=self.device
             )
-            out = model(batch, mw)
-            z = out["node_embeddings"]
-            for nt, emb in z.items():
-                ids = batch[nt].node_id.cpu()
-                node_emb[nt][ids] = emb.cpu()
-            bid = batch["bill"].node_id.cpu()
-            bill_topic_logits[bid] = out["bill_logits"].cpu()
-            bill_success_logit[bid] = out["success_logit"].cpu()
-            for nt in out["actor_topic_dict"]:
-                ids = batch[nt].node_id.cpu()
-                actor_topic_prob[nt][ids] = out["actor_topic_dict"][nt].cpu()
-                actor_influence[nt][ids] = out["influence_dict"][nt].cpu()
-            del out, z, batch
-            torch.mps.empty_cache()
-            gc.collect()
-    torch.save(node_emb, os.path.join(out_dir, "node_embeddings.pt"))
-    torch.save(bill_topic_logits, os.path.join(out_dir, "bill_topic_logits.pt"))
-    torch.save(bill_success_logit, os.path.join(out_dir, "bill_success_logit.pt"))
-    torch.save(actor_topic_prob, os.path.join(out_dir, "actor_topic_prob.pt"))
-    torch.save(actor_influence, os.path.join(out_dir, "actor_influence.pt"))
+            out = self.model(batch, mw_dict)
+
+            for nt, z_nt in out["node_embeddings"].items():
+                nids = batch[nt].node_id.cpu()
+                z_cpu = z_nt.cpu()
+                self.emb_sum[nt].index_add_(0, nids, z_cpu)
+                self.emb_cnt[nt].index_add_(0, nids, torch.ones_like(nids))
+
+            bill_ids = batch["bill"].node_id.cpu()
+            self.bill_logit_sum.index_add_(0, bill_ids, out["bill_logits"].cpu())
+            self.bill_logit_cnt.index_add_(0, bill_ids, torch.ones_like(bill_ids))
+            self.success_sum.index_add_(0, bill_ids, out["success_logit"].cpu())
+            self.success_cnt.index_add_(0, bill_ids, torch.ones_like(bill_ids))
+
+            for nt in self.model.actor_types:
+                if nt not in out["actor_topic_dict"]:
+                    continue
+                nids = batch[nt].node_id.cpu()
+                self.actor_align_sum[nt].index_add_(0, nids, out["actor_topic_dict"][nt].cpu())
+                self.actor_align_cnt[nt].index_add_(0, nids, torch.ones_like(nids))
+                self.actor_infl_sum[nt].index_add_(0, nids, out["influence_dict"][nt].cpu())
+                self.actor_infl_cnt[nt].index_add_(0, nids, torch.ones_like(nids))
+
+        emb_final = {
+            nt: self.emb_sum[nt] / self.emb_cnt[nt].clamp_min(1).unsqueeze(-1)
+            for nt in self.emb_sum
+        }
+        bill_logits_final = self.bill_logit_sum / self.bill_logit_cnt.clamp_min(1).unsqueeze(-1)
+        success_final = self.success_sum / self.success_cnt.clamp_min(1)
+
+        actor_align_final = {
+            nt: self.actor_align_sum[nt] / self.actor_align_cnt[nt].clamp_min(1).unsqueeze(-1)
+            for nt in self.actor_align_sum
+        }
+        actor_infl_final = {
+            nt: self.actor_infl_sum[nt] / self.actor_infl_cnt[nt].clamp_min(1)
+            for nt in self.actor_infl_sum
+        }
+
+        torch.save(emb_final, self.out_dir / "node_embeddings.pt")
+        torch.save(
+            {
+                "bill_logits": bill_logits_final,
+                "success_logit": success_final,
+                "actor_align": actor_align_final,
+                "actor_influence": actor_infl_final,
+            },
+            self.out_dir / "predictions.pt",
+        )
 
 def main():
-    with open('bill_labels.json', 'r') as f:
+    data = load_and_preprocess_data()
+    logger = setup_logging()
+
+    with open('bill_labels_updated.json', 'r') as f:
         topic_cluster_labels_dict = json.load(f)
 
-    data = load_and_preprocess_data()
     num_topics = len(list(set([v for v in topic_cluster_labels_dict.values()]))) + 1
     cluster_bill = torch.full((data['bill'].num_nodes,), num_topics, dtype=torch.long)
+
     key1 = data['bill'].n_id.tolist()
     key2 = data['bill'].node_id.tolist()
     key = {k1: k2 for k1, k2 in zip(key1, key2)}
@@ -676,10 +834,43 @@ def main():
             ('legislator_term','wrote','bill_version') )
         ]
     }
+    in_dims = {nt: data[nt].x.size(1) for nt in data.node_types if hasattr(data[nt], 'x') and data[nt].x is not None}
 
-    model = LegislativeGraphModel(data.metadata(), cluster_bill, topic_onehot_bill, hidden_dim, dropout_p).to(device)
-    model.load_state_dict(torch.load("best_model5.pt"), strict=False)
-    export_gnn_outputs(model, data, A_by, ALLOWED)
+    model = LegislativeGraphModel(in_dims, cluster_bill, topic_onehot_bill, hidden_dim, dropout_p).to(device)
+
+    torch.mps.empty_cache()
+    gc.collect()
+
+    for nt in data.node_types:
+        if hasattr(data[nt], 'n_id'):
+            delattr(data[nt], 'n_id')
+
+    loader = HGTLoader(
+        data,
+        num_samples={
+            'legislator_term': [240] * 2,
+            'legislator': [240] * 2,
+            'committee': [212] * 2,
+            'lobby_firm': [212] * 2,
+            'donor': [212] * 2,
+            'bill_version': [9600] * 2,
+            'bill': [4800] * 2,
+        },
+        batch_size=248,
+        shuffle=True,
+        input_nodes='legislator_term'
+    )
+
+    saver = FinalOutputSaver(
+        checkpoint_path='GNN/checkpoint_epoch_3.pt',
+        model=model,
+        data=data,
+        loader=loader,
+        A_by=A_by,
+        ALLOWED=ALLOWED,
+        out_dir='dashboard'
+    )
+    saver.run()
 
 if __name__ == "__main__":
     main()

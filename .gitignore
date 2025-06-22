@@ -1,4 +1,6 @@
-ca_leg/etl_data
+ca_leg/etl_data/batch*
+ca_leg/etl_data/LOB
+ca_leg/etl_data/temp
 ca_leg/legislation_data
 ca_leg/etl/*.xml
 .DS_Store
