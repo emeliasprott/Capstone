@@ -418,13 +418,11 @@ server <- function(input, output, session) {
         req(input$topic_select)
         topic_id <- topics %>%
             filter(topic == input$topic_select) %>%
-            distinct(topic_cluster) %>%
+            distinct(topic) %>%
             pull()
 
-        term_bills <- bills %>% filter(topic_cluster == topic_id)
-
         ent_set <- top_ents %>%
-            filter(subject == input$topic_select)
+            filter(topic == input$topic_select)
 
 
         top_leg <- ent_set %>%
@@ -444,11 +442,29 @@ server <- function(input, output, session) {
             filter(topic == input$topic_select) %>%
             pull(controversy))
 
+        partisanship <- mean(topics %>%
+            filter(topic == input$topic_select) %>%
+            pull(alignment_ratio))
+
+        partisanship <- round(((((1 - partisanship) * 100) - 25) / 25 * 100), 2)
+
+        if (partisanship < 0) {
+            partisanship <- paste(-1 * partisanship, "% R", sep = "")
+        } else {
+            partisanship <- paste(partisanship, "% D", sep = "")
+        }
+
+        vol <- topics %>%
+            filter(topic == input$topic_select) %>%
+            group_by(topic) %>%
+            summarise(volume = sum(bill_id)) %>%
+            pull(volume)
+
 
         tibble(
             Metric = c(
                 "Top Legislators", "Top Donors", "Top Lobbyists",
-                "Passage Rate", "Controversiality",
+                "Passage Rate", "Controversiality", "Partisanship",
                 "Volume of Bills"
             ),
             Value = c(
@@ -457,7 +473,8 @@ server <- function(input, output, session) {
                 paste(top_lobby, collapse = ", "),
                 scales::percent(passage_rate, accuracy = 0.1),
                 scales::percent(cont, accuracy = 0.1),
-                nrow(term_bills)
+                partisanship,
+                vol
             )
         )
     })
@@ -506,7 +523,7 @@ server <- function(input, output, session) {
                 total_funding = scales::dollar(total_received, accuracy = 1),
                 outcome = scales::percent(outcome, accuracy = 0.1)
             ) %>%
-            rename(Legislator = full_name, Term = term, House = chamber, "Top Topics" = top_topics, Outcome = outcome, "Lead Author" = author_type, "Number of Bills" = bill_version, Donations = donations_term, Lobbying = lobbying_term, "Total Funding" = total_funding) %>%
+            rename(Legislator = full_name, Term = term, House = chamber, "Top Topics" = top_topics, Outcome = outcome, "Lead Author" = author_type, "Number of Bills" = bill_versions, Donations = donations_term, Lobbying = lobbying_term, "Total Funding" = total_funding) %>%
             arrange(desc(total_received)) %>%
             select(Legislator, Term, House, Outcome, "Lead Author", "Number of Bills", Donations, Lobbying, "Total Funding")
     })
