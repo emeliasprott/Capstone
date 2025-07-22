@@ -17,32 +17,73 @@ The project is structured into multiple phases:
 
 ### Repository Structure
 
-#### Capstone/
+#### Capstone
 
-- ca_leg/
-  - etl/                    # Downloaded zip files, PDFs, unprocessed XML
-    - Dockerfile            # Dockerfile for PostgreSQL container
-    - run_etl.sh            # Bash script to automate SQL loading
-    - save-data.ipynb       # Notebook to save SQL data as CSVs
-    - xml_parse.ipynb       # Notebook to parse XML into JSON
-- pdf_parsing/
-  - data-collection.ipynb   # Notebook to collect and process PDFs
-  - text_cleaning.ipynb     # Notebook to clean and standardize text
-- GNN/
-  - LeGNN.py                # Script to create and train the GNN
-  - LeGNN_output.py         # Script to output the GNN results
-  - policy_embs.py          # Script to create policy embeddings
-- dashboard/
-  - backend/
-    - scripts/
-      - backend.ipynb       # Notebook to extract metrics for dashboard
-      - combining_data.py   # Script to combine output from batches
-      - faiss_creator.py    # Script to create FAISS index
-  - app.R                   # R Shiny app for the dashboard
-- combining.ipynb           # Notebook to combine data from different sources
-- eda1.html                 # Exploratory data analysis project
-- graph-construction.ipynb  # Notebook to construct the graph
-- README.md                 # Current file
+<table>
+    <thead>
+        <tr><th>Section</th><th>File</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td rowspan="4"><strong>ca_leg/etl/</strong></td>
+            <td>Dockerfile</td>
+            <td>Dockerfile for PostgreSQL container</td>
+        </tr>
+        <tr>
+            <td>run_etl.sh</td>
+            <td>Bash script to automate SQL loading</td>
+        </tr>
+        <tr>
+            <td>save-data.ipynb</td>
+            <td>Notebook to save SQL data as CSVs</td>
+        </tr>
+        <tr>
+            <td>xml_parse.ipynb</td>
+            <td>Notebook to parse XML into JSON</td>
+        </tr>
+        <tr>
+            <td rowspan="2"><strong>pdf_parsing/</strong></td>
+            <td>data-collection.ipynb</td>
+            <td>Notebook to collect and process PDFs</td>
+        </tr>
+        <tr>
+            <td>text_cleaning.ipynb</td>
+            <td>Notebook to clean and standardize text</td>
+        </tr>
+        <tr>
+            <td rowspan="2"><strong>GNN/</strong></td>
+            <td>LeGNN.py</td>
+            <td>Script to create and train the GNN</td>
+        </tr>
+        <tr>
+            <td>topic-embedding.ipynb</td>
+            <td>Script to create topic embeddings</td>
+        </tr>
+        <tr>
+            <td rowspan="2"><strong>dashboard/backend/scripts/</strong></td>
+            <td>precomputations.ipynb</td>
+            <td>Notebook to extract metrics for dashboard</td>
+        </tr>
+        <tr>
+            <td>app.R</td>
+            <td>R Shiny app for the dashboard</td>
+        </tr>
+        <tr>
+            <td rowspan="3"><strong>Root Directory</strong></td>
+            <td>combining.ipynb</td>
+            <td>Notebook to combine data from different sources</td>
+        </tr>
+        <tr>
+            <td>eda1.html</td>
+            <td>Exploratory data analysis project</td>
+        </tr>
+        <tr>
+            <td>graph-construction.ipynb</td>
+            <td>Notebook to construct the graph</td>
+        </tr>
+    </tbody>
+</table>
+
 
 ## II. [Data](https://ca-leg-eda.my.canva.site/preliminary) (*links to presentation*)
 
