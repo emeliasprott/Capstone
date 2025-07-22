@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_add
 from torch_geometric.loader import HGTLoader
 from torch_geometric.nn import SAGEConv
 from contextlib import contextmanager
@@ -28,6 +28,11 @@ def _et_to_key(et):
 def _key_to_et(k):
     return tuple(k.split(_EDGE_SEP))
 
+def safe_scatter_mean(src, index, dim_size):
+    ones = torch.ones(src.size(0), dtype=src.dtype, device=src.device)
+    sum_ = scatter_add(src, index, dim=0, dim_size=dim_size)
+    count = scatter_add(ones, index, dim=0, dim_size=dim_size).clamp(min=1)
+    return sum_ / count.unsqueeze(-1)
 @contextmanager
 def error_context(operation_name: str, logger: logging.Logger):
     try:
@@ -348,6 +353,7 @@ class ActorHead(nn.Module):
         context = torch.matmul(p.transpose(0, 1), v)
         topic_align = context.mean(0)
         influence = p.mean(1).sum(-1)
+        influence = torch.nan_to_num(influence, nan=0.0, posinf=1.0, neginf=-1.0)
         return topic_align, influence
 
 class BillTopicHead(nn.Module):
@@ -451,8 +457,8 @@ class LegislativeGraphModel(nn.Module):
 
         self.encoders = nn.ModuleList([LegislativeGraphEncoder(hidden_dim, dropout, device) for _ in range(n_layers)])
 
-        self.bill_alpha = nn.Parameter(torch.tensor(0.7))
-        self.leg_alpha  = nn.Parameter(torch.tensor(0.7))
+        self.bill_alpha = nn.Parameter(torch.tensor(0.5))
+        self.leg_alpha  = nn.Parameter(torch.tensor(0.5))
 
         self.topic_head = BillTopicHead(hidden_dim, topic_onehot.size(1))
         self.success = SuccessHead(hidden_dim)
@@ -471,15 +477,22 @@ class LegislativeGraphModel(nn.Module):
         self.loss_computer = StableLossComputer(device=device)
 
     def _aggregate_hierarchy(self, z, b):
-        s, d = b.edge_index_dict[('bill_version', 'is_version', 'bill')]
-        bill_agg = scatter_mean(z['bill_version'][s], d,
-                                dim=0, dim_size=z['bill'].size(0))
-        z['bill'] = self.bill_alpha * z['bill'] + (1 - self.bill_alpha) * bill_agg
+        if ('bill_version', 'is_version', 'bill') in b.edge_index_dict:
+            s, d = b.edge_index_dict[('bill_version', 'is_version', 'bill')]
+            if s.numel() > 0 and d.numel() > 0:
+                bill_agg = safe_scatter_mean(z['bill_version'][s], d, dim_size=z['bill'].size(0))
+                if torch.isnan(bill_agg).any():
+                    bill_agg = torch.zeros_like(bill_agg)
+                z['bill'] = self.bill_alpha * z['bill'] + (1 - self.bill_alpha) * bill_agg
 
-        d2, s2 = b.edge_index_dict[('legislator', 'samePerson', 'legislator_term')]
-        leg_agg = scatter_mean(z['legislator_term'][s2], d2,
-                               dim=0, dim_size=z['legislator'].size(0))
-        z['legislator'] = self.leg_alpha * z['legislator'] + (1 - self.leg_alpha) * leg_agg
+        if ('legislator', 'samePerson', 'legislator_term') in b.edge_index_dict:
+            d2, s2 = b.edge_index_dict[('legislator', 'samePerson', 'legislator_term')]
+            if s2.numel() > 0 and d2.numel() > 0:
+                leg_agg = safe_scatter_mean(z['legislator_term'][s2], d2, dim_size=z['legislator'].size(0))
+                if torch.isnan(leg_agg).any():
+                    leg_agg = torch.zeros_like(leg_agg)
+                z['legislator'] = self.leg_alpha * z['legislator'] + (1 - self.leg_alpha) * leg_agg
+
         return z
 
     def encoder(self, batch):

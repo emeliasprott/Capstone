@@ -10,6 +10,7 @@ library(plotly)
 library(tidyverse)
 library(sf)
 library(leaflet)
+library(purrr)
 
 nyt_theme <- bs_theme(version = 5, base_font = font_google("Open Sans"), heading_font = font_google("Libre Baskerville"), bg = "#ffffff", fg = "#111111", primary = "#000000", secondary = "#555555", base_font_size = "16px", line_height_base = 1.6)
 
@@ -36,9 +37,19 @@ topics <- read_csv("./data/topics_agg.csv")
 
 leg_topics <- read_csv("./data/legislator_terms.csv")
 
+top_ents <- read_csv("./data/top_entities.csv")
+
 ui <- fluidPage(
     theme = nyt_theme,
     tags$head(tags$title("Legislative Insights • Beta"), tags$link(rel = "icon", href = "favicon.png")),
+    tags$style(HTML("
+    .dt-ellipsis {
+        max-width: 250px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    ")),
     navbarPage(
         title = div(class = "fw-bold", "Legislative Insights"),
         tabPanel(
@@ -60,7 +71,7 @@ ui <- fluidPage(
                         p("This section lists individual donors and lobbying firms, along with how much they gave and which policy topics they were most involved in. You can choose to view only donors, only lobbyists, or both. The table updates instantly and can be downloaded."),
                         br(),
                         h5("Topics"),
-                        p("Here, you can see trends by policy topic. Use the 'Scorecard' tab to choose a topic and view which legislators and funders are most active in that area, along with statistics about bill passage rates, political support, and how controversial the topic tends to be. The 'Data' tab shows a full table of topics across all years and terms, which you can also download."),
+                        p("Here, you can see trends by policy topic. Use the 'Scorecard' tab to choose a topic and view which legislators and funders are most active in that area, along with statistics about bill passage rates, political support, and how controversial the topic tends to be."),
                         br(),
                         h5("Legislators"),
                         p("This section shows a list of all legislators by term, along with their main policy areas, how much funding they received, and how many bills they worked on. You can filter, sort, or download the table to learn more about any individual legislator.")
@@ -73,14 +84,6 @@ ui <- fluidPage(
             fluidRow(
                 column(
                     3,
-                    pickerInput(
-                        inputId = "term_select",
-                        label = "Legislative Term(s)",
-                        choices = sort(unique(reg_funds$Term)),
-                        selected = unique(reg_funds$Term),
-                        multiple = TRUE,
-                        options = list(`actions-box` = TRUE, `live-search` = TRUE)
-                    ),
                     radioButtons(
                         inputId = "metric_select",
                         label = "Show totals for:",
@@ -114,7 +117,18 @@ ui <- fluidPage(
                     div(class = "small text-muted", "Search by Bill ID, Author, or Keyword."),
                     br(),
                     textInput("bill_id", "Bill ID"),
-                    pickerInput("session_multi", "Session(s)", choices = sort(unique(bills$term)), multiple = TRUE, width = "fit", options = pickerOptions(countSelectedText = "{0} selected", deselectAllText = "Deselect all", selectAllText = "Select all", selectedTextFormat = "count"), inline = TRUE),
+                    pickerInput(
+                        "session_multi", "Session(s)",
+                        choices = sort(unique(bills$term)),
+                        multiple = TRUE, width = "fit",
+                        options = pickerOptions(
+                            countSelectedText = "{0} selected",
+                            deselectAllText = "Deselect all",
+                            selectAllText = "Select all",
+                            selectedTextFormat = "count"
+                        ),
+                        inline = TRUE
+                    ),
                     textInput("author_text", "Author"),
                     textInput("topic_text", "Keyword"),
                     actionButton("do_search", "Search"),
@@ -171,25 +185,6 @@ ui <- fluidPage(
                                 class = "card",
                                 div(class = "card-header", "Topic Scorecard"),
                                 div(class = "card-body", DTOutput("topic_score_tbl"))
-                            )
-                        )
-                    )
-                ),
-                tabPanel(
-                    "Data",
-                    fluidRow(
-                        column(
-                            12,
-                            div(
-                                class = "card",
-                                div(
-                                    class = "card-header d-flex justify-content-between",
-                                    span("All Topic Funding Data"),
-                                    downloadButton("topic_dl_all", "Download CSV",
-                                        class = "btn-sm btn-outline-secondary"
-                                    )
-                                ),
-                                div(class = "card-body", DTOutput("topic_all_tbl"))
                             )
                         )
                     )
@@ -305,7 +300,8 @@ server <- function(input, output, session) {
     dtl <- reactive({
         df <- donor_topics %>%
             rename("Top Topics" = top_topics, Name = name, Total = total_spent) %>%
-            mutate(Total = scales::dollar(round(Total, 2)))
+            mutate(Total = scales::dollar(round(Total, 2))) %>%
+            arrange(desc(Total))
 
         if (input$donor_lobby_select == "donor") {
             df <- df %>%
@@ -342,7 +338,10 @@ server <- function(input, output, session) {
 
     search_res <- eventReactive(input$do_search, {
         df <- bills
-        if (length(input$session_multi) > 0) df <- df %>% filter(session %in% input$session_multi)
+        if (length(input$session_multi) > 0) {
+            sel <- as.numeric(input$session_multi)
+            df <- df %>% filter(term %in% sel)
+        }
         if (nchar(trimws(input$author_text)) > 0) {
             q <- str_to_lower(trimws(input$author_text))
             df <- df %>%
@@ -354,9 +353,12 @@ server <- function(input, output, session) {
             df <- df %>% mutate(dist_author = 0)
         }
         if (nchar(trimws(input$topic_text)) > 0) {
+            q <- str_to_lower(trimws(input$topic_text))
             df <- df %>%
-                mutate(dist_topic = stringdist(str_to_lower(topic), str_to_lower(trimws(input$topic_text)), method = "jw")) %>%
-                filter(dist_topic < 0.4)
+                mutate(topic_vec = str_split(topic, ",\\s*")) %>%
+                mutate(dist_topic = map_dbl(topic_vec, ~ min(stringdist(q, str_to_lower(str_trim(.x)), method = "jw")))) %>%
+                filter(dist_topic < 0.4) %>%
+                select(-topic_vec)
         } else {
             df <- df %>% mutate(dist_topic = 0)
         }
@@ -386,7 +388,11 @@ server <- function(input, output, session) {
         df <- search_res()
         idx <- which(names(df) == "authors") - 1
         datatable(df, escape = FALSE, rownames = FALSE, options = table_opts) %>%
-            formatStyle("Authors", whiteSpace = "normal", wordWrap = "nowrap", lineHeight = "1.2")
+            formatStyle(
+                "Authors",
+                target = "cell",
+                className = "dt-ellipsis"
+            )
     })
     output$dl_bills <- downloadHandler(filename = function() {
         paste0("bills_", Sys.Date(), ".csv")
@@ -396,68 +402,61 @@ server <- function(input, output, session) {
 
     topic_choices <- reactive({
         topics %>%
-            distinct(topic_cluster) %>%
-            pull(topic_cluster) %>%
+            distinct(topic) %>%
+            pull(topic) %>%
             sort()
     })
 
     output$topic_select_ui <- renderUI({
         selectInput("topic_select", "Topic",
             choices = topic_choices(),
-            selected = topic_choices()[1]
+            selected = topic_choices()[2]
         )
     })
 
     topic_score_data <- reactive({
         req(input$topic_select)
+        topic_id <- topics %>%
+            filter(topic == input$topic_select) %>%
+            distinct(topic_cluster) %>%
+            pull()
 
-        term_bills <- bills %>% filter(topic_cluster == input$topic_select)
-        leg_set <- leg_topics %>% filter(top_0 == input$topic_select)
-        ent_set <- donor_topics %>% filter(topic_1 == input$topic_select)
+        term_bills <- bills %>% filter(topic_cluster == topic_id)
 
-        top_leg <- leg_set %>%
-            count(legislator, sort = TRUE) %>%
-            head(5) %>%
-            pull(legislator)
+        ent_set <- top_ents %>%
+            filter(subject == input$topic_select)
 
-        top_ent <- ent_set %>%
-            rename(entity = name) %>%
-            group_by(entity) %>%
-            summarise(total = sum(total, na.rm = TRUE)) %>%
-            arrange(desc(total)) %>%
-            head(5) %>%
-            pull(entity)
+
+        top_leg <- ent_set %>%
+            pull(top_legislators)
+
+        top_donor <- ent_set %>%
+            pull(top_donors)
+
+        top_lobby <- ent_set %>%
+            pull(top_lobby)
 
         passage_rate <- mean(topics %>%
-            filter(C75 == input$topic_select) %>%
+            filter(topic == input$topic_select) %>%
             pull(outcome))
-        r <- leg_topics %>%
-            mutate(party = if_else(Party == "D", 1, 0)) %>%
-            summarise(party = mean(party, na.rm = TRUE)) %>%
-            pull(party)
-        part <- (1 - mean(topics %>%
-            filter(C75 == input$topic_select) %>%
-            pull(partisanship))) / r
-        if (is.na(part)) {
-            part <- 0
-        }
-        cont <- 1 - mean(topics %>%
-            filter(C75 == input$topic_select) %>%
-            pull(vote_signal))
+
+        cont <- 0.5 - mean(topics %>%
+            filter(topic == input$topic_select) %>%
+            pull(controversy))
 
 
         tibble(
             Metric = c(
-                "Top Legislators", "Top Donors/Lobbyists",
-                "Passage Rate", "Controversiality", "Bipartisan Support",
+                "Top Legislators", "Top Donors", "Top Lobbyists",
+                "Passage Rate", "Controversiality",
                 "Volume of Bills"
             ),
             Value = c(
                 paste(top_leg, collapse = ", "),
-                paste(top_ent, collapse = ", "),
+                paste(top_donor, collapse = ", "),
+                paste(top_lobby, collapse = ", "),
                 scales::percent(passage_rate, accuracy = 0.1),
                 scales::percent(cont, accuracy = 0.1),
-                scales::percent(part, accuracy = 0.1),
                 nrow(term_bills)
             )
         )
@@ -474,27 +473,19 @@ server <- function(input, output, session) {
     output$topic_all_tbl <- renderDT({
         datatable(
             topics %>%
-                mutate(total_funding = donations_term + lobbying_term) %>%
-                filter(C75 != "Acupuncture Licensing and Oversight") %>%
-                group_by(C75, term) %>%
+                group_by(topic, term) %>%
                 summarise(
                     pass_rate = mean(outcome, na.rm = TRUE),
                     controversiality = mean(vote_signal, na.rm = TRUE),
-                    partisanship = mean(partisanship, na.rm = TRUE),
-                    total_funding = sum(total_funding, na.rm = TRUE),
-                    lobbying = sum(lobbying_term, na.rm = TRUE),
-                    donations = sum(donations_term, na.rm = TRUE),
+                    partisanship = mean(partisan_split * 100, na.rm = TRUE),
                     number_bills = sum(bill_id, na.rm = TRUE),
                     longevity = mean(longevity, na.rm = TRUE)
                 ) %>%
-                rename(Topic = C75, Term = term) %>%
+                rename(Term = term) %>%
                 mutate(
                     pass_rate = scales::percent(pass_rate, accuracy = 0.1),
                     controversiality = scales::percent(1 - controversiality, accuracy = 0.1),
-                    partisanship = if_else(partisanship < 0.7, paste0(scales::percent((0.7 - partisanship) / 0.7, accuracy = 0.1), " R."), if_else(partisanship > 0.7, paste0(scales::percent((partisanship - 0.7) / 0.3, accuracy = 0.1), " D."), "Neutral")),
-                    total_funding = scales::dollar(total_funding, accuracy = 1),
-                    lobbying = scales::dollar(lobbying, accuracy = 1),
-                    donations = scales::dollar(donations, accuracy = 1)
+                    partisanship = if_else(partisanship < 0.7, paste0(scales::percent((0.7 - partisanship) / 0.7, accuracy = 0.1), " R."), if_else(partisanship > 0.7, paste0(scales::percent((partisanship - 0.7) / 0.3, accuracy = 0.1), " D."), "Neutral"))
                 ),
             options = list(
                 dom = "Blfrtip",
@@ -506,21 +497,18 @@ server <- function(input, output, session) {
         )
     })
 
-    output$topic_dl_all <- downloadHandler(
-        filename = function() paste0("topic_funding_all_", Sys.Date(), ".csv"),
-        content  = function(file) write_csv(donor_topics, file)
-    )
-
     leg_tbl <- reactive({
         leg_topics %>%
             mutate(
+                chamber = if_else(chamber == "assembly", "Assembly", "Senate"),
                 lobbying_term = scales::dollar(total_lobbying, accuracy = 1),
                 donations_term = scales::dollar(total_donations, accuracy = 1),
                 total_funding = scales::dollar(total_received, accuracy = 1),
                 outcome = scales::percent(outcome, accuracy = 0.1)
             ) %>%
-            rename(Legislator = legislator, Term = term, House = chamber, "Top Topics" = top_topics, Outcome = outcome, "Lead Author" = author_type, "Number of Bills" = bill_version, Donations = total_donations, Lobbying = total_lobbying, "Total Funding" = total_funding) %>%
-            select(Legislator, Term, House, Outcome, "Lead Author", "Number of Bills", Donations, Lobbying, "Total Funding", "Area 1":"Area 10")
+            rename(Legislator = full_name, Term = term, House = chamber, "Top Topics" = top_topics, Outcome = outcome, "Lead Author" = author_type, "Number of Bills" = bill_version, Donations = donations_term, Lobbying = lobbying_term, "Total Funding" = total_funding) %>%
+            arrange(desc(total_received)) %>%
+            select(Legislator, Term, House, Outcome, "Lead Author", "Number of Bills", Donations, Lobbying, "Total Funding")
     })
 
     output$leg <- renderDT({
