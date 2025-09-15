@@ -6,11 +6,21 @@ import numpy as np
 from tqdm import tqdm
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 from torch_scatter import scatter_mean, scatter_add
+try:
+    from torch_sparse import SparseTensor  # type: ignore
+except ImportError:  # pragma: no cover - optional
+    SparseTensor = None
 from torch_geometric.loader import HGTLoader
 from torch_geometric.nn import HGTConv
 from contextlib import contextmanager
 from GNN.time_utils import convert_to_utc_seconds as _convert_to_utc_seconds_list
+from collections import defaultdict
 from collections.abc import Mapping
+
+try:
+    from torch_geometric.utils import metapath_reachable_graph
+except ImportError:  # pragma: no cover - optional PyG utility
+    metapath_reachable_graph = None
 
 # utilities
 def setup_logging():
@@ -199,7 +209,12 @@ def compute_relation_neg_sampling_ratios(data, *, min_ratio=1, max_ratio=5):
 hidden_dim = 192
 n_layers = 3
 dropout_p = 0.10
-device = 'mps'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+    device = 'mps'
+else:
+    device = 'cpu'
 inf_reg_weight = 0.1
 ent_reg_weight = 0.1
 
@@ -1559,66 +1574,206 @@ class StableLossComputer:
         except Exception:
             return torch.tensor(0.0, device=self.device)
 
-def _adj(data, et):
-    row, col = data.edge_index_dict[et]
-    ns, nd = data[et[0]].num_nodes, data[et[2]].num_nodes
-    return torch.sparse_coo_tensor(
-        torch.stack([row, col]), torch.ones_like(row, dtype=torch.float32), (ns, nd)
-    ).coalesce()
+class MetaPathMaskBuilder:
+    """Construct attention masks via cached meta-path enumeration.
 
-def build_masks_weights(d, acts, A_by, paths, device=device):
-    dev = torch.device('cpu')
-    rows = {nt: d[nt].node_id.cpu() for nt in acts}
-    cols = d['bill_version'].node_id.cpu()
-    out = {}
-    col_map = {int(g): i for i, g in enumerate(cols.tolist())}
-    for nt in acts:
-        n_ids = rows[nt]
-        row_map = {int(g): i for i, g in enumerate(n_ids.tolist())}
-        n_r = n_ids.size(0)
-        n_c = cols.size(0)
-        m = torch.zeros(n_r, n_c, dtype=torch.bool, device=dev)
-        w = torch.zeros(n_r, n_c, dtype=torch.float32, device=dev)
+    The builder avoids dense matrix products by traversing allowed meta-paths
+    on demand using lightweight adjacency lookups. Results are cached per
+    actor/path combination so repeated epochs can reuse previously computed
+    connectivity, and the produced mask/weight tensors are moved onto the
+    target accelerator device when available.
+    """
+    def __init__(self, data, allowed_paths, device=device):
+        self.device = torch.device(device)
+        self._edge_maps = self._prepare_edge_maps(data)
+        self._path_cache = {}
+        self._reachable_cache = {}
+        self._edge_index_dict = {
+            tuple(et): data.edge_index_dict[et].detach().cpu()
+            for et in data.edge_types
+        }
+        self._num_nodes_dict = {
+            nt: int(data[nt].num_nodes) for nt in data.node_types
+        }
 
-        for path in paths[nt]:
-            S = A_by[path[0]]
-            for et in path[1:]:
-                S = (S @ A_by[et]).coalesce()
+        normalized_paths = {}
+        self._path_lookup = {}
+        for nt, paths in allowed_paths.items():
+            norm_set = []
+            for path in paths:
+                norm_path = tuple(tuple(step) for step in path)
+                norm_set.append(norm_path)
+                self._path_lookup[norm_path] = norm_path
+            normalized_paths[nt] = norm_set
+        self.allowed_paths = normalized_paths
 
-            r, c = S.indices()
-            keep = torch.isin(r, rows[nt]) & torch.isin(c, cols)
-            if not keep.any():
+    def _prepare_edge_maps(self, data):
+        edge_maps = {}
+        for et in data.edge_types:
+            edge_index = data.edge_index_dict[et]
+            if edge_index.numel() == 0:
+                edge_maps[tuple(et)] = {
+                    'src': np.empty(0, dtype=np.int64),
+                    'dst': np.empty(0, dtype=np.int64),
+                    'ptr': np.zeros(1, dtype=np.int64),
+                }
                 continue
-            r_kept = r[keep].tolist()
-            c_kept = c[keep].tolist()
-            r_sub = [row_map[int(g)] for g in r_kept]
-            c_sub = [col_map[int(g)] for g in c_kept]
-            m[r_sub, c_sub] = True
-            if any(e in path[0][1] or e in path[1][1] for e in {'donated_to','wrote','lobbied','member_of'}):
-                ei = A_by[path[0]].indices()
-                ea = A_by[path[0]].values()
-                Wsp = torch.sparse_coo_tensor(ei, ea, A_by[path[0]].shape, device=dev).coalesce()
-                for et in path[1:]:
-                    Wsp = (Wsp @ A_by[et]).coalesce()
 
-                wr, wc = Wsp.indices()
-                keep_w = torch.isin(wr, rows[nt]) & torch.isin(wc, cols)
-                if keep_w.any():
-                    wr_sub = [row_map[int(g)] for g in wr[keep_w].tolist()]
-                    wc_sub = [col_map[int(g)] for g in wc[keep_w].tolist()]
-                    w[wr_sub, wc_sub] += Wsp.values()[keep_w]
+            src = edge_index[0].detach().cpu().numpy().astype(np.int64, copy=False)
+            dst = edge_index[1].detach().cpu().numpy().astype(np.int64, copy=False)
+            order = np.argsort(src, kind='mergesort')
+            src_sorted = src[order]
+            dst_sorted = dst[order]
+            unique, counts = np.unique(src_sorted, return_counts=True)
+            ptr = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
 
-        out[nt] = (m.to(device), w.to(device))
-    return out
+            edge_maps[tuple(et)] = {
+                'src': unique,
+                'dst': dst_sorted,
+                'ptr': ptr,
+            }
+        return edge_maps
+
+    def _neighbors(self, edge_data, src_id):
+        src_nodes = edge_data['src']
+        if src_nodes.size == 0:
+            return None
+        idx = np.searchsorted(src_nodes, int(src_id))
+        if idx >= src_nodes.size or src_nodes[idx] != int(src_id):
+            return None
+        start = edge_data['ptr'][idx]
+        end = edge_data['ptr'][idx + 1]
+        if start == end:
+            return None
+        return edge_data['dst'][start:end]
+
+    def _get_reachable_map(self, path_key):
+        if metapath_reachable_graph is None:
+            return None
+        if path_key in self._reachable_cache:
+            return self._reachable_cache[path_key]
+
+        metapath = [tuple(step) for step in self._path_lookup[path_key]]
+        try:
+            reachable = metapath_reachable_graph(
+                self._edge_index_dict,
+                metapath,
+                num_nodes_dict=self._num_nodes_dict,
+            )
+        except TypeError:
+            reachable = metapath_reachable_graph(self._edge_index_dict, metapath)
+        except Exception:
+            reachable = None
+
+        mapping = defaultdict(set)
+        if isinstance(reachable, torch.Tensor) and reachable.numel() > 0:
+            reach_cpu = reachable.detach().cpu()
+            src_nodes = reach_cpu[0].tolist()
+            dst_nodes = reach_cpu[1].tolist()
+            for s, d in zip(src_nodes, dst_nodes):
+                mapping[int(s)].add(int(d))
+        elif SparseTensor is not None and isinstance(reachable, SparseTensor):
+            row, col, _ = reachable.coo()
+            if row is not None and col is not None:
+                src_nodes = row.detach().cpu().tolist()
+                dst_nodes = col.detach().cpu().tolist()
+                for s, d in zip(src_nodes, dst_nodes):
+                    mapping[int(s)].add(int(d))
+
+        self._reachable_cache[path_key] = mapping if mapping else None
+        return self._reachable_cache[path_key]
+
+    def _enumerate_path(self, path_key, src_id):
+        cache_key = (path_key, int(src_id))
+        if cache_key in self._path_cache:
+            return self._path_cache[cache_key]
+
+        path = self._path_lookup[path_key]
+        reachable_map = self._get_reachable_map(path_key)
+        if reachable_map is not None and int(src_id) not in reachable_map:
+            self._path_cache[cache_key] = {}
+            return {}
+
+        frontier = {int(src_id): 1.0}
+        for step in path:
+            edge_data = self._edge_maps.get(step)
+            if edge_data is None:
+                frontier = {}
+                break
+
+            next_frontier = {}
+            for node, weight in frontier.items():
+                neighbors = self._neighbors(edge_data, node)
+                if neighbors is None:
+                    continue
+                for nbr in neighbors.tolist():
+                    next_frontier[nbr] = next_frontier.get(nbr, 0.0) + weight
+
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        dest_counts = {int(dst): float(cnt) for dst, cnt in frontier.items()}
+        if reachable_map is not None:
+            allowed = reachable_map.get(int(src_id))
+            if allowed:
+                dest_counts = {dst: cnt for dst, cnt in dest_counts.items() if dst in allowed}
+        self._path_cache[cache_key] = dest_counts
+        return dest_counts
+
+    def __call__(self, batch, actor_types):
+        result = {}
+        bill_store = batch['bill_version']
+        cols_tensor = getattr(bill_store, 'node_id', None)
+        if cols_tensor is None:
+            cols_tensor = torch.arange(bill_store.num_nodes)
+        cols = cols_tensor.detach().cpu().tolist()
+        col_map = {int(g): i for i, g in enumerate(cols)}
+        n_cols = len(cols)
+
+        for nt in actor_types:
+            actor_store = getattr(batch, nt, None)
+            if actor_store is None or nt not in self.allowed_paths:
+                result[nt] = (
+                    torch.zeros((0, n_cols), dtype=torch.bool, device=self.device),
+                    torch.zeros((0, n_cols), dtype=torch.float32, device=self.device),
+                )
+                continue
+
+            node_ids_tensor = getattr(actor_store, 'node_id', None)
+            if node_ids_tensor is None:
+                node_ids_tensor = torch.arange(actor_store.num_nodes)
+            row_ids = node_ids_tensor.detach().cpu().tolist()
+            n_rows = len(row_ids)
+            mask = torch.zeros((n_rows, n_cols), dtype=torch.bool, device=self.device)
+            weight = torch.zeros((n_rows, n_cols), dtype=torch.float32, device=self.device)
+            row_map = {int(g): i for i, g in enumerate(row_ids)}
+
+            for path in self.allowed_paths[nt]:
+                for actor_id in row_ids:
+                    dest_counts = self._enumerate_path(path, actor_id)
+                    if not dest_counts:
+                        continue
+                    row_idx = row_map[int(actor_id)]
+                    for dst_id, count in dest_counts.items():
+                        col_idx = col_map.get(int(dst_id))
+                        if col_idx is None:
+                            continue
+                        mask[row_idx, col_idx] = True
+                        weight[row_idx, col_idx] += float(count)
+
+            result[nt] = (mask, weight)
+
+        return result
 
 class TrainingManager:
-    def __init__(self, model, optimizer, logger, A_by, ALLOWED):
+    def __init__(self, model, optimizer, logger, mask_builder, actor_types):
         self.model = model
         self.optimizer = optimizer
         self.logger = logger
         self.loss_computer = StableLossComputer()
-        self.A_by = A_by
-        self.ALLOWED = ALLOWED
+        self.mask_builder = mask_builder
+        self.actor_types = actor_types
 
         self.best_loss = float('inf')
         self.patience_counter = 0
@@ -1636,7 +1791,8 @@ class TrainingManager:
                     print(loss)
                     epoch_losses.append(loss)
                     if batch_idx % 10 == 0:
-                        torch.mps.empty_cache()
+                        if getattr(torch, 'mps', None) is not None and torch.backends.mps.is_available():
+                            torch.mps.empty_cache()
                         gc.collect()
 
                 except Exception as e:
@@ -1658,7 +1814,7 @@ class TrainingManager:
     def train_step(self, batch):
         batch = batch.to(device)
         self.optimizer.zero_grad()
-        mw_dict = build_masks_weights(batch, ['legislator','committee','donor','lobby_firm'], self.A_by, self.ALLOWED)
+        mw_dict = self.mask_builder(batch, self.actor_types)
 
         outputs = self.model(batch, mw_dict)
         loss_dict = self.model.compute_loss(outputs, batch)
@@ -1703,7 +1859,6 @@ def main():
 
     topic_onehot_bill = F.one_hot(cluster_bill.clamp(max=num_topics-1), num_classes=num_topics).float()
     cluster_bill, topic_onehot_bill = cluster_bill.to(device), topic_onehot_bill.to(device)
-    A_by = {et: _adj(data, et).coalesce() for et in data.edge_types}
     valid_destination_sets = build_valid_destination_sets(data)
     neg_sampling_ratios = compute_relation_neg_sampling_ratios(data)
 
@@ -1740,6 +1895,8 @@ def main():
             ('legislator_term','wrote','bill_version') )
         ]
     }
+    mask_builder = MetaPathMaskBuilder(data, ALLOWED, device=device)
+    actor_types = ['legislator', 'committee', 'donor', 'lobby_firm']
     in_dims = {nt: data[nt].x.size(1) for nt in data.node_types if hasattr(data[nt], 'x') and data[nt].x is not None}
     metadata = data.metadata()
 
@@ -1760,7 +1917,8 @@ def main():
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-6, eps=1e-8)
 
-    torch.mps.empty_cache()
+    if getattr(torch, 'mps', None) is not None and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     gc.collect()
 
     for nt in data.node_types:
@@ -1787,7 +1945,13 @@ def main():
     patience = 5
     # model.load_state_dict(torch.load("best_model5.pt"), strict=False)
     # optimizer.load_state_dict(torch.load("best_opt5.pt"))
-    trainer = TrainingManager(optimizer=optimizer, logger=logger, model=model, A_by=A_by, ALLOWED=ALLOWED)
+    trainer = TrainingManager(
+        optimizer=optimizer,
+        logger=logger,
+        model=model,
+        mask_builder=mask_builder,
+        actor_types=actor_types,
+    )
 
     for epoch in tqdm(range(epochs), position=0, total=epochs):
         avg_loss = trainer.train_epoch(loader, epoch)
