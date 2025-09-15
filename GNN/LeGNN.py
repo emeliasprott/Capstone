@@ -9,6 +9,7 @@ from torch_scatter import scatter_mean, scatter_add
 from torch_geometric.loader import HGTLoader
 from torch_geometric.nn import SAGEConv
 from contextlib import contextmanager
+from GNN.time_utils import convert_to_utc_seconds as _convert_to_utc_seconds_list
 
 # utilities
 def setup_logging():
@@ -94,38 +95,10 @@ def alarm():
         time.sleep(0.5)
 
 # preprocessing
-def safe_normalize_timestamps(timestamps, eps=1e-8):
-    timestamps = torch.nan_to_num(timestamps, nan=0.0, posinf=1e4, neginf=-1e4)
-    p5 = torch.quantile(timestamps, 0.05)
-    p95 = torch.quantile(timestamps, 0.95)
+def convert_to_utc_seconds(time_data):
+    """Convert timestamp-like values to a torch tensor of UTC seconds."""
 
-    if (p95 - p5) < eps:
-        return torch.zeros_like(timestamps)
-
-    timestamps = torch.clamp(timestamps, p5, p95)
-    normalized = (timestamps - p5) / (p95 - p5)
-    return torch.nan_to_num(normalized, nan=0.0)
-
-def safe_standardize_time_format(time_data):
-    times = []
-    for t in time_data:
-        try:
-            if isinstance(t, (int, float)) and 1900 <= t  and t <= 2100:
-                td = datetime.datetime(int(t), 6, 15).timestamp()
-            elif (isinstance(t, str) or (isinstance(t, float))) and (float(t) < 2100 and float(t) > 1900):
-                td = datetime.datetime(int(float(t)), 6, 15).timestamp()
-            elif float(t) > 0 and float(t) < 1990:
-                td = t
-            elif float(t) > 17000000.0:
-                td = float(t)
-            elif isinstance(t, datetime.datetime):
-                td = t.timestamp()
-            else:
-                td = float(t) * 1e9
-        except:
-            td = datetime.datetime(2000, 6, 15).timestamp()
-        times.append(td)
-    return torch.tensor(times, dtype=torch.float32)
+    return torch.tensor(_convert_to_utc_seconds_list(time_data), dtype=torch.float32)
 
 def pull_timestamps(data):
     timestamp_edges = [
@@ -145,9 +118,8 @@ def pull_timestamps(data):
             if data[et].edge_attr.size(1) > 1:
                 edge_attr = data[et].edge_attr
                 ts_col = edge_attr[:, -1]
-                if ts_col.abs().max() > 1e8 or ts_col.min() < 0:
-                    ts_col = safe_standardize_time_format(ts_col.tolist()).to(edge_attr.device)
-                data[et].timestamp = safe_normalize_timestamps(ts_col)
+                ts_seconds = convert_to_utc_seconds(ts_col).to(edge_attr.device)
+                data[et].timestamp = ts_seconds
                 data[et].edge_attr = edge_attr[:, :-1]
 
     for nt in timestamp_nodes:
@@ -157,10 +129,9 @@ def pull_timestamps(data):
                     if data[nt].x.size(1) > 1:
                         x = data[nt].x
                         ts_col = x[:, -1]
-                        if ts_col.abs().max() > 1e8 or ts_col.min() < 0:
-                            ts_col = safe_standardize_time_format(ts_col.tolist()).to(x.device)
-                        if nt in timestamp_nodes or ts_col.abs().max() > 1e6:
-                            data[nt].timestamp = safe_normalize_timestamps(ts_col)
+                        ts_seconds = convert_to_utc_seconds(ts_col).to(x.device)
+                        if nt in timestamp_nodes or ts_seconds.abs().max() > 1e6:
+                            data[nt].timestamp = ts_seconds
                             data[nt].x = x[:, :-1]
             except:
                 pass
