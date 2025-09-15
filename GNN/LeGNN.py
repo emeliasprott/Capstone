@@ -597,30 +597,70 @@ def load_and_preprocess_data(path='data3.pt', controversy_kwargs=None):
     return data
 
 # encoders
+class TGATRelativeTimeEncoder(nn.Module):
+    def __init__(self, hidden_dim, in_channels=5, num_frequencies=16):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_dim = hidden_dim
+        self.num_frequencies = max(1, min(num_frequencies, hidden_dim // 2))
+
+        self.frequencies = nn.Parameter(torch.randn(in_channels, self.num_frequencies))
+        self.phase = nn.Parameter(torch.zeros(self.num_frequencies))
+        self.proj = nn.Sequential(
+            nn.Linear(self.num_frequencies * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, time_features):
+        if time_features.dim() == 1:
+            time_features = time_features.unsqueeze(-1)
+
+        features = torch.nan_to_num(time_features, nan=0.0, posinf=0.0, neginf=0.0)
+        if features.size(-1) != self.in_channels:
+            pad = self.in_channels - features.size(-1)
+            if pad > 0:
+                padding = torch.zeros(*features.shape[:-1], pad, device=features.device, dtype=features.dtype)
+                features = torch.cat([features, padding], dim=-1)
+            else:
+                features = features[..., :self.in_channels]
+
+        max_abs = features.abs().amax(dim=0, keepdim=True).clamp(min=1.0)
+        scaled = features / max_abs
+
+        angles = scaled @ self.frequencies + self.phase
+        sin_part = torch.sin(angles)
+        cos_part = torch.cos(angles)
+        encoding = torch.cat([sin_part, cos_part], dim=-1)
+        return self.proj(encoding)
+
+
 class LegislativeTemporalEncoder(nn.Module):
-    def __init__(self, d=hidden_dim):
+    def __init__(self, d=hidden_dim, in_channels=5, num_frequencies=16):
         super().__init__()
         self.hidden_dim = d
-        for h in ['vote_temporal', 'donation_temporal', 'lobbying_temporal']:
-            setattr(self, h, nn.Sequential(
-                nn.Linear(1, d // 4),
-                nn.ReLU(),
-                nn.Linear(d // 4, d),
-            ))
+        self.time_encoder = TGATRelativeTimeEncoder(d, in_channels=in_channels, num_frequencies=num_frequencies)
 
-        self.vote_temporal = getattr(self, 'vote_temporal')
-        self.donation_temporal = getattr(self, 'donation_temporal')
-        self.lobbying_temporal = getattr(self, 'lobbying_temporal')
+        def _process_block():
+            return nn.Sequential(
+                nn.LayerNorm(d),
+                nn.Linear(d, d),
+                nn.GELU(),
+                nn.Linear(d, d),
+            )
 
-    def forward(self, timestamps, process_type):
-        if process_type == 'vote':
-            return self.vote_temporal(timestamps.unsqueeze(-1))
-        elif process_type == 'donation':
-            return self.donation_temporal(timestamps.unsqueeze(-1))
-        elif process_type == 'lobbying':
-            return self.lobbying_temporal(timestamps.unsqueeze(-1))
-        else:
-            return self.vote_temporal(timestamps.unsqueeze(-1))
+        self.process_blocks = nn.ModuleDict({
+            'default': _process_block(),
+            'vote': _process_block(),
+            'donation': _process_block(),
+            'lobbying': _process_block(),
+            'hierarchy': _process_block(),
+        })
+
+    def forward(self, time_features, process_type):
+        encoded = self.time_encoder(time_features)
+        block = self.process_blocks.get(process_type, self.process_blocks['default'])
+        return block(encoded)
 
 class FeatureProjector(nn.Module):
     def __init__(self, in_dims, d_out=hidden_dim):
@@ -732,11 +772,37 @@ class LegislativeGraphEncoder(nn.Module):
         self.relation_groups = _group_edge_types(self.metadata[1], relation_weight_sharing)
         self.heads = heads
 
-        self.process_map = {
-            ('donor', 'donated_to', 'legislator_term'): 'donation',
-            ('lobby_firm', 'lobbied', 'legislator_term'): 'lobbying',
-            ('bill_version', 'is_version', 'bill'): 'hierarchy'
-        }
+        donation_edges = [
+            ('donor', 'donated_to', 'legislator_term'),
+            ('legislator_term', 'rev_donated_to', 'donor'),
+        ]
+        lobbying_edges = [
+            ('lobby_firm', 'lobbied', 'legislator_term'),
+            ('lobby_firm', 'lobbied', 'committee'),
+            ('committee', 'rev_lobbied', 'lobby_firm'),
+            ('legislator_term', 'rev_lobbied', 'lobby_firm'),
+        ]
+        vote_edges = [
+            ('legislator_term', 'voted_on', 'bill_version'),
+            ('bill_version', 'rev_voted_on', 'legislator_term'),
+        ]
+        hierarchy_edges = [
+            ('bill_version', 'is_version', 'bill'),
+            ('bill', 'rev_is_version', 'bill_version'),
+        ]
+
+        process_map = {}
+        for group, label in [
+            (donation_edges, 'donation'),
+            (lobbying_edges, 'lobbying'),
+            (vote_edges, 'vote'),
+            (hierarchy_edges, 'hierarchy'),
+        ]:
+            for et in group:
+                process_map[tuple(et)] = label
+                process_map[et[1]] = label
+
+        self.process_map = process_map
 
         self.convs = nn.ModuleDict()
         for group_name, relations in self.relation_groups.items():
@@ -746,34 +812,145 @@ class LegislativeGraphEncoder(nn.Module):
         self.temporal_encoder = LegislativeTemporalEncoder(hidden_dim)
         self.vote_conv = PolarityAwareConv(hidden_dim, 385, dropout)
 
-    def forward(self, x_dict, edge_index_dict, edge_attr_dict, ts_dict):
+    def forward(
+        self,
+        x_dict,
+        edge_index_dict,
+        edge_attr_dict,
+        edge_ts_dict=None,
+        node_ts_dict=None,
+        edge_delta_dict=None,
+    ):
         out = {nt: torch.zeros_like(x, device=x.device) for nt, x in x_dict.items()}
-        temporal_adjustments = {}
 
-        if ts_dict is not None:
-            for et, timestamps in ts_dict.items():
-                if timestamps is None:
-                    continue
-                norm_et = _normalize_edge_type(et)
-                if norm_et not in edge_index_dict:
-                    continue
-                edge_index = edge_index_dict[norm_et]
-                if edge_index.numel() == 0:
-                    continue
-                src = norm_et[0]
-                if src not in x_dict:
-                    continue
-                if edge_index[0].max() >= x_dict[src].size(0):
-                    continue
-                process = self.process_map.get(norm_et, 'vote')
-                edge_temp = self.temporal_encoder(timestamps, process)
-                node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
-                temporal_adjustments[norm_et] = torch.nan_to_num(node_temp, nan=0.0, posinf=0.0, neginf=0.0)
+        edge_ts_dict = edge_ts_dict or {}
+        node_ts_dict = node_ts_dict or {}
+        edge_delta_dict = edge_delta_dict or {}
+
+        node_time_tensors = {}
+        for nt, ts in node_ts_dict.items():
+            if ts is None:
+                continue
+            tensor = sanitize(ts)
+            if tensor.dim() == 0:
+                tensor = tensor.unsqueeze(0)
+            node_time_tensors[nt] = tensor.view(-1)
+
+        edge_delta_tensors = {}
+        for et, delta in edge_delta_dict.items():
+            if delta is None:
+                continue
+            tensor = sanitize(delta)
+            if tensor.dim() == 0:
+                tensor = tensor.unsqueeze(0)
+            edge_delta_tensors[_normalize_edge_type(et)] = tensor.view(-1)
+
+        temporal_messages = {}
+
+        for et, timestamps in edge_ts_dict.items():
+            if timestamps is None:
+                continue
+
+            norm_et = _normalize_edge_type(et)
+            if norm_et not in edge_index_dict:
+                continue
+
+            edge_index = edge_index_dict[norm_et]
+            if edge_index.numel() == 0:
+                continue
+
+            src_type, _, dst_type = norm_et
+            if dst_type not in x_dict:
+                continue
+
+            num_edges = edge_index.size(1)
+
+            ts_tensor = sanitize(timestamps).view(-1)
+            if ts_tensor.numel() == 0:
+                continue
+
+            ts_tensor = ts_tensor.to(x_dict[dst_type].device)
+            if ts_tensor.numel() != num_edges:
+                min_len = min(ts_tensor.numel(), num_edges)
+                ts_tensor = ts_tensor[:min_len]
+                if min_len < num_edges:
+                    pad_value = ts_tensor.mean() if min_len > 0 else torch.tensor(0.0, device=ts_tensor.device)
+                    pad_scalar = float(pad_value.item()) if isinstance(pad_value, torch.Tensor) else float(pad_value)
+                    ts_tensor = F.pad(ts_tensor, (0, num_edges - min_len), value=pad_scalar)
+
+            src_times = node_time_tensors.get(src_type)
+            dst_times = node_time_tensors.get(dst_type)
+
+            if src_times is not None:
+                src_times = src_times.to(ts_tensor.device)
+            if dst_times is not None:
+                dst_times = dst_times.to(ts_tensor.device)
+
+            src_idx = edge_index[0]
+            dst_idx = edge_index[1]
+
+            base_time = torch.nan_to_num(ts_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+            src_delta = torch.zeros_like(base_time)
+            if src_times is not None and src_times.numel() > 0:
+                valid_src = src_idx < src_times.size(0)
+                if valid_src.any():
+                    src_delta[valid_src] = base_time[valid_src] - src_times[src_idx[valid_src]]
+            else:
+                valid_src = torch.zeros_like(base_time, dtype=torch.bool)
+
+            dst_delta = torch.zeros_like(base_time)
+            if dst_times is not None and dst_times.numel() > 0:
+                valid_dst = dst_idx < dst_times.size(0)
+                if valid_dst.any():
+                    dst_delta[valid_dst] = dst_times[dst_idx[valid_dst]] - base_time[valid_dst]
+            else:
+                valid_dst = torch.zeros_like(base_time, dtype=torch.bool)
+
+            src_dst_delta = torch.zeros_like(base_time)
+            if src_times is not None and dst_times is not None and src_times.numel() > 0 and dst_times.numel() > 0:
+                valid_pair = valid_src & valid_dst
+                if valid_pair.any():
+                    src_dst_delta[valid_pair] = dst_times[dst_idx[valid_pair]] - src_times[src_idx[valid_pair]]
+
+            delta_feature = torch.zeros_like(base_time)
+            delta_tensor = edge_delta_tensors.get(norm_et)
+            if delta_tensor is None:
+                delta_tensor = edge_delta_tensors.get(_et_to_key(norm_et))
+            if delta_tensor is not None:
+                delta_tensor = delta_tensor.to(base_time.device)
+                if delta_tensor.numel() != num_edges:
+                    min_len = min(delta_tensor.numel(), num_edges)
+                    delta_tensor = delta_tensor[:min_len]
+                    if min_len < num_edges:
+                        pad_value = delta_tensor.mean() if min_len > 0 else torch.tensor(0.0, device=delta_tensor.device)
+                        pad_scalar = float(pad_value.item()) if isinstance(pad_value, torch.Tensor) else float(pad_value)
+                        delta_tensor = F.pad(delta_tensor, (0, num_edges - min_len), value=pad_scalar)
+                delta_feature = torch.nan_to_num(delta_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+            time_features = torch.stack([
+                base_time,
+                src_delta,
+                dst_delta,
+                src_dst_delta,
+                delta_feature,
+            ], dim=-1)
+
+            process = self.process_map.get(norm_et)
+            if process is None:
+                process = self.process_map.get(norm_et[1], 'vote')
+
+            encoded = self.temporal_encoder(time_features, process)
+            encoded = torch.nan_to_num(encoded, nan=0.0, posinf=0.0, neginf=0.0)
+
+            aggregated = scatter_mean(encoded, dst_idx, dim=0, dim_size=x_dict[dst_type].size(0))
+            temporal_messages[norm_et] = torch.nan_to_num(aggregated, nan=0.0, posinf=0.0, neginf=0.0)
+
+        remaining_temporal = dict(temporal_messages)
 
         for group_name, conv in self.convs.items():
             relations = self.relation_groups[group_name]
             group_edge_index = {}
-            src_modifiers = {}
 
             for et in relations:
                 if et not in edge_index_dict:
@@ -782,26 +959,34 @@ class LegislativeGraphEncoder(nn.Module):
                 if edge_index.numel() == 0:
                     continue
                 group_edge_index[et] = edge_index
-                if et in temporal_adjustments:
-                    src_modifiers.setdefault(et[0], []).append(temporal_adjustments[et])
 
             if not group_edge_index:
                 continue
 
-            x_group = x_dict
-            if src_modifiers:
-                x_group = x_dict.copy()
-                for src_type, modifiers in src_modifiers.items():
-                    stacked = torch.stack(modifiers)
-                    delta = torch.nan_to_num(stacked.sum(dim=0), nan=0.0, posinf=0.0, neginf=0.0)
-                    x_group[src_type] = x_group[src_type] + delta
-
-            conv_out = conv(x_group, group_edge_index)
+            conv_out = conv(x_dict, group_edge_index)
             for nt, value in conv_out.items():
+                cleaned = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
                 if nt in out:
-                    out[nt] += value
+                    out[nt] += cleaned
                 else:
-                    out[nt] = value
+                    out[nt] = cleaned
+
+            for et in relations:
+                addition = remaining_temporal.pop(et, None)
+                if addition is None:
+                    continue
+                dst_type = et[2]
+                if dst_type in out:
+                    out[dst_type] += addition
+                else:
+                    out[dst_type] = addition
+
+        for et, addition in remaining_temporal.items():
+            dst_type = et[2]
+            if dst_type in out:
+                out[dst_type] += addition
+            else:
+                out[dst_type] = addition
 
         vote_et = ('legislator_term', 'voted_on', 'bill_version')
         if vote_et in edge_attr_dict and vote_et in edge_index_dict:
@@ -895,11 +1080,42 @@ class LegislativeGraphModel(nn.Module):
             for nt in self.feature_proj if hasattr(batch[nt], 'x')
         }
 
-        ts_dict = {et: batch[et].timestamp for et in batch.edge_types
-                   if hasattr(batch[et], 'timestamp')}
+        edge_ts_dict = {}
+        edge_delta_dict = {}
+        for et in batch.edge_types:
+            store = batch[et]
+            if hasattr(store, 'timestamp') and getattr(store, 'timestamp') is not None:
+                edge_ts_dict[et] = store.timestamp
+
+            for attr_name in ('time_diff', 'time_diffs', 'time_delta', 'time_deltas', 'delta_time'):
+                if hasattr(store, attr_name):
+                    value = getattr(store, attr_name)
+                    if value is not None:
+                        edge_delta_dict[et] = value
+                        break
+
+        node_ts_dict = {}
+        if hasattr(batch, 'node_types'):
+            node_iter = batch.node_types
+        else:
+            node_iter = self.node_types
+
+        for nt in node_iter:
+            if not hasattr(batch, nt):
+                continue
+            store = batch[nt]
+            if hasattr(store, 'timestamp') and getattr(store, 'timestamp') is not None:
+                node_ts_dict[nt] = store.timestamp
 
         for encoder in self.encoders:
-            x_dict = encoder(x_dict, batch.edge_index_dict, batch.edge_attr_dict, ts_dict)
+            x_dict = encoder(
+                x_dict,
+                batch.edge_index_dict,
+                batch.edge_attr_dict,
+                edge_ts_dict,
+                node_ts_dict,
+                edge_delta_dict,
+            )
 
         return x_dict
 
