@@ -1,4 +1,4 @@
-import datetime, gc, json, torch, logging
+import datetime, gc, json, torch, logging, math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -130,6 +130,71 @@ def safe_tensor_operation(func, *args, default_value=0.0, clamp_range=(-1e3, 1e3
     except Exception as e:
         logging.error(f"Error in {func.__name__}: {e}")
         return torch.tensor(default_value)
+
+def build_valid_destination_sets(data):
+    """Collect the set of valid destination node ids for every edge type."""
+
+    valid_sets = {}
+    for edge_type in data.edge_types:
+        edge_index = data.edge_index_dict[edge_type]
+        dst_nodes = edge_index[1]
+        if isinstance(dst_nodes, torch.Tensor):
+            dst_nodes = dst_nodes.detach()
+            if dst_nodes.device.type != 'cpu':
+                dst_nodes = dst_nodes.to('cpu')
+            dst_nodes = dst_nodes.to(dtype=torch.long)
+        else:
+            dst_nodes = torch.as_tensor(dst_nodes, dtype=torch.long)
+
+        valid_sets[tuple(edge_type)] = torch.unique(dst_nodes)
+
+    return valid_sets
+
+def compute_relation_neg_sampling_ratios(data, *, min_ratio=1, max_ratio=5):
+    """Estimate negative sampling ratios per edge type based on sparsity."""
+
+    avg_degree_by_edge = {}
+    degree_values = []
+
+    for edge_type in data.edge_types:
+        edge_index = data.edge_index_dict[edge_type]
+        edge_key = tuple(edge_type)
+        num_edges = edge_index.size(1)
+
+        if num_edges == 0:
+            avg_degree_by_edge[edge_key] = 0.0
+            continue
+
+        src_nodes = edge_index[0].detach()
+        if src_nodes.device.type != 'cpu':
+            src_nodes = src_nodes.to('cpu')
+        src_nodes = src_nodes.to(dtype=torch.long)
+
+        unique_sources = torch.unique(src_nodes).numel()
+        unique_sources = max(int(unique_sources), 1)
+        avg_degree = float(num_edges) / unique_sources
+
+        avg_degree_by_edge[edge_key] = avg_degree
+        degree_values.append(avg_degree)
+
+    global_avg_degree = sum(degree_values) / len(degree_values) if degree_values else 0.0
+    default_ratio = max(
+        min_ratio,
+        min(max_ratio, int(math.ceil(global_avg_degree)) if global_avg_degree > 0 else min_ratio),
+    )
+
+    ratios = {}
+    for edge_key, avg_degree in avg_degree_by_edge.items():
+        if avg_degree <= 0.0:
+            ratios[edge_key] = 0
+            continue
+
+        ratio = global_avg_degree / avg_degree if global_avg_degree > 0 else 1.0
+        ratio = max(min_ratio, min(max_ratio, int(math.ceil(ratio))))
+        ratios[edge_key] = ratio
+
+    ratios['default'] = default_ratio
+    return ratios
 
 hidden_dim = 192
 n_layers = 3
@@ -1008,7 +1073,19 @@ class LegislativeGraphEncoder(nn.Module):
         return out
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, metadata, relation_weight_sharing=None, device=device):
+    def __init__(
+        self,
+        in_dims,
+        cluster_id,
+        topic_onehot,
+        hidden_dim,
+        dropout,
+        metadata,
+        relation_weight_sharing=None,
+        device=device,
+        neg_sampling_ratio=1,
+        valid_destination_sets=None,
+    ):
         super().__init__()
         self.device = device
 
@@ -1053,7 +1130,11 @@ class LegislativeGraphModel(nn.Module):
 
         self.register_buffer('cluster_id',  cluster_id)
         self.register_buffer('topic_onehot', topic_onehot)
-        self.loss_computer = StableLossComputer(device=device)
+        self.loss_computer = StableLossComputer(
+            device=device,
+            neg_sampling_ratio=neg_sampling_ratio,
+            valid_destination_sets=valid_destination_sets,
+        )
 
     def _aggregate_hierarchy(self, z, b):
         if ('bill_version', 'is_version', 'bill') in b.edge_index_dict:
@@ -1159,7 +1240,7 @@ class LegislativeGraphModel(nn.Module):
         loss_dict['topic_loss'] = topic_loss
 
         embeddings = outputs["node_embeddings"]
-        link_loss = self.loss_computer.compute_link_loss(embeddings, batch.edge_index_dict)
+        link_loss = self.loss_computer.compute_link_loss(embeddings, batch)
         loss_dict['link_loss'] = link_loss
 
         success_loss = torch.tensor(0.0, device=self.device)
@@ -1181,12 +1262,108 @@ class LegislativeGraphModel(nn.Module):
         return loss_dict
 
 class StableLossComputer:
-    def __init__(self, device=device, temp=0.1, neg_sampling_ratio=1):
+    def __init__(self, device=device, temp=0.1, neg_sampling_ratio=1, valid_destination_sets=None):
         self.device = device
         self.temp = temp
-        self.neg_sampling_ratio = neg_sampling_ratio
         self.bce = nn.BCEWithLogitsLoss()
         self.eps = 1e-8
+        self._set_neg_sampling_ratio(neg_sampling_ratio)
+        self.valid_destination_sets = self._prepare_valid_destination_sets(valid_destination_sets)
+
+    def _set_neg_sampling_ratio(self, ratio):
+        self.default_neg_sampling_ratio = 1
+        self.neg_sampling_ratio_map = {}
+
+        if isinstance(ratio, Mapping):
+            default_value = None
+            for key, value in ratio.items():
+                if isinstance(key, str) and key.lower() == 'default':
+                    default_value = value
+                    continue
+                try:
+                    edge_key = _normalize_edge_type(key)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    ratio_value = int(value)
+                except (TypeError, ValueError):
+                    continue
+                self.neg_sampling_ratio_map[edge_key] = max(0, ratio_value)
+
+            if default_value is not None:
+                try:
+                    self.default_neg_sampling_ratio = max(0, int(default_value))
+                except (TypeError, ValueError):
+                    self.default_neg_sampling_ratio = 0
+        else:
+            try:
+                self.default_neg_sampling_ratio = max(0, int(ratio))
+            except (TypeError, ValueError):
+                self.default_neg_sampling_ratio = 0
+
+    def _prepare_valid_destination_sets(self, mapping):
+        if not mapping:
+            return {}
+
+        prepared = {}
+        for key, value in mapping.items():
+            try:
+                edge_key = _normalize_edge_type(key)
+            except (TypeError, ValueError):
+                continue
+
+            if value is None:
+                continue
+
+            tensor = torch.as_tensor(value, dtype=torch.long)
+            if tensor.dim() == 0:
+                tensor = tensor.unsqueeze(0)
+            tensor = torch.unique(tensor)
+            if tensor.device.type != 'cpu':
+                tensor = tensor.to('cpu')
+
+            prepared[edge_key] = tensor
+
+        return prepared
+
+    def _get_neg_sampling_ratio(self, edge_type):
+        edge_key = tuple(edge_type)
+        return self.neg_sampling_ratio_map.get(edge_key, self.default_neg_sampling_ratio)
+
+    def _candidate_negative_indices(self, edge_type, embeddings, batch, dst_type):
+        num_nodes = embeddings[dst_type].size(0)
+        if num_nodes == 0:
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+
+        candidates = torch.arange(num_nodes, device=self.device, dtype=torch.long)
+
+        if not self.valid_destination_sets:
+            return candidates
+
+        valid_global = self.valid_destination_sets.get(edge_type)
+        if valid_global is None:
+            return candidates
+        if valid_global.numel() == 0:
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+
+        if hasattr(batch, 'node_types') and dst_type not in batch.node_types:
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+
+        node_store = batch[dst_type]
+        node_ids = getattr(node_store, 'node_id', None)
+        if node_ids is None:
+            return candidates
+
+        node_ids_cpu = node_ids.detach()
+        if node_ids_cpu.device.type != 'cpu':
+            node_ids_cpu = node_ids_cpu.to('cpu')
+        node_ids_cpu = node_ids_cpu.to(dtype=torch.long)
+
+        mask_cpu = torch.isin(node_ids_cpu, valid_global)
+        if not mask_cpu.any():
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+
+        return candidates[mask_cpu.to(device=candidates.device)]
 
     def compute_topic_loss(self, logits, labels):
         logits = torch.clamp(logits, -10, 10)
@@ -1200,50 +1377,70 @@ class StableLossComputer:
 
         return safe_tensor_operation(lambda: loss, default_value=0.0).clamp(0, 1000)
 
-    def compute_link_loss(self, embeddings, edge_index_dict):
+    def compute_link_loss(self, embeddings, batch):
         total_loss = 0.0
         num_edges = 0
 
-        for (s_t, _, d_t), ei in edge_index_dict.items():
-            if ei.numel() == 0:
+        for edge_type, edge_index in batch.edge_index_dict.items():
+            if edge_index.numel() == 0:
                 continue
-            s, d = ei
+
+            s, d = edge_index
             if s.numel() == 0 or d.numel() == 0:
                 continue
+
+            s_t, _, d_t = edge_type
+            if s_t not in embeddings or d_t not in embeddings:
+                continue
+
             z_s = embeddings[s_t][s]
             z_d = embeddings[d_t][d]
             if torch.isnan(z_s).any() or torch.isinf(z_s).any():
                 continue
             if torch.isnan(z_d).any() or torch.isinf(z_d).any():
                 continue
+
             z_s = F.normalize(torch.clamp(z_s, -10, 10), dim=-1, eps=1e-8)
             z_d = F.normalize(torch.clamp(z_d, -10, 10), dim=-1, eps=1e-8)
 
             pos_scores = torch.clamp((z_s * z_d).sum(-1) / self.temp, -10, 10)
             pos_loss = self.bce(pos_scores, torch.ones_like(pos_scores))
+            relation_loss = pos_loss
 
+            neg_ratio = self._get_neg_sampling_ratio(edge_type)
+            if neg_ratio > 0:
+                candidates = self._candidate_negative_indices(edge_type, embeddings, batch, d_t)
+                if candidates.numel() > 0:
+                    max_candidates = int(candidates.numel())
+                    n_neg = min(s.size(0) * neg_ratio, max_candidates)
+                    if n_neg > 0:
+                        perm = torch.randperm(max_candidates, device=self.device)[:n_neg]
+                        neg_indices = candidates[perm]
 
-            if self.neg_sampling_ratio > 0:
-                n_neg = min(s.size(0) * self.neg_sampling_ratio, embeddings[d_t].size(0))
-                neg_indices = torch.randperm(embeddings[d_t].size(0), device=self.device)[:n_neg]
+                        if z_s.size(0) >= n_neg:
+                            z_s_neg = z_s[:n_neg]
+                        else:
+                            repeat = math.ceil(n_neg / z_s.size(0))
+                            z_s_neg = z_s.repeat(repeat, 1)[:n_neg]
 
-                z_s_neg = z_s[:n_neg] if n_neg <= s.size(0) else z_s.repeat(n_neg // s.size(0) + 1, 1)[:n_neg]
-                z_d_neg = F.normalize(torch.clamp(embeddings[d_t][neg_indices], -10, 10), dim=-1, eps=1e-8)
+                        z_d_neg = F.normalize(
+                            torch.clamp(embeddings[d_t][neg_indices], -10, 10),
+                            dim=-1,
+                            eps=1e-8,
+                        )
 
-                neg_scores = torch.clamp((z_s_neg * z_d_neg).sum(-1) / self.temp, -10, 10)
-                neg_loss = self.bce(neg_scores, torch.zeros_like(neg_scores))
+                        neg_scores = torch.clamp((z_s_neg * z_d_neg).sum(-1) / self.temp, -10, 10)
+                        neg_loss = self.bce(neg_scores, torch.zeros_like(neg_scores))
 
-                if not torch.isnan(neg_loss) and not torch.isinf(neg_loss):
-                    total_loss += pos_loss + neg_loss
-                else:
-                    total_loss += pos_loss
-            else:
-                total_loss += pos_loss
+                        if not torch.isnan(neg_loss) and not torch.isinf(neg_loss):
+                            relation_loss = relation_loss + neg_loss
 
+            total_loss += relation_loss
             num_edges += 1
+
         try:
             return torch.clamp(total_loss / max(num_edges, 1), 0, 1000)
-        except:
+        except Exception:
             return torch.tensor(0.0, device=self.device)
 
 def _adj(data, et):
@@ -1391,6 +1588,8 @@ def main():
     topic_onehot_bill = F.one_hot(cluster_bill.clamp(max=num_topics-1), num_classes=num_topics).float()
     cluster_bill, topic_onehot_bill = cluster_bill.to(device), topic_onehot_bill.to(device)
     A_by = {et: _adj(data, et).coalesce() for et in data.edge_types}
+    valid_destination_sets = build_valid_destination_sets(data)
+    neg_sampling_ratios = compute_relation_neg_sampling_ratios(data)
 
     ALLOWED = {
         "donor": [
@@ -1439,6 +1638,8 @@ def main():
         metadata,
         relation_weight_sharing=relation_weight_sharing,
         device=device,
+        neg_sampling_ratio=neg_sampling_ratios,
+        valid_destination_sets=valid_destination_sets,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-6, eps=1e-8)
 
