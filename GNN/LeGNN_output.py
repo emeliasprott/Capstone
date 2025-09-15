@@ -7,10 +7,11 @@ from tqdm import tqdm
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 from torch_scatter import scatter_mean
 from torch_geometric.loader import HGTLoader
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import HGTConv
 from contextlib import contextmanager
 from pathlib import Path
 from GNN.time_utils import convert_to_utc_seconds as _convert_to_utc_seconds_list
+from collections.abc import Mapping
 
 # utilities
 def setup_logging():
@@ -25,10 +26,86 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 _EDGE_SEP = '∷'
+
+
 def _et_to_key(et):
     return _EDGE_SEP.join(et)
+
+
 def _key_to_et(k):
     return tuple(k.split(_EDGE_SEP))
+
+
+def _looks_like_edge(value):
+    if isinstance(value, str):
+        return value.count(_EDGE_SEP) == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) == 3
+    return False
+
+
+def _normalize_edge_type(edge_type):
+    if isinstance(edge_type, str):
+        return _key_to_et(edge_type)
+    edge_tuple = tuple(edge_type)
+    if len(edge_tuple) != 3:
+        raise ValueError(f"Edge type {edge_type!r} is not a valid (src, rel, dst) triplet")
+    return edge_tuple
+
+
+def _group_edge_types(edge_types, relation_weight_sharing=None):
+    normalized = [tuple(et) for et in edge_types]
+    edge_set = set(normalized)
+
+    if relation_weight_sharing is None:
+        groups = {}
+        for src, rel, dst in normalized:
+            group_key = rel[4:] if rel.startswith('rev_') else rel
+            groups.setdefault(group_key, []).append((src, rel, dst))
+        return {str(k): v for k, v in groups.items()}
+
+    if isinstance(relation_weight_sharing, str):
+        mode = relation_weight_sharing.lower()
+        if mode in {"distinct", "separate", "none"}:
+            return {str(_et_to_key(et)): [et] for et in normalized}
+        if mode in {"all", "shared", "share_all"}:
+            return {"all_relations": normalized}
+        raise ValueError(f"Unknown relation_weight_sharing mode: {relation_weight_sharing}")
+
+    if not isinstance(relation_weight_sharing, Mapping):
+        raise TypeError("relation_weight_sharing must be a mapping, string, or None")
+
+    groups = {}
+    assigned = set()
+    key_iterable = list(relation_weight_sharing.keys())
+    is_edge_to_group = bool(key_iterable) and all(_looks_like_edge(key) for key in key_iterable)
+
+    if is_edge_to_group:
+        for raw_edge, group_name in relation_weight_sharing.items():
+            edge = _normalize_edge_type(raw_edge)
+            if edge not in edge_set:
+                continue
+            groups.setdefault(str(group_name), []).append(edge)
+            assigned.add(edge)
+    else:
+        for group_name, relations in relation_weight_sharing.items():
+            group_edges = []
+            for rel in relations:
+                edge = _normalize_edge_type(rel)
+                if edge not in edge_set:
+                    continue
+                if edge in assigned:
+                    raise ValueError(f"Edge type {edge} assigned to multiple groups")
+                group_edges.append(edge)
+                assigned.add(edge)
+            if group_edges:
+                groups[str(group_name)] = group_edges
+
+    for edge in normalized:
+        if edge not in assigned:
+            groups.setdefault(_et_to_key(edge), []).append(edge)
+
+    return groups
 
 @contextmanager
 def error_context(operation_name: str, logger: logging.Logger):
@@ -57,6 +134,36 @@ dropout_p = 0.10
 device = 'mps'
 inf_reg_weight = 0.1
 ent_reg_weight = 0.1
+
+DEFAULT_RELATION_WEIGHT_SHARING = {
+    "donation": [
+        ('donor', 'donated_to', 'legislator_term'),
+        ('legislator_term', 'rev_donated_to', 'donor'),
+    ],
+    "lobbying": [
+        ('lobby_firm', 'lobbied', 'legislator_term'),
+        ('lobby_firm', 'lobbied', 'committee'),
+        ('committee', 'rev_lobbied', 'lobby_firm'),
+        ('legislator_term', 'rev_lobbied', 'lobby_firm'),
+    ],
+    "bill_hierarchy": [
+        ('bill_version', 'is_version', 'bill'),
+        ('bill', 'rev_is_version', 'bill_version'),
+    ],
+    "voting": [
+        ('legislator_term', 'voted_on', 'bill_version'),
+        ('bill_version', 'rev_voted_on', 'legislator_term'),
+    ],
+    "authorship": [
+        ('legislator_term', 'wrote', 'bill_version'),
+        ('bill_version', 'rev_wrote', 'legislator_term'),
+    ],
+    "membership": [
+        ('committee', 'member_of', 'legislator_term'),
+        ('committee', 'rev_member_of', 'legislator_term'),
+        ('legislator_term', 'member_of', 'committee'),
+    ],
+}
 
 def _init_linear(m: nn.Linear):
     nn.init.kaiming_uniform_(m.weight, a=0.01)
@@ -593,10 +700,15 @@ class SuccessHead(nn.Module):
 
 
 class LegislativeGraphEncoder(nn.Module):
-    def __init__(self, hidden_dim, dropout, device=device):
+    def __init__(self, hidden_dim, dropout, metadata, relation_weight_sharing=None, device=device, heads=2):
         super().__init__()
         self.device = device
         self.hidden_dim = hidden_dim
+
+        node_types, edge_types = metadata
+        self.metadata = (tuple(node_types), [tuple(et) for et in edge_types])
+        self.relation_groups = _group_edge_types(self.metadata[1], relation_weight_sharing)
+        self.heads = heads
 
         self.process_map = {
             ('donor', 'donated_to', 'legislator_term'): 'donation',
@@ -604,37 +716,70 @@ class LegislativeGraphEncoder(nn.Module):
             ('bill_version', 'is_version', 'bill'): 'hierarchy'
         }
 
-        self.convs = nn.ModuleDict({
-            _et_to_key(et): SAGEConv((hidden_dim, hidden_dim), hidden_dim, normalize=True)
-            for et in self.process_map.keys()
-        })
+        self.convs = nn.ModuleDict()
+        for group_name, relations in self.relation_groups.items():
+            metadata_subset = (self.metadata[0], relations)
+            self.convs[group_name] = HGTConv(hidden_dim, hidden_dim, metadata_subset, heads=self.heads)
 
         self.temporal_encoder = LegislativeTemporalEncoder(hidden_dim)
         self.vote_conv = PolarityAwareConv(hidden_dim, 385, dropout)
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict, ts_dict):
         out = {nt: torch.zeros_like(x, device=x.device) for nt, x in x_dict.items()}
+        temporal_adjustments = {}
 
-        for key, conv in self.convs.items():
-            et = _key_to_et(key)
-            src, rel, dst = et
-            if et not in edge_index_dict:
+        if ts_dict is not None:
+            for et, timestamps in ts_dict.items():
+                if timestamps is None:
+                    continue
+                norm_et = _normalize_edge_type(et)
+                if norm_et not in edge_index_dict:
+                    continue
+                edge_index = edge_index_dict[norm_et]
+                if edge_index.numel() == 0:
+                    continue
+                src = norm_et[0]
+                if src not in x_dict:
+                    continue
+                if edge_index[0].max() >= x_dict[src].size(0):
+                    continue
+                process = self.process_map.get(norm_et, 'vote')
+                edge_temp = self.temporal_encoder(timestamps, process)
+                node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
+                temporal_adjustments[norm_et] = torch.nan_to_num(node_temp, nan=0.0, posinf=0.0, neginf=0.0)
+
+        for group_name, conv in self.convs.items():
+            relations = self.relation_groups[group_name]
+            group_edge_index = {}
+            src_modifiers = {}
+
+            for et in relations:
+                if et not in edge_index_dict:
+                    continue
+                edge_index = edge_index_dict[et]
+                if edge_index.numel() == 0:
+                    continue
+                group_edge_index[et] = edge_index
+                if et in temporal_adjustments:
+                    src_modifiers.setdefault(et[0], []).append(temporal_adjustments[et])
+
+            if not group_edge_index:
                 continue
 
-            edge_index = edge_index_dict[et]
-            if edge_index.numel() == 0:
-                continue
-            x_src = x_dict[src]
-            if ts_dict is not None and et in ts_dict and ts_dict[et] is not None:
-                edge_temp = self.temporal_encoder(ts_dict[et], self.process_map.get(et, 'vote'))
-                if edge_index[0].max() < x_dict[src].size(0):
-                    node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
-                    x_src = x_src + node_temp
+            x_group = x_dict
+            if src_modifiers:
+                x_group = x_dict.copy()
+                for src_type, modifiers in src_modifiers.items():
+                    stacked = torch.stack(modifiers)
+                    delta = torch.nan_to_num(stacked.sum(dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+                    x_group[src_type] = x_group[src_type] + delta
 
-            if (edge_index[0].max() < x_src.size(0) and
-                edge_index[1].max() < x_dict[dst].size(0)):
-                conv_out = conv((x_src, x_dict[dst]), edge_index)
-                out[dst] += conv_out
+            conv_out = conv(x_group, group_edge_index)
+            for nt, value in conv_out.items():
+                if nt in out:
+                    out[nt] += value
+                else:
+                    out[nt] = value
 
         vote_et = ('legislator_term', 'voted_on', 'bill_version')
         if vote_et in edge_attr_dict and vote_et in edge_index_dict:
@@ -656,11 +801,13 @@ class LegislativeGraphEncoder(nn.Module):
         return out
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, device=device):
+    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, metadata, relation_weight_sharing=None, device=device):
         super().__init__()
         self.device = device
 
         self.node_types = in_dims.keys()
+        self.metadata = (tuple(metadata[0]), [tuple(et) for et in metadata[1]])
+        self.relation_weight_sharing = relation_weight_sharing
 
         self.feature_proj = nn.ModuleDict({
             nt: nn.Sequential(
@@ -672,7 +819,16 @@ class LegislativeGraphModel(nn.Module):
         })
         self.cluster_id = cluster_id
 
-        self.encoders = nn.ModuleList([LegislativeGraphEncoder(hidden_dim, dropout, device) for _ in range(n_layers)])
+        self.encoders = nn.ModuleList([
+            LegislativeGraphEncoder(
+                hidden_dim,
+                dropout,
+                self.metadata,
+                relation_weight_sharing=self.relation_weight_sharing,
+                device=device,
+            )
+            for _ in range(n_layers)
+        ])
 
         self.bill_alpha = nn.Parameter(torch.tensor(0.7))
         self.leg_alpha  = nn.Parameter(torch.tensor(0.7))
@@ -1057,7 +1213,19 @@ def main():
     }
     in_dims = {nt: data[nt].x.size(1) for nt in data.node_types if hasattr(data[nt], 'x') and data[nt].x is not None}
 
-    model = LegislativeGraphModel(in_dims, cluster_bill, topic_onehot_bill, hidden_dim, dropout_p).to(device)
+    metadata = data.metadata()
+    relation_weight_sharing = DEFAULT_RELATION_WEIGHT_SHARING
+
+    model = LegislativeGraphModel(
+        in_dims,
+        cluster_bill,
+        topic_onehot_bill,
+        hidden_dim,
+        dropout_p,
+        metadata,
+        relation_weight_sharing=relation_weight_sharing,
+        device=device,
+    ).to(device)
 
     torch.mps.empty_cache()
     gc.collect()
