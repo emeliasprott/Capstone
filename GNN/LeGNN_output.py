@@ -146,7 +146,14 @@ def clean_features(data):
     data = pull_timestamps(data)
     return data
 
-def compute_controversiality(data):
+def compute_controversiality(
+    data,
+    *,
+    session_attr=None,
+    total_possible_attr=None,
+):
+    """Compute controversy scores for bill versions based on vote signals."""
+
     edge_type = ('legislator_term', 'voted_on', 'bill_version')
     if edge_type not in data.edge_index_dict:
         raise ValueError("Missing 'voted_on' edges in data.")
@@ -154,32 +161,199 @@ def compute_controversiality(data):
     ei = data[edge_type].edge_index
     ea = data[edge_type].edge_attr
 
-    vote_signal = ea[:, 0]
+    vote_signal = ea[:, 0].to(torch.float32)
 
-    src_nodes = ei[0]
     tgt_nodes = ei[1]
 
     num_bills = data['bill_version'].num_nodes
-    device = tgt_nodes.device
+    device = vote_signal.device
 
-    yes_votes = torch.zeros(num_bills, device=device)
-    no_votes = torch.zeros(num_bills, device=device)
+    def _to_tensor(value, *, length=None):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value)
+        elif isinstance(value, (list, tuple)):
+            tensor = torch.tensor(value)
+        elif isinstance(value, (int, float)):
+            tensor = torch.tensor([float(value)])
+        else:
+            return None
+
+        tensor = tensor.to(device=device, dtype=torch.float32)
+        if tensor.dim() == 0:
+            tensor = tensor.unsqueeze(0)
+        if length is not None:
+            if tensor.numel() == 1 and length > 1:
+                tensor = tensor.repeat(length)
+            elif tensor.numel() != length:
+                return None
+        return tensor.view(-1)
+
+    def _fetch_store_attr(store, name):
+        if not isinstance(name, str):
+            return None
+        value = getattr(store, name, None)
+        if value is None:
+            try:
+                value = store[name]
+            except (KeyError, AttributeError, TypeError):
+                value = None
+        return value
+
+    def _normalize_session_key(key):
+        if isinstance(key, (int, float)):
+            return int(key)
+        if isinstance(key, str):
+            candidate = key.strip()
+            if candidate.isdigit():
+                return int(candidate)
+            try:
+                return int(float(candidate))
+            except ValueError:
+                return None
+        return None
+
+    session_tensor = None
+    if session_attr is not None:
+        session_values = session_attr
+        if isinstance(session_attr, str):
+            session_values = _fetch_store_attr(data['bill_version'], session_attr)
+        session_tensor = _to_tensor(session_values, length=num_bills)
+        if session_tensor is None:
+            raise ValueError(
+                f"Session attribute '{session_attr}' could not be resolved to a tensor."
+            )
+        if torch.is_floating_point(session_tensor):
+            session_tensor = session_tensor.round().long()
+        else:
+            session_tensor = session_tensor.to(torch.long)
+
+    yes_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
+    no_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
+    abstain_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
 
     yes_votes.index_add_(0, tgt_nodes, (vote_signal > 0).float())
     no_votes.index_add_(0, tgt_nodes, (vote_signal < 0).float())
+    abstain_votes.index_add_(0, tgt_nodes, (vote_signal == 0).float())
 
-    total_votes = yes_votes + no_votes + 1e-6
+    observed_total = yes_votes + no_votes + abstain_votes
 
-    yes_ratio = yes_votes / total_votes
-    no_ratio = no_votes / total_votes
+    candidate_attrs = []
+    if total_possible_attr is not None:
+        candidate_attrs.append(total_possible_attr)
+    candidate_attrs.extend(
+        [
+            'total_possible_votes',
+            'possible_votes',
+            'committee_size',
+            'chamber_size',
+            'membership_size',
+        ]
+    )
 
-    controversy = 4 * yes_ratio * no_ratio
+    total_possible = None
+    for attr in candidate_attrs:
+        value = None
+        if isinstance(attr, dict):
+            if session_tensor is None:
+                raise ValueError(
+                    "Session information is required when total_possible_attr is a mapping."
+                )
+            mapped = torch.zeros(num_bills, dtype=torch.float32, device=device)
+            for key, item in attr.items():
+                normalized_key = _normalize_session_key(key)
+                if normalized_key is None:
+                    continue
+                mask = session_tensor == normalized_key
+                if not torch.any(mask):
+                    continue
+                fill_tensor = _to_tensor(item, length=None)
+                if fill_tensor is None:
+                    continue
+                if fill_tensor.numel() == 1:
+                    mapped[mask] = fill_tensor.item()
+                elif fill_tensor.numel() == mask.sum().item():
+                    mapped[mask] = fill_tensor.to(device=device, dtype=torch.float32)
+                else:
+                    raise ValueError(
+                        "Mapping for total_possible_attr must provide either a scalar or "
+                        "a tensor matching the number of bills in the session."
+                    )
+            value = mapped
+        elif isinstance(attr, (str, torch.Tensor, np.ndarray, list, tuple, int, float)):
+            if isinstance(attr, str):
+                value = _fetch_store_attr(data['bill_version'], attr)
+            else:
+                value = attr
+        if value is None:
+            continue
+        total_possible = _to_tensor(value, length=num_bills)
+        if total_possible is not None:
+            break
+
+    if total_possible is None:
+        total_possible = observed_total.clone()
+
+    total_possible = torch.maximum(total_possible, observed_total)
+    total_possible = total_possible.clamp(min=1.0)
+
+    yes_ratio = yes_votes / total_possible
+    no_ratio = no_votes / total_possible
+    abstain_ratio = abstain_votes / total_possible
+    participation_ratio = (yes_votes + no_votes) / total_possible
+
+    controversy = 4 * yes_ratio * no_ratio * participation_ratio
     controversy = controversy.clamp(0, 1)
+
     data['bill_version'].controversy = controversy
+    data['bill_version'].yes_votes = yes_votes
+    data['bill_version'].no_votes = no_votes
+    data['bill_version'].abstain_votes = abstain_votes
+    data['bill_version'].total_possible_votes = total_possible
+    data['bill_version'].participation_ratio = participation_ratio
+    data['bill_version'].abstain_ratio = abstain_ratio
+
+    if session_tensor is not None:
+        unique_sessions, inverse = torch.unique(session_tensor, return_inverse=True)
+        session_yes = torch.zeros(unique_sessions.size(0), dtype=torch.float32, device=device)
+        session_no = torch.zeros_like(session_yes)
+        session_abstain = torch.zeros_like(session_yes)
+        session_total = torch.zeros_like(session_yes)
+
+        session_yes.index_add_(0, inverse, yes_votes)
+        session_no.index_add_(0, inverse, no_votes)
+        session_abstain.index_add_(0, inverse, abstain_votes)
+        session_total.index_add_(0, inverse, total_possible)
+
+        session_total = session_total.clamp(min=1.0)
+        session_yes_ratio = session_yes / session_total
+        session_no_ratio = session_no / session_total
+        session_participation = (session_yes + session_no) / session_total
+
+        session_controversy = 4 * session_yes_ratio * session_no_ratio * session_participation
+        session_controversy = session_controversy.clamp(0, 1)
+
+        def _session_key(value):
+            scalar = value.item()
+            if isinstance(scalar, float) and scalar.is_integer():
+                return int(scalar)
+            return scalar
+
+        data['bill_version'].session_controversy = {
+            _session_key(sess.cpu()): float(session_controversy[i].item())
+            for i, sess in enumerate(unique_sessions)
+        }
+        data['bill_version'].session_participation = {
+            _session_key(sess.cpu()): float(session_participation[i].item())
+            for i, sess in enumerate(unique_sessions)
+        }
 
     return data
 
-def load_and_preprocess_data(path='data3.pt'):
+def load_and_preprocess_data(path='data3.pt', controversy_kwargs=None):
     full_data = torch.load(path, weights_only=False)
     for nt in full_data.node_types:
         if hasattr(full_data[nt], 'x') and full_data[nt].x is not None:
@@ -205,7 +379,8 @@ def load_and_preprocess_data(path='data3.pt'):
     del full_data
     gc.collect()
     data = RemoveIsolatedNodes()(data)
-    data = compute_controversiality(clean_features(data))
+    kwargs = controversy_kwargs or {}
+    data = compute_controversiality(clean_features(data), **kwargs)
 
     for nt in data.node_types:
         ids = torch.arange(data[nt].num_nodes, device='mps')
