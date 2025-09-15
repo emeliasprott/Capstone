@@ -68,6 +68,21 @@ def sanitize(t, clamp=1e4):
     t = torch.nan_to_num(t, nan=0.0, posinf=clamp, neginf=-clamp)
     return t.clamp_(-clamp, clamp)
 
+
+def _sanitize_feature_tensor(x):
+    if x is None:
+        return None
+
+    if isinstance(x, torch.Tensor):
+        tensor = x.to(dtype=torch.float32)
+    else:
+        tensor = torch.as_tensor(x, dtype=torch.float32)
+
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(-1)
+
+    return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+
 def _global_to_local(sorted_global, query):
     pos = torch.searchsorted(sorted_global, query)
     return pos
@@ -132,17 +147,77 @@ def pull_timestamps(data):
             except:
                 pass
     return data
-def clean_features(data):
+
+
+def ensure_global_feature_stats(data):
+    existing = getattr(data, 'feature_stats', None)
+    stats = {}
+
+    if isinstance(existing, dict):
+        for nt, value in existing.items():
+            if not isinstance(value, dict):
+                continue
+            mean = value.get('mean')
+            std = value.get('std')
+            if mean is None or std is None:
+                continue
+            mean_tensor = torch.as_tensor(mean, dtype=torch.float32).detach().cpu()
+            std_tensor = torch.as_tensor(std, dtype=torch.float32).detach().cpu().clamp(min=1e-5)
+            stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
+
     for nt in data.node_types:
-        x = data[nt].x
-        x = torch.as_tensor(x, dtype=torch.float32)
-        x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-        mean = x.mean(0, keepdim=True)
-        std = x.std(0, keepdim=True).clamp(min=1e-5)
-        x = ((x - mean) / std).clamp(-10, 10)
-        data[nt].x = x
-        data[nt].x_mean = mean
-        data[nt].x_std = std
+        if nt in stats:
+            continue
+
+        store = data[nt]
+
+        x_mean = getattr(store, 'x_mean', None)
+        x_std = getattr(store, 'x_std', None)
+
+        if x_mean is not None and x_std is not None:
+            mean_tensor = torch.as_tensor(x_mean, dtype=torch.float32).detach().cpu()
+            std_tensor = torch.as_tensor(x_std, dtype=torch.float32).detach().cpu().clamp(min=1e-5)
+            stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
+            continue
+
+        x = getattr(store, 'x', None)
+        sanitized = _sanitize_feature_tensor(x)
+        if sanitized is None or sanitized.numel() == 0:
+            continue
+
+        mean_tensor = sanitized.mean(0, keepdim=True).detach().cpu()
+        std_tensor = sanitized.std(0, keepdim=True).clamp(min=1e-5).detach().cpu()
+        stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
+
+    data.feature_stats = stats
+    return stats
+def clean_features(data):
+    stats = ensure_global_feature_stats(data)
+
+    for nt in data.node_types:
+        store = data[nt]
+        x = getattr(store, 'x', None)
+        sanitized = _sanitize_feature_tensor(x)
+        if sanitized is None or sanitized.numel() == 0:
+            continue
+
+        node_stats = stats.get(nt)
+        if node_stats is None:
+            mean_tensor = sanitized.mean(0, keepdim=True).detach().cpu()
+            std_tensor = sanitized.std(0, keepdim=True).clamp(min=1e-5).detach().cpu()
+            node_stats = {'mean': mean_tensor, 'std': std_tensor}
+            stats[nt] = node_stats
+
+        mean = node_stats['mean'].to(device=sanitized.device, dtype=sanitized.dtype)
+        std = node_stats['std'].to(device=sanitized.device, dtype=sanitized.dtype).clamp(min=1e-5)
+
+        normalized = ((sanitized - mean) / std).clamp(-10, 10)
+
+        store.x = normalized
+        store.x_mean = mean
+        store.x_std = std
+
+    data.feature_stats = stats
     data = pull_timestamps(data)
     return data
 
