@@ -1116,6 +1116,7 @@ class LegislativeGraphModel(nn.Module):
         device=device,
         neg_sampling_ratio=1,
         valid_destination_sets=None,
+        influence_supervision_weight=0.1,
     ):
         super().__init__()
         self.device = device
@@ -1159,6 +1160,9 @@ class LegislativeGraphModel(nn.Module):
             nt: nn.Linear(dk, k_topics, bias=False) for nt in self.actor_types
         })
 
+        self.supervised_actor_types = {'donor', 'lobby_firm'}
+        self.influence_supervision_weight = float(influence_supervision_weight)
+
         self.register_buffer('cluster_id',  cluster_id)
         self.register_buffer('topic_onehot', topic_onehot)
         self.loss_computer = StableLossComputer(
@@ -1185,6 +1189,36 @@ class LegislativeGraphModel(nn.Module):
                 z['legislator'] = self.leg_alpha * z['legislator'] + (1 - self.leg_alpha) * leg_agg
 
         return z
+
+    def _compute_observable_targets(self, mask, weights):
+        if mask is None or weights is None:
+            return None, None
+        if mask.numel() == 0 or weights.numel() == 0:
+            return None, None
+
+        mask = mask.to(dtype=torch.bool)
+        masked_weights = torch.where(mask, weights, torch.zeros_like(weights))
+        signal = masked_weights.sum(dim=1)
+        if signal.numel() == 0:
+            return None, None
+
+        signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+        positive_signal = signal.clamp_min(0.0)
+
+        if positive_signal.numel() == 0:
+            return None, None
+
+        log_signal = torch.log1p(positive_signal)
+        if log_signal.numel() == 0:
+            return None, None
+
+        max_val = torch.max(log_signal)
+        if torch.isnan(max_val) or torch.isinf(max_val) or max_val.item() <= 0:
+            normalized = torch.zeros_like(log_signal)
+        else:
+            normalized = (log_signal / max_val).clamp(0.0, 1.0)
+
+        return normalized, log_signal
 
     def encoder(self, batch):
         x_dict = {
@@ -1246,13 +1280,23 @@ class LegislativeGraphModel(nn.Module):
         succ_scalar = torch.sigmoid(success_log).mean()
 
         align_dict, infl_dict = {}, {}
+        influence_targets, influence_weights = {}, {}
         for nt in self.actor_types:
-            if nt not in z:
+            if nt not in z or nt not in mask_weight_dict:
                 continue
             mvb, wvb = mask_weight_dict[nt]
-            ta, inf  = self.actor_head[nt](z[nt], z_bv, mvb.to(self.device), wvb.to(self.device))
+            mvb = mvb.to(self.device)
+            wvb = wvb.to(self.device)
+            ta, inf = self.actor_head[nt](z[nt], z_bv, mvb, wvb)
             align_dict[nt] = self.actor_topic_proj[nt](ta).softmax(-1)
-            infl_dict[nt]  = inf * succ_scalar
+            infl = inf * succ_scalar
+            infl_dict[nt] = infl
+
+            if nt in self.supervised_actor_types:
+                targets, weights = self._compute_observable_targets(mvb, wvb)
+                if targets is not None and weights is not None:
+                    influence_targets[nt] = targets
+                    influence_weights[nt] = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
             "node_embeddings": z,
@@ -1260,7 +1304,9 @@ class LegislativeGraphModel(nn.Module):
             "bill_labels": bill_labels,
             "success_logit": success_log,
             "actor_topic_dict": align_dict,
-            "influence_dict" : infl_dict
+            "influence_dict" : infl_dict,
+            "influence_targets": influence_targets,
+            "influence_target_weights": influence_weights,
         }
     def compute_loss(self, outputs, batch):
         loss_dict = {}
@@ -1287,7 +1333,46 @@ class LegislativeGraphModel(nn.Module):
                 influence_reg += outputs['influence_dict'][nt].mean()
         loss_dict['influence_reg'] = influence_reg
 
-        total_loss = (topic_loss + link_loss + success_loss + influence_reg)
+        regression_loss = torch.tensor(0.0, device=self.device)
+        reg_components = 0
+        influence_targets = outputs.get('influence_targets', {})
+        influence_weights = outputs.get('influence_target_weights', {})
+
+        if influence_targets and 'influence_dict' in outputs:
+            for nt, pred in outputs['influence_dict'].items():
+                target = influence_targets.get(nt)
+                weight = influence_weights.get(nt)
+
+                if target is None or weight is None:
+                    continue
+                if target.numel() == 0 or weight.numel() == 0:
+                    continue
+
+                pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+                target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+                weight = torch.nan_to_num(weight, nan=0.0, posinf=0.0, neginf=0.0)
+
+                positive_weight = weight.clamp_min(0.0)
+                if torch.count_nonzero(positive_weight) == 0:
+                    continue
+
+                normalized_weight = positive_weight / (positive_weight.sum() + 1e-6)
+                diff = (pred - target) ** 2
+                regression_loss = regression_loss + (diff * normalized_weight).sum()
+                reg_components += 1
+
+        if reg_components > 0:
+            regression_loss = regression_loss / reg_components
+
+        loss_dict['influence_regression_loss'] = regression_loss
+
+        total_loss = (
+            topic_loss
+            + link_loss
+            + success_loss
+            + influence_reg
+            + self.influence_supervision_weight * regression_loss
+        )
         loss_dict['total_loss'] = total_loss
 
         return loss_dict
@@ -1671,6 +1756,7 @@ def main():
         device=device,
         neg_sampling_ratio=neg_sampling_ratios,
         valid_destination_sets=valid_destination_sets,
+        influence_supervision_weight=inf_reg_weight,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-6, eps=1e-8)
 
