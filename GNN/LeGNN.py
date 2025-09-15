@@ -761,50 +761,81 @@ class ActorHead(nn.Module):
     def __init__(self, d, h=4):
         super().__init__()
         self.h = h
-        dk = d // h
-        self.Q = nn.Linear(d, d, bias=False)
-        self.K = nn.Linear(d, d, bias=False)
-        self.V = nn.Linear(d, d, bias=False)
-        self.dk = dk
+        self.dk = d // h
+        self.attn = nn.MultiheadAttention(d, h, batch_first=True, dropout=0.0)
 
     def forward(self, a_z, bv_z, mask, weight=None):
-        if torch.isnan(a_z).any() or torch.isinf(a_z).any():
-            a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
-        if torch.isnan(bv_z).any() or torch.isinf(bv_z).any():
-            bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        q = self.Q(a_z).view(-1, self.h, self.dk).transpose(0, 1)
-        k = self.K(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
-        v = self.V(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
+        n_actor = a_z.size(0)
+        device = a_z.device
 
-        att = (q @ k.transpose(-1, -2)) / np.sqrt(self.dk)
-        att = att.transpose(0, 1)
-
-        if mask.numel() == 0 or (~mask).all():
-            context = torch.zeros_like(v.transpose(0, 1))
-            topic_align = context.mean(0)
-            influence = torch.zeros(mask.size(0), device=mask.device)
+        if n_actor == 0:
+            topic_align = torch.zeros((0, self.dk), device=device, dtype=a_z.dtype)
+            influence = torch.zeros(0, device=device, dtype=a_z.dtype)
             return topic_align, influence
 
-        att = att.masked_fill(~mask.unsqueeze(1), -1e4)
+        if mask.numel() == 0 or bv_z.numel() == 0:
+            topic_align = torch.zeros((n_actor, self.dk), device=device, dtype=a_z.dtype)
+            influence = torch.zeros(n_actor, device=device, dtype=a_z.dtype)
+            return topic_align, influence
 
-        if weight is not None:
-            weight = torch.nan_to_num(weight, nan=0.0, posinf=1.0, neginf=-1.0)
-            att = att + weight.unsqueeze(1)
+        mask = mask.to(device=device, dtype=torch.bool)
+        valid_actor_mask = mask.any(dim=1)
 
-        att = torch.clamp(att, -10, 10)
-        att_max = att.max(dim=-1, keepdim=True)[0]
-        att_stable = att - att_max
-        p = F.softmax(att_stable, dim=-1)
-        if torch.isnan(p).any():
-            p = torch.nan_to_num(p, nan=1.0/p.size(-1))
-            p = p / p.sum(dim=-1, keepdim=True)
+        topic_align_full = torch.zeros((n_actor, self.dk), device=device, dtype=a_z.dtype)
+        influence_full = torch.zeros(n_actor, device=device, dtype=a_z.dtype)
 
-        context = torch.matmul(p.transpose(0, 1), v)
-        topic_align = context.mean(0)
-        influence = p.mean(1).sum(-1)
-        influence = torch.nan_to_num(influence, nan=0.0, posinf=1.0, neginf=-1.0)
-        return topic_align, influence
+        if not valid_actor_mask.any():
+            return topic_align_full, influence_full
+
+        valid_idx = valid_actor_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        query = a_z[valid_idx].unsqueeze(1)
+        key = bv_z.unsqueeze(0).expand(query.size(0), -1, -1)
+        value = key
+
+        mask_valid = mask[valid_idx]
+        key_padding_mask = ~mask_valid
+
+        attn_mask = None
+        weight_valid = None
+        if weight is not None and weight.numel() > 0:
+            weight_valid = torch.nan_to_num(weight[valid_idx], nan=0.0, posinf=1.0, neginf=-1.0)
+            weight_valid = weight_valid.masked_fill(key_padding_mask, float('-inf'))
+            attn_mask = weight_valid.unsqueeze(1).repeat_interleave(self.h, dim=0).to(dtype=a_z.dtype)
+
+        attn_output, attn_weights = self.attn(
+            query=query,
+            key=key,
+            value=value,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+
+        attn_output = torch.nan_to_num(attn_output.squeeze(1), nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+        topic_align_valid = attn_output.view(query.size(0), self.h, self.dk).mean(dim=1)
+
+        attn_weights = torch.nan_to_num(attn_weights.squeeze(1), nan=0.0, posinf=0.0, neginf=0.0)
+        attn_weights = attn_weights * mask_valid.float()
+
+        if weight_valid is not None:
+            norm_scores = F.softmax(weight_valid, dim=-1)
+            norm_scores = torch.nan_to_num(norm_scores, nan=0.0, posinf=0.0, neginf=0.0)
+            norm_scores = norm_scores * mask_valid.float()
+            influence_valid = (norm_scores * attn_weights).sum(dim=-1)
+        else:
+            influence_valid = attn_weights.sum(dim=-1)
+
+        influence_valid = torch.nan_to_num(influence_valid, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        topic_align_full[valid_idx] = topic_align_valid
+        influence_full[valid_idx] = influence_valid
+
+        return topic_align_full, influence_full
 
 class BillTopicHead(nn.Module):
     def __init__(self, hidden_dim, k):
