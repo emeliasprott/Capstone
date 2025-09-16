@@ -7,9 +7,11 @@ from tqdm import tqdm
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 from torch_scatter import scatter_mean
 from torch_geometric.loader import HGTLoader
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import HGTConv
 from contextlib import contextmanager
 from pathlib import Path
+from GNN.time_utils import convert_to_utc_seconds as _convert_to_utc_seconds_list
+from collections.abc import Mapping
 
 # utilities
 def setup_logging():
@@ -24,10 +26,86 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 _EDGE_SEP = '∷'
+
+
 def _et_to_key(et):
     return _EDGE_SEP.join(et)
+
+
 def _key_to_et(k):
     return tuple(k.split(_EDGE_SEP))
+
+
+def _looks_like_edge(value):
+    if isinstance(value, str):
+        return value.count(_EDGE_SEP) == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) == 3
+    return False
+
+
+def _normalize_edge_type(edge_type):
+    if isinstance(edge_type, str):
+        return _key_to_et(edge_type)
+    edge_tuple = tuple(edge_type)
+    if len(edge_tuple) != 3:
+        raise ValueError(f"Edge type {edge_type!r} is not a valid (src, rel, dst) triplet")
+    return edge_tuple
+
+
+def _group_edge_types(edge_types, relation_weight_sharing=None):
+    normalized = [tuple(et) for et in edge_types]
+    edge_set = set(normalized)
+
+    if relation_weight_sharing is None:
+        groups = {}
+        for src, rel, dst in normalized:
+            group_key = rel[4:] if rel.startswith('rev_') else rel
+            groups.setdefault(group_key, []).append((src, rel, dst))
+        return {str(k): v for k, v in groups.items()}
+
+    if isinstance(relation_weight_sharing, str):
+        mode = relation_weight_sharing.lower()
+        if mode in {"distinct", "separate", "none"}:
+            return {str(_et_to_key(et)): [et] for et in normalized}
+        if mode in {"all", "shared", "share_all"}:
+            return {"all_relations": normalized}
+        raise ValueError(f"Unknown relation_weight_sharing mode: {relation_weight_sharing}")
+
+    if not isinstance(relation_weight_sharing, Mapping):
+        raise TypeError("relation_weight_sharing must be a mapping, string, or None")
+
+    groups = {}
+    assigned = set()
+    key_iterable = list(relation_weight_sharing.keys())
+    is_edge_to_group = bool(key_iterable) and all(_looks_like_edge(key) for key in key_iterable)
+
+    if is_edge_to_group:
+        for raw_edge, group_name in relation_weight_sharing.items():
+            edge = _normalize_edge_type(raw_edge)
+            if edge not in edge_set:
+                continue
+            groups.setdefault(str(group_name), []).append(edge)
+            assigned.add(edge)
+    else:
+        for group_name, relations in relation_weight_sharing.items():
+            group_edges = []
+            for rel in relations:
+                edge = _normalize_edge_type(rel)
+                if edge not in edge_set:
+                    continue
+                if edge in assigned:
+                    raise ValueError(f"Edge type {edge} assigned to multiple groups")
+                group_edges.append(edge)
+                assigned.add(edge)
+            if group_edges:
+                groups[str(group_name)] = group_edges
+
+    for edge in normalized:
+        if edge not in assigned:
+            groups.setdefault(_et_to_key(edge), []).append(edge)
+
+    return groups
 
 @contextmanager
 def error_context(operation_name: str, logger: logging.Logger):
@@ -57,6 +135,36 @@ device = 'mps'
 inf_reg_weight = 0.1
 ent_reg_weight = 0.1
 
+DEFAULT_RELATION_WEIGHT_SHARING = {
+    "donation": [
+        ('donor', 'donated_to', 'legislator_term'),
+        ('legislator_term', 'rev_donated_to', 'donor'),
+    ],
+    "lobbying": [
+        ('lobby_firm', 'lobbied', 'legislator_term'),
+        ('lobby_firm', 'lobbied', 'committee'),
+        ('committee', 'rev_lobbied', 'lobby_firm'),
+        ('legislator_term', 'rev_lobbied', 'lobby_firm'),
+    ],
+    "bill_hierarchy": [
+        ('bill_version', 'is_version', 'bill'),
+        ('bill', 'rev_is_version', 'bill_version'),
+    ],
+    "voting": [
+        ('legislator_term', 'voted_on', 'bill_version'),
+        ('bill_version', 'rev_voted_on', 'legislator_term'),
+    ],
+    "authorship": [
+        ('legislator_term', 'wrote', 'bill_version'),
+        ('bill_version', 'rev_wrote', 'legislator_term'),
+    ],
+    "membership": [
+        ('committee', 'member_of', 'legislator_term'),
+        ('committee', 'rev_member_of', 'legislator_term'),
+        ('legislator_term', 'member_of', 'committee'),
+    ],
+}
+
 def _init_linear(m: nn.Linear):
     nn.init.kaiming_uniform_(m.weight, a=0.01)
     if m.bias is not None:
@@ -66,6 +174,21 @@ def sanitize(t, clamp=1e4):
     t = t.float() if t.dtype == torch.float64 else t
     t = torch.nan_to_num(t, nan=0.0, posinf=clamp, neginf=-clamp)
     return t.clamp_(-clamp, clamp)
+
+
+def _sanitize_feature_tensor(x):
+    if x is None:
+        return None
+
+    if isinstance(x, torch.Tensor):
+        tensor = x.to(dtype=torch.float32)
+    else:
+        tensor = torch.as_tensor(x, dtype=torch.float32)
+
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(-1)
+
+    return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
 
 def _global_to_local(sorted_global, query):
     pos = torch.searchsorted(sorted_global, query)
@@ -90,38 +213,10 @@ def alarm():
         time.sleep(0.5)
 
 # preprocessing
-def safe_normalize_timestamps(timestamps, eps=1e-8):
-    timestamps = torch.nan_to_num(timestamps, nan=0.0, posinf=1e4, neginf=-1e4)
-    p5 = torch.quantile(timestamps, 0.05)
-    p95 = torch.quantile(timestamps, 0.95)
+def convert_to_utc_seconds(time_data):
+    """Convert timestamp-like values to a torch tensor of UTC seconds."""
 
-    if (p95 - p5) < eps:
-        return torch.zeros_like(timestamps)
-
-    timestamps = torch.clamp(timestamps, p5, p95)
-    normalized = (timestamps - p5) / (p95 - p5)
-    return torch.nan_to_num(normalized, nan=0.0)
-
-def safe_standardize_time_format(time_data):
-    times = []
-    for t in time_data:
-        try:
-            if isinstance(t, (int, float)) and 1900 <= t  and t <= 2100:
-                td = datetime.datetime(int(t), 6, 15).timestamp()
-            elif (isinstance(t, str) or (isinstance(t, float))) and (float(t) < 2100 and float(t) > 1900):
-                td = datetime.datetime(int(float(t)), 6, 15).timestamp()
-            elif float(t) > 0 and float(t) < 1990:
-                td = t
-            elif float(t) > 17000000.0:
-                td = float(t)
-            elif isinstance(t, datetime.datetime):
-                td = t.timestamp()
-            else:
-                td = float(t) * 1e9
-        except:
-            td = datetime.datetime(2000, 6, 15).timestamp()
-        times.append(td)
-    return torch.tensor(times, dtype=torch.float32)
+    return torch.tensor(_convert_to_utc_seconds_list(time_data), dtype=torch.float32)
 
 def pull_timestamps(data):
     timestamp_edges = [
@@ -141,9 +236,8 @@ def pull_timestamps(data):
             if data[et].edge_attr.size(1) > 1:
                 edge_attr = data[et].edge_attr
                 ts_col = edge_attr[:, -1]
-                if ts_col.abs().max() > 1e8 or ts_col.min() < 0:
-                    ts_col = safe_standardize_time_format(ts_col.tolist()).to(edge_attr.device)
-                data[et].timestamp = safe_normalize_timestamps(ts_col)
+                ts_seconds = convert_to_utc_seconds(ts_col).to(edge_attr.device)
+                data[et].timestamp = ts_seconds
                 data[et].edge_attr = edge_attr[:, :-1]
 
     for nt in timestamp_nodes:
@@ -153,29 +247,95 @@ def pull_timestamps(data):
                     if data[nt].x.size(1) > 1:
                         x = data[nt].x
                         ts_col = x[:, -1]
-                        if ts_col.abs().max() > 1e8 or ts_col.min() < 0:
-                            ts_col = safe_standardize_time_format(ts_col.tolist()).to(x.device)
-                        if nt in timestamp_nodes or ts_col.abs().max() > 1e6:
-                            data[nt].timestamp = safe_normalize_timestamps(ts_col)
+                        ts_seconds = convert_to_utc_seconds(ts_col).to(x.device)
+                        if nt in timestamp_nodes or ts_seconds.abs().max() > 1e6:
+                            data[nt].timestamp = ts_seconds
                             data[nt].x = x[:, :-1]
             except:
                 pass
     return data
-def clean_features(data):
+
+
+def ensure_global_feature_stats(data):
+    existing = getattr(data, 'feature_stats', None)
+    stats = {}
+
+    if isinstance(existing, dict):
+        for nt, value in existing.items():
+            if not isinstance(value, dict):
+                continue
+            mean = value.get('mean')
+            std = value.get('std')
+            if mean is None or std is None:
+                continue
+            mean_tensor = torch.as_tensor(mean, dtype=torch.float32).detach().cpu()
+            std_tensor = torch.as_tensor(std, dtype=torch.float32).detach().cpu().clamp(min=1e-5)
+            stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
+
     for nt in data.node_types:
-        x = data[nt].x
-        x = torch.as_tensor(x, dtype=torch.float32)
-        x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-        mean = x.mean(0, keepdim=True)
-        std = x.std(0, keepdim=True).clamp(min=1e-5)
-        x = ((x - mean) / std).clamp(-10, 10)
-        data[nt].x = x
-        data[nt].x_mean = mean
-        data[nt].x_std = std
+        if nt in stats:
+            continue
+
+        store = data[nt]
+
+        x_mean = getattr(store, 'x_mean', None)
+        x_std = getattr(store, 'x_std', None)
+
+        if x_mean is not None and x_std is not None:
+            mean_tensor = torch.as_tensor(x_mean, dtype=torch.float32).detach().cpu()
+            std_tensor = torch.as_tensor(x_std, dtype=torch.float32).detach().cpu().clamp(min=1e-5)
+            stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
+            continue
+
+        x = getattr(store, 'x', None)
+        sanitized = _sanitize_feature_tensor(x)
+        if sanitized is None or sanitized.numel() == 0:
+            continue
+
+        mean_tensor = sanitized.mean(0, keepdim=True).detach().cpu()
+        std_tensor = sanitized.std(0, keepdim=True).clamp(min=1e-5).detach().cpu()
+        stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
+
+    data.feature_stats = stats
+    return stats
+def clean_features(data):
+    stats = ensure_global_feature_stats(data)
+
+    for nt in data.node_types:
+        store = data[nt]
+        x = getattr(store, 'x', None)
+        sanitized = _sanitize_feature_tensor(x)
+        if sanitized is None or sanitized.numel() == 0:
+            continue
+
+        node_stats = stats.get(nt)
+        if node_stats is None:
+            mean_tensor = sanitized.mean(0, keepdim=True).detach().cpu()
+            std_tensor = sanitized.std(0, keepdim=True).clamp(min=1e-5).detach().cpu()
+            node_stats = {'mean': mean_tensor, 'std': std_tensor}
+            stats[nt] = node_stats
+
+        mean = node_stats['mean'].to(device=sanitized.device, dtype=sanitized.dtype)
+        std = node_stats['std'].to(device=sanitized.device, dtype=sanitized.dtype).clamp(min=1e-5)
+
+        normalized = ((sanitized - mean) / std).clamp(-10, 10)
+
+        store.x = normalized
+        store.x_mean = mean
+        store.x_std = std
+
+    data.feature_stats = stats
     data = pull_timestamps(data)
     return data
 
-def compute_controversiality(data):
+def compute_controversiality(
+    data,
+    *,
+    session_attr=None,
+    total_possible_attr=None,
+):
+    """Compute controversy scores for bill versions based on vote signals."""
+
     edge_type = ('legislator_term', 'voted_on', 'bill_version')
     if edge_type not in data.edge_index_dict:
         raise ValueError("Missing 'voted_on' edges in data.")
@@ -183,32 +343,199 @@ def compute_controversiality(data):
     ei = data[edge_type].edge_index
     ea = data[edge_type].edge_attr
 
-    vote_signal = ea[:, 0]
+    vote_signal = ea[:, 0].to(torch.float32)
 
-    src_nodes = ei[0]
     tgt_nodes = ei[1]
 
     num_bills = data['bill_version'].num_nodes
-    device = tgt_nodes.device
+    device = vote_signal.device
 
-    yes_votes = torch.zeros(num_bills, device=device)
-    no_votes = torch.zeros(num_bills, device=device)
+    def _to_tensor(value, *, length=None):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value)
+        elif isinstance(value, (list, tuple)):
+            tensor = torch.tensor(value)
+        elif isinstance(value, (int, float)):
+            tensor = torch.tensor([float(value)])
+        else:
+            return None
+
+        tensor = tensor.to(device=device, dtype=torch.float32)
+        if tensor.dim() == 0:
+            tensor = tensor.unsqueeze(0)
+        if length is not None:
+            if tensor.numel() == 1 and length > 1:
+                tensor = tensor.repeat(length)
+            elif tensor.numel() != length:
+                return None
+        return tensor.view(-1)
+
+    def _fetch_store_attr(store, name):
+        if not isinstance(name, str):
+            return None
+        value = getattr(store, name, None)
+        if value is None:
+            try:
+                value = store[name]
+            except (KeyError, AttributeError, TypeError):
+                value = None
+        return value
+
+    def _normalize_session_key(key):
+        if isinstance(key, (int, float)):
+            return int(key)
+        if isinstance(key, str):
+            candidate = key.strip()
+            if candidate.isdigit():
+                return int(candidate)
+            try:
+                return int(float(candidate))
+            except ValueError:
+                return None
+        return None
+
+    session_tensor = None
+    if session_attr is not None:
+        session_values = session_attr
+        if isinstance(session_attr, str):
+            session_values = _fetch_store_attr(data['bill_version'], session_attr)
+        session_tensor = _to_tensor(session_values, length=num_bills)
+        if session_tensor is None:
+            raise ValueError(
+                f"Session attribute '{session_attr}' could not be resolved to a tensor."
+            )
+        if torch.is_floating_point(session_tensor):
+            session_tensor = session_tensor.round().long()
+        else:
+            session_tensor = session_tensor.to(torch.long)
+
+    yes_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
+    no_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
+    abstain_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
 
     yes_votes.index_add_(0, tgt_nodes, (vote_signal > 0).float())
     no_votes.index_add_(0, tgt_nodes, (vote_signal < 0).float())
+    abstain_votes.index_add_(0, tgt_nodes, (vote_signal == 0).float())
 
-    total_votes = yes_votes + no_votes + 1e-6
+    observed_total = yes_votes + no_votes + abstain_votes
 
-    yes_ratio = yes_votes / total_votes
-    no_ratio = no_votes / total_votes
+    candidate_attrs = []
+    if total_possible_attr is not None:
+        candidate_attrs.append(total_possible_attr)
+    candidate_attrs.extend(
+        [
+            'total_possible_votes',
+            'possible_votes',
+            'committee_size',
+            'chamber_size',
+            'membership_size',
+        ]
+    )
 
-    controversy = 4 * yes_ratio * no_ratio
+    total_possible = None
+    for attr in candidate_attrs:
+        value = None
+        if isinstance(attr, dict):
+            if session_tensor is None:
+                raise ValueError(
+                    "Session information is required when total_possible_attr is a mapping."
+                )
+            mapped = torch.zeros(num_bills, dtype=torch.float32, device=device)
+            for key, item in attr.items():
+                normalized_key = _normalize_session_key(key)
+                if normalized_key is None:
+                    continue
+                mask = session_tensor == normalized_key
+                if not torch.any(mask):
+                    continue
+                fill_tensor = _to_tensor(item, length=None)
+                if fill_tensor is None:
+                    continue
+                if fill_tensor.numel() == 1:
+                    mapped[mask] = fill_tensor.item()
+                elif fill_tensor.numel() == mask.sum().item():
+                    mapped[mask] = fill_tensor.to(device=device, dtype=torch.float32)
+                else:
+                    raise ValueError(
+                        "Mapping for total_possible_attr must provide either a scalar or "
+                        "a tensor matching the number of bills in the session."
+                    )
+            value = mapped
+        elif isinstance(attr, (str, torch.Tensor, np.ndarray, list, tuple, int, float)):
+            if isinstance(attr, str):
+                value = _fetch_store_attr(data['bill_version'], attr)
+            else:
+                value = attr
+        if value is None:
+            continue
+        total_possible = _to_tensor(value, length=num_bills)
+        if total_possible is not None:
+            break
+
+    if total_possible is None:
+        total_possible = observed_total.clone()
+
+    total_possible = torch.maximum(total_possible, observed_total)
+    total_possible = total_possible.clamp(min=1.0)
+
+    yes_ratio = yes_votes / total_possible
+    no_ratio = no_votes / total_possible
+    abstain_ratio = abstain_votes / total_possible
+    participation_ratio = (yes_votes + no_votes) / total_possible
+
+    controversy = 4 * yes_ratio * no_ratio * participation_ratio
     controversy = controversy.clamp(0, 1)
+
     data['bill_version'].controversy = controversy
+    data['bill_version'].yes_votes = yes_votes
+    data['bill_version'].no_votes = no_votes
+    data['bill_version'].abstain_votes = abstain_votes
+    data['bill_version'].total_possible_votes = total_possible
+    data['bill_version'].participation_ratio = participation_ratio
+    data['bill_version'].abstain_ratio = abstain_ratio
+
+    if session_tensor is not None:
+        unique_sessions, inverse = torch.unique(session_tensor, return_inverse=True)
+        session_yes = torch.zeros(unique_sessions.size(0), dtype=torch.float32, device=device)
+        session_no = torch.zeros_like(session_yes)
+        session_abstain = torch.zeros_like(session_yes)
+        session_total = torch.zeros_like(session_yes)
+
+        session_yes.index_add_(0, inverse, yes_votes)
+        session_no.index_add_(0, inverse, no_votes)
+        session_abstain.index_add_(0, inverse, abstain_votes)
+        session_total.index_add_(0, inverse, total_possible)
+
+        session_total = session_total.clamp(min=1.0)
+        session_yes_ratio = session_yes / session_total
+        session_no_ratio = session_no / session_total
+        session_participation = (session_yes + session_no) / session_total
+
+        session_controversy = 4 * session_yes_ratio * session_no_ratio * session_participation
+        session_controversy = session_controversy.clamp(0, 1)
+
+        def _session_key(value):
+            scalar = value.item()
+            if isinstance(scalar, float) and scalar.is_integer():
+                return int(scalar)
+            return scalar
+
+        data['bill_version'].session_controversy = {
+            _session_key(sess.cpu()): float(session_controversy[i].item())
+            for i, sess in enumerate(unique_sessions)
+        }
+        data['bill_version'].session_participation = {
+            _session_key(sess.cpu()): float(session_participation[i].item())
+            for i, sess in enumerate(unique_sessions)
+        }
 
     return data
 
-def load_and_preprocess_data(path='data3.pt'):
+def load_and_preprocess_data(path='data3.pt', controversy_kwargs=None):
     full_data = torch.load(path, weights_only=False)
     for nt in full_data.node_types:
         if hasattr(full_data[nt], 'x') and full_data[nt].x is not None:
@@ -234,7 +561,8 @@ def load_and_preprocess_data(path='data3.pt'):
     del full_data
     gc.collect()
     data = RemoveIsolatedNodes()(data)
-    data = compute_controversiality(clean_features(data))
+    kwargs = controversy_kwargs or {}
+    data = compute_controversiality(clean_features(data), **kwargs)
 
     for nt in data.node_types:
         ids = torch.arange(data[nt].num_nodes, device='mps')
@@ -307,49 +635,81 @@ class ActorHead(nn.Module):
     def __init__(self, d, h=4):
         super().__init__()
         self.h = h
-        dk = d // h
-        self.Q = nn.Linear(d, d, bias=False)
-        self.K = nn.Linear(d, d, bias=False)
-        self.V = nn.Linear(d, d, bias=False)
-        self.dk = dk
+        self.dk = d // h
+        self.attn = nn.MultiheadAttention(d, h, batch_first=True, dropout=0.0)
 
     def forward(self, a_z, bv_z, mask, weight=None):
-        if torch.isnan(a_z).any() or torch.isinf(a_z).any():
-            a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
-        if torch.isnan(bv_z).any() or torch.isinf(bv_z).any():
-            bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        q = self.Q(a_z).view(-1, self.h, self.dk).transpose(0, 1)
-        k = self.K(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
-        v = self.V(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
+        n_actor = a_z.size(0)
+        device = a_z.device
 
-        att = (q @ k.transpose(-1, -2)) / np.sqrt(self.dk)
-        att = att.transpose(0, 1)
-
-        if mask.numel() == 0 or (~mask).all():
-            context = torch.zeros_like(v.transpose(0, 1))
-            topic_align = context.mean(0)
-            influence = torch.zeros(mask.size(0), device=mask.device)
+        if n_actor == 0:
+            topic_align = torch.zeros((0, self.dk), device=device, dtype=a_z.dtype)
+            influence = torch.zeros(0, device=device, dtype=a_z.dtype)
             return topic_align, influence
 
-        att = att.masked_fill(~mask.unsqueeze(1), -1e4)
+        if mask.numel() == 0 or bv_z.numel() == 0:
+            topic_align = torch.zeros((n_actor, self.dk), device=device, dtype=a_z.dtype)
+            influence = torch.zeros(n_actor, device=device, dtype=a_z.dtype)
+            return topic_align, influence
 
-        if weight is not None:
-            weight = torch.nan_to_num(weight, nan=0.0, posinf=1.0, neginf=-1.0)
-            att = att + weight.unsqueeze(1)
+        mask = mask.to(device=device, dtype=torch.bool)
+        valid_actor_mask = mask.any(dim=1)
 
-        att = torch.clamp(att, -10, 10)
-        att_max = att.max(dim=-1, keepdim=True)[0]
-        att_stable = att - att_max
-        p = F.softmax(att_stable, dim=-1)
-        if torch.isnan(p).any():
-            p = torch.nan_to_num(p, nan=1.0/p.size(-1))
-            p = p / p.sum(dim=-1, keepdim=True)
+        topic_align_full = torch.zeros((n_actor, self.dk), device=device, dtype=a_z.dtype)
+        influence_full = torch.zeros(n_actor, device=device, dtype=a_z.dtype)
 
-        context = torch.matmul(p.transpose(0, 1), v)
-        topic_align = context.mean(0)
-        influence = p.mean(1).sum(-1)
-        return topic_align, influence
+        if not valid_actor_mask.any():
+            return topic_align_full, influence_full
+
+        valid_idx = valid_actor_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        query = a_z[valid_idx].unsqueeze(1)
+        key = bv_z.unsqueeze(0).expand(query.size(0), -1, -1)
+        value = key
+
+        mask_valid = mask[valid_idx]
+        key_padding_mask = ~mask_valid
+
+        attn_mask = None
+        weight_valid = None
+        if weight is not None and weight.numel() > 0:
+            weight_valid = torch.nan_to_num(weight[valid_idx], nan=0.0, posinf=1.0, neginf=-1.0)
+            weight_valid = weight_valid.masked_fill(key_padding_mask, float('-inf'))
+            attn_mask = weight_valid.unsqueeze(1).repeat_interleave(self.h, dim=0).to(dtype=a_z.dtype)
+
+        attn_output, attn_weights = self.attn(
+            query=query,
+            key=key,
+            value=value,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+
+        attn_output = torch.nan_to_num(attn_output.squeeze(1), nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+        topic_align_valid = attn_output.view(query.size(0), self.h, self.dk).mean(dim=1)
+
+        attn_weights = torch.nan_to_num(attn_weights.squeeze(1), nan=0.0, posinf=0.0, neginf=0.0)
+        attn_weights = attn_weights * mask_valid.float()
+
+        if weight_valid is not None:
+            norm_scores = F.softmax(weight_valid, dim=-1)
+            norm_scores = torch.nan_to_num(norm_scores, nan=0.0, posinf=0.0, neginf=0.0)
+            norm_scores = norm_scores * mask_valid.float()
+            influence_valid = (norm_scores * attn_weights).sum(dim=-1)
+        else:
+            influence_valid = attn_weights.sum(dim=-1)
+
+        influence_valid = torch.nan_to_num(influence_valid, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        topic_align_full[valid_idx] = topic_align_valid
+        influence_full[valid_idx] = influence_valid
+
+        return topic_align_full, influence_full
 
 class BillTopicHead(nn.Module):
     def __init__(self, hidden_dim, k):
@@ -372,10 +732,15 @@ class SuccessHead(nn.Module):
 
 
 class LegislativeGraphEncoder(nn.Module):
-    def __init__(self, hidden_dim, dropout, device=device):
+    def __init__(self, hidden_dim, dropout, metadata, relation_weight_sharing=None, device=device, heads=2):
         super().__init__()
         self.device = device
         self.hidden_dim = hidden_dim
+
+        node_types, edge_types = metadata
+        self.metadata = (tuple(node_types), [tuple(et) for et in edge_types])
+        self.relation_groups = _group_edge_types(self.metadata[1], relation_weight_sharing)
+        self.heads = heads
 
         self.process_map = {
             ('donor', 'donated_to', 'legislator_term'): 'donation',
@@ -383,37 +748,70 @@ class LegislativeGraphEncoder(nn.Module):
             ('bill_version', 'is_version', 'bill'): 'hierarchy'
         }
 
-        self.convs = nn.ModuleDict({
-            _et_to_key(et): SAGEConv((hidden_dim, hidden_dim), hidden_dim, normalize=True)
-            for et in self.process_map.keys()
-        })
+        self.convs = nn.ModuleDict()
+        for group_name, relations in self.relation_groups.items():
+            metadata_subset = (self.metadata[0], relations)
+            self.convs[group_name] = HGTConv(hidden_dim, hidden_dim, metadata_subset, heads=self.heads)
 
         self.temporal_encoder = LegislativeTemporalEncoder(hidden_dim)
         self.vote_conv = PolarityAwareConv(hidden_dim, 385, dropout)
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict, ts_dict):
         out = {nt: torch.zeros_like(x, device=x.device) for nt, x in x_dict.items()}
+        temporal_adjustments = {}
 
-        for key, conv in self.convs.items():
-            et = _key_to_et(key)
-            src, rel, dst = et
-            if et not in edge_index_dict:
+        if ts_dict is not None:
+            for et, timestamps in ts_dict.items():
+                if timestamps is None:
+                    continue
+                norm_et = _normalize_edge_type(et)
+                if norm_et not in edge_index_dict:
+                    continue
+                edge_index = edge_index_dict[norm_et]
+                if edge_index.numel() == 0:
+                    continue
+                src = norm_et[0]
+                if src not in x_dict:
+                    continue
+                if edge_index[0].max() >= x_dict[src].size(0):
+                    continue
+                process = self.process_map.get(norm_et, 'vote')
+                edge_temp = self.temporal_encoder(timestamps, process)
+                node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
+                temporal_adjustments[norm_et] = torch.nan_to_num(node_temp, nan=0.0, posinf=0.0, neginf=0.0)
+
+        for group_name, conv in self.convs.items():
+            relations = self.relation_groups[group_name]
+            group_edge_index = {}
+            src_modifiers = {}
+
+            for et in relations:
+                if et not in edge_index_dict:
+                    continue
+                edge_index = edge_index_dict[et]
+                if edge_index.numel() == 0:
+                    continue
+                group_edge_index[et] = edge_index
+                if et in temporal_adjustments:
+                    src_modifiers.setdefault(et[0], []).append(temporal_adjustments[et])
+
+            if not group_edge_index:
                 continue
 
-            edge_index = edge_index_dict[et]
-            if edge_index.numel() == 0:
-                continue
-            x_src = x_dict[src]
-            if ts_dict is not None and et in ts_dict and ts_dict[et] is not None:
-                edge_temp = self.temporal_encoder(ts_dict[et], self.process_map.get(et, 'vote'))
-                if edge_index[0].max() < x_dict[src].size(0):
-                    node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
-                    x_src = x_src + node_temp
+            x_group = x_dict
+            if src_modifiers:
+                x_group = x_dict.copy()
+                for src_type, modifiers in src_modifiers.items():
+                    stacked = torch.stack(modifiers)
+                    delta = torch.nan_to_num(stacked.sum(dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+                    x_group[src_type] = x_group[src_type] + delta
 
-            if (edge_index[0].max() < x_src.size(0) and
-                edge_index[1].max() < x_dict[dst].size(0)):
-                conv_out = conv((x_src, x_dict[dst]), edge_index)
-                out[dst] += conv_out
+            conv_out = conv(x_group, group_edge_index)
+            for nt, value in conv_out.items():
+                if nt in out:
+                    out[nt] += value
+                else:
+                    out[nt] = value
 
         vote_et = ('legislator_term', 'voted_on', 'bill_version')
         if vote_et in edge_attr_dict and vote_et in edge_index_dict:
@@ -435,11 +833,13 @@ class LegislativeGraphEncoder(nn.Module):
         return out
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, device=device):
+    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, metadata, relation_weight_sharing=None, device=device):
         super().__init__()
         self.device = device
 
         self.node_types = in_dims.keys()
+        self.metadata = (tuple(metadata[0]), [tuple(et) for et in metadata[1]])
+        self.relation_weight_sharing = relation_weight_sharing
 
         self.feature_proj = nn.ModuleDict({
             nt: nn.Sequential(
@@ -451,7 +851,16 @@ class LegislativeGraphModel(nn.Module):
         })
         self.cluster_id = cluster_id
 
-        self.encoders = nn.ModuleList([LegislativeGraphEncoder(hidden_dim, dropout, device) for _ in range(n_layers)])
+        self.encoders = nn.ModuleList([
+            LegislativeGraphEncoder(
+                hidden_dim,
+                dropout,
+                self.metadata,
+                relation_weight_sharing=self.relation_weight_sharing,
+                device=device,
+            )
+            for _ in range(n_layers)
+        ])
 
         self.bill_alpha = nn.Parameter(torch.tensor(0.7))
         self.leg_alpha  = nn.Parameter(torch.tensor(0.7))
@@ -836,7 +1245,19 @@ def main():
     }
     in_dims = {nt: data[nt].x.size(1) for nt in data.node_types if hasattr(data[nt], 'x') and data[nt].x is not None}
 
-    model = LegislativeGraphModel(in_dims, cluster_bill, topic_onehot_bill, hidden_dim, dropout_p).to(device)
+    metadata = data.metadata()
+    relation_weight_sharing = DEFAULT_RELATION_WEIGHT_SHARING
+
+    model = LegislativeGraphModel(
+        in_dims,
+        cluster_bill,
+        topic_onehot_bill,
+        hidden_dim,
+        dropout_p,
+        metadata,
+        relation_weight_sharing=relation_weight_sharing,
+        device=device,
+    ).to(device)
 
     torch.mps.empty_cache()
     gc.collect()
