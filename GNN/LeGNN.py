@@ -1,4 +1,4 @@
-import datetime, gc, json, torch, logging, math
+import datetime, gc, json, torch, logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,21 +6,9 @@ import numpy as np
 from tqdm import tqdm
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
 from torch_scatter import scatter_mean, scatter_add
-try:
-    from torch_sparse import SparseTensor  # type: ignore
-except ImportError:  # pragma: no cover - optional
-    SparseTensor = None
 from torch_geometric.loader import HGTLoader
-from torch_geometric.nn import HGTConv
+from torch_geometric.nn import SAGEConv
 from contextlib import contextmanager
-from GNN.time_utils import convert_to_utc_seconds as _convert_to_utc_seconds_list
-from collections import defaultdict
-from collections.abc import Mapping
-
-try:
-    from torch_geometric.utils import metapath_reachable_graph
-except ImportError:  # pragma: no cover - optional PyG utility
-    metapath_reachable_graph = None
 
 # utilities
 def setup_logging():
@@ -35,85 +23,10 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 _EDGE_SEP = '∷'
-
-
 def _et_to_key(et):
     return _EDGE_SEP.join(et)
 def _key_to_et(k):
     return tuple(k.split(_EDGE_SEP))
-
-
-def _looks_like_edge(value):
-    if isinstance(value, str):
-        return value.count(_EDGE_SEP) == 2
-    if isinstance(value, (list, tuple)):
-        return len(value) == 3
-    return False
-
-
-def _normalize_edge_type(edge_type):
-    if isinstance(edge_type, str):
-        return _key_to_et(edge_type)
-    edge_tuple = tuple(edge_type)
-    if len(edge_tuple) != 3:
-        raise ValueError(f"Edge type {edge_type!r} is not a valid (src, rel, dst) triplet")
-    return edge_tuple
-
-
-def _group_edge_types(edge_types, relation_weight_sharing=None):
-    normalized = [tuple(et) for et in edge_types]
-    edge_set = set(normalized)
-
-    if relation_weight_sharing is None:
-        groups = {}
-        for src, rel, dst in normalized:
-            group_key = rel[4:] if rel.startswith('rev_') else rel
-            groups.setdefault(group_key, []).append((src, rel, dst))
-        return {str(k): v for k, v in groups.items()}
-
-    if isinstance(relation_weight_sharing, str):
-        mode = relation_weight_sharing.lower()
-        if mode in {"distinct", "separate", "none"}:
-            return {str(_et_to_key(et)): [et] for et in normalized}
-        if mode in {"all", "shared", "share_all"}:
-            return {"all_relations": normalized}
-        raise ValueError(f"Unknown relation_weight_sharing mode: {relation_weight_sharing}")
-
-    if not isinstance(relation_weight_sharing, Mapping):
-        raise TypeError("relation_weight_sharing must be a mapping, string, or None")
-
-    groups = {}
-    assigned = set()
-    # Detect whether mapping is edge_type -> group or group -> [edge_types]
-    key_iterable = list(relation_weight_sharing.keys())
-    is_edge_to_group = bool(key_iterable) and all(_looks_like_edge(key) for key in key_iterable)
-
-    if is_edge_to_group:
-        for raw_edge, group_name in relation_weight_sharing.items():
-            edge = _normalize_edge_type(raw_edge)
-            if edge not in edge_set:
-                continue
-            groups.setdefault(str(group_name), []).append(edge)
-            assigned.add(edge)
-    else:
-        for group_name, relations in relation_weight_sharing.items():
-            group_edges = []
-            for rel in relations:
-                edge = _normalize_edge_type(rel)
-                if edge not in edge_set:
-                    continue
-                if edge in assigned:
-                    raise ValueError(f"Edge type {edge} assigned to multiple groups")
-                group_edges.append(edge)
-                assigned.add(edge)
-            if group_edges:
-                groups[str(group_name)] = group_edges
-
-    for edge in normalized:
-        if edge not in assigned:
-            groups.setdefault(_et_to_key(edge), []).append(edge)
-
-    return groups
 
 def safe_scatter_mean(src, index, dim_size):
     ones = torch.ones(src.size(0), dtype=src.dtype, device=src.device)
@@ -141,112 +54,12 @@ def safe_tensor_operation(func, *args, default_value=0.0, clamp_range=(-1e3, 1e3
         logging.error(f"Error in {func.__name__}: {e}")
         return torch.tensor(default_value)
 
-def build_valid_destination_sets(data):
-    """Collect the set of valid destination node ids for every edge type."""
-
-    valid_sets = {}
-    for edge_type in data.edge_types:
-        edge_index = data.edge_index_dict[edge_type]
-        dst_nodes = edge_index[1]
-        if isinstance(dst_nodes, torch.Tensor):
-            dst_nodes = dst_nodes.detach()
-            if dst_nodes.device.type != 'cpu':
-                dst_nodes = dst_nodes.to('cpu')
-            dst_nodes = dst_nodes.to(dtype=torch.long)
-        else:
-            dst_nodes = torch.as_tensor(dst_nodes, dtype=torch.long)
-
-        valid_sets[tuple(edge_type)] = torch.unique(dst_nodes)
-
-    return valid_sets
-
-def compute_relation_neg_sampling_ratios(data, *, min_ratio=1, max_ratio=5):
-    """Estimate negative sampling ratios per edge type based on sparsity."""
-
-    avg_degree_by_edge = {}
-    degree_values = []
-
-    for edge_type in data.edge_types:
-        edge_index = data.edge_index_dict[edge_type]
-        edge_key = tuple(edge_type)
-        num_edges = edge_index.size(1)
-
-        if num_edges == 0:
-            avg_degree_by_edge[edge_key] = 0.0
-            continue
-
-        src_nodes = edge_index[0].detach()
-        if src_nodes.device.type != 'cpu':
-            src_nodes = src_nodes.to('cpu')
-        src_nodes = src_nodes.to(dtype=torch.long)
-
-        unique_sources = torch.unique(src_nodes).numel()
-        unique_sources = max(int(unique_sources), 1)
-        avg_degree = float(num_edges) / unique_sources
-
-        avg_degree_by_edge[edge_key] = avg_degree
-        degree_values.append(avg_degree)
-
-    global_avg_degree = sum(degree_values) / len(degree_values) if degree_values else 0.0
-    default_ratio = max(
-        min_ratio,
-        min(max_ratio, int(math.ceil(global_avg_degree)) if global_avg_degree > 0 else min_ratio),
-    )
-
-    ratios = {}
-    for edge_key, avg_degree in avg_degree_by_edge.items():
-        if avg_degree <= 0.0:
-            ratios[edge_key] = 0
-            continue
-
-        ratio = global_avg_degree / avg_degree if global_avg_degree > 0 else 1.0
-        ratio = max(min_ratio, min(max_ratio, int(math.ceil(ratio))))
-        ratios[edge_key] = ratio
-
-    ratios['default'] = default_ratio
-    return ratios
-
 hidden_dim = 192
 n_layers = 3
 dropout_p = 0.10
-if torch.cuda.is_available():
-    device = 'cuda'
-elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
-    device = 'mps'
-else:
-    device = 'cpu'
+device = 'mps'
 inf_reg_weight = 0.1
 ent_reg_weight = 0.1
-
-DEFAULT_RELATION_WEIGHT_SHARING = {
-    "donation": [
-        ('donor', 'donated_to', 'legislator_term'),
-        ('legislator_term', 'rev_donated_to', 'donor'),
-    ],
-    "lobbying": [
-        ('lobby_firm', 'lobbied', 'legislator_term'),
-        ('lobby_firm', 'lobbied', 'committee'),
-        ('committee', 'rev_lobbied', 'lobby_firm'),
-        ('legislator_term', 'rev_lobbied', 'lobby_firm'),
-    ],
-    "bill_hierarchy": [
-        ('bill_version', 'is_version', 'bill'),
-        ('bill', 'rev_is_version', 'bill_version'),
-    ],
-    "voting": [
-        ('legislator_term', 'voted_on', 'bill_version'),
-        ('bill_version', 'rev_voted_on', 'legislator_term'),
-    ],
-    "authorship": [
-        ('legislator_term', 'wrote', 'bill_version'),
-        ('bill_version', 'rev_wrote', 'legislator_term'),
-    ],
-    "membership": [
-        ('committee', 'member_of', 'legislator_term'),
-        ('committee', 'rev_member_of', 'legislator_term'),
-        ('legislator_term', 'member_of', 'committee'),
-    ],
-}
 
 def _init_linear(m: nn.Linear):
     nn.init.kaiming_uniform_(m.weight, a=0.01)
@@ -257,21 +70,6 @@ def sanitize(t, clamp=1e4):
     t = t.float() if t.dtype == torch.float64 else t
     t = torch.nan_to_num(t, nan=0.0, posinf=clamp, neginf=-clamp)
     return t.clamp_(-clamp, clamp)
-
-
-def _sanitize_feature_tensor(x):
-    if x is None:
-        return None
-
-    if isinstance(x, torch.Tensor):
-        tensor = x.to(dtype=torch.float32)
-    else:
-        tensor = torch.as_tensor(x, dtype=torch.float32)
-
-    if tensor.dim() == 1:
-        tensor = tensor.unsqueeze(-1)
-
-    return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
 
 def _global_to_local(sorted_global, query):
     pos = torch.searchsorted(sorted_global, query)
@@ -296,10 +94,38 @@ def alarm():
         time.sleep(0.5)
 
 # preprocessing
-def convert_to_utc_seconds(time_data):
-    """Convert timestamp-like values to a torch tensor of UTC seconds."""
+def safe_normalize_timestamps(timestamps, eps=1e-8):
+    timestamps = torch.nan_to_num(timestamps, nan=0.0, posinf=1e4, neginf=-1e4)
+    p5 = torch.quantile(timestamps, 0.05)
+    p95 = torch.quantile(timestamps, 0.95)
 
-    return torch.tensor(_convert_to_utc_seconds_list(time_data), dtype=torch.float32)
+    if (p95 - p5) < eps:
+        return torch.zeros_like(timestamps)
+
+    timestamps = torch.clamp(timestamps, p5, p95)
+    normalized = (timestamps - p5) / (p95 - p5)
+    return torch.nan_to_num(normalized, nan=0.0)
+
+def safe_standardize_time_format(time_data):
+    times = []
+    for t in time_data:
+        try:
+            if isinstance(t, (int, float)) and 1900 <= t  and t <= 2100:
+                td = datetime.datetime(int(t), 6, 15).timestamp()
+            elif (isinstance(t, str) or (isinstance(t, float))) and (float(t) < 2100 and float(t) > 1900):
+                td = datetime.datetime(int(float(t)), 6, 15).timestamp()
+            elif float(t) > 0 and float(t) < 1990:
+                td = t
+            elif float(t) > 17000000.0:
+                td = float(t)
+            elif isinstance(t, datetime.datetime):
+                td = t.timestamp()
+            else:
+                td = float(t) * 1e9
+        except:
+            td = datetime.datetime(2000, 6, 15).timestamp()
+        times.append(td)
+    return torch.tensor(times, dtype=torch.float32)
 
 def pull_timestamps(data):
     timestamp_edges = [
@@ -319,8 +145,9 @@ def pull_timestamps(data):
             if data[et].edge_attr.size(1) > 1:
                 edge_attr = data[et].edge_attr
                 ts_col = edge_attr[:, -1]
-                ts_seconds = convert_to_utc_seconds(ts_col).to(edge_attr.device)
-                data[et].timestamp = ts_seconds
+                if ts_col.abs().max() > 1e8 or ts_col.min() < 0:
+                    ts_col = safe_standardize_time_format(ts_col.tolist()).to(edge_attr.device)
+                data[et].timestamp = safe_normalize_timestamps(ts_col)
                 data[et].edge_attr = edge_attr[:, :-1]
 
     for nt in timestamp_nodes:
@@ -330,113 +157,29 @@ def pull_timestamps(data):
                     if data[nt].x.size(1) > 1:
                         x = data[nt].x
                         ts_col = x[:, -1]
-                        ts_seconds = convert_to_utc_seconds(ts_col).to(x.device)
-                        if nt in timestamp_nodes or ts_seconds.abs().max() > 1e6:
-                            data[nt].timestamp = ts_seconds
+                        if ts_col.abs().max() > 1e8 or ts_col.min() < 0:
+                            ts_col = safe_standardize_time_format(ts_col.tolist()).to(x.device)
+                        if nt in timestamp_nodes or ts_col.abs().max() > 1e6:
+                            data[nt].timestamp = safe_normalize_timestamps(ts_col)
                             data[nt].x = x[:, :-1]
             except:
                 pass
     return data
-
-
-def ensure_global_feature_stats(data):
-    existing = getattr(data, 'feature_stats', None)
-    stats = {}
-
-    if isinstance(existing, dict):
-        for nt, value in existing.items():
-            if not isinstance(value, dict):
-                continue
-            mean = value.get('mean')
-            std = value.get('std')
-            if mean is None or std is None:
-                continue
-            mean_tensor = torch.as_tensor(mean, dtype=torch.float32).detach().cpu()
-            std_tensor = torch.as_tensor(std, dtype=torch.float32).detach().cpu().clamp(min=1e-5)
-            stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
-
-    for nt in data.node_types:
-        if nt in stats:
-            continue
-
-        store = data[nt]
-
-        x_mean = getattr(store, 'x_mean', None)
-        x_std = getattr(store, 'x_std', None)
-
-        if x_mean is not None and x_std is not None:
-            mean_tensor = torch.as_tensor(x_mean, dtype=torch.float32).detach().cpu()
-            std_tensor = torch.as_tensor(x_std, dtype=torch.float32).detach().cpu().clamp(min=1e-5)
-            stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
-            continue
-
-        x = getattr(store, 'x', None)
-        sanitized = _sanitize_feature_tensor(x)
-        if sanitized is None or sanitized.numel() == 0:
-            continue
-
-        mean_tensor = sanitized.mean(0, keepdim=True).detach().cpu()
-        std_tensor = sanitized.std(0, keepdim=True).clamp(min=1e-5).detach().cpu()
-        stats[nt] = {'mean': mean_tensor, 'std': std_tensor}
-
-    data.feature_stats = stats
-    return stats
 def clean_features(data):
-    stats = ensure_global_feature_stats(data)
-
     for nt in data.node_types:
-        store = data[nt]
-        x = getattr(store, 'x', None)
-        sanitized = _sanitize_feature_tensor(x)
-        if sanitized is None or sanitized.numel() == 0:
-            continue
-
-        node_stats = stats.get(nt)
-        if node_stats is None:
-            mean_tensor = sanitized.mean(0, keepdim=True).detach().cpu()
-            std_tensor = sanitized.std(0, keepdim=True).clamp(min=1e-5).detach().cpu()
-            node_stats = {'mean': mean_tensor, 'std': std_tensor}
-            stats[nt] = node_stats
-
-        mean = node_stats['mean'].to(device=sanitized.device, dtype=sanitized.dtype)
-        std = node_stats['std'].to(device=sanitized.device, dtype=sanitized.dtype).clamp(min=1e-5)
-
-        normalized = ((sanitized - mean) / std).clamp(-10, 10)
-
-        store.x = normalized
-        store.x_mean = mean
-        store.x_std = std
-
-    data.feature_stats = stats
+        x = data[nt].x
+        x = torch.as_tensor(x, dtype=torch.float32)
+        x = torch.nan_to_num(x.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+        mean = x.mean(0, keepdim=True)
+        std = x.std(0, keepdim=True).clamp(min=1e-5)
+        x = ((x - mean) / std).clamp(-10, 10)
+        data[nt].x = x
+        data[nt].x_mean = mean
+        data[nt].x_std = std
     data = pull_timestamps(data)
     return data
 
-def compute_controversiality(
-    data,
-    *,
-    session_attr=None,
-    total_possible_attr=None,
-):
-    """Compute controversy scores for bill versions based on vote signals.
-
-    Parameters
-    ----------
-    data:
-        Heterogeneous graph data containing a ``('legislator_term', 'voted_on',
-        'bill_version')`` edge type with a vote signal stored in
-        ``edge_attr``.
-    session_attr:
-        Optional attribute (name or tensor) that encodes the legislative
-        session or year for each bill version. When provided, the function
-        will aggregate controversy statistics per session in addition to the
-        per-bill values.
-    total_possible_attr:
-        Attribute (name, tensor, or mapping) describing the total possible
-        votes for each bill version (for example, committee size or chamber
-        membership). When omitted, the function falls back to the observed
-        vote counts (yes + no + abstain).
-    """
-
+def compute_controversiality(data):
     edge_type = ('legislator_term', 'voted_on', 'bill_version')
     if edge_type not in data.edge_index_dict:
         raise ValueError("Missing 'voted_on' edges in data.")
@@ -444,199 +187,32 @@ def compute_controversiality(
     ei = data[edge_type].edge_index
     ea = data[edge_type].edge_attr
 
-    vote_signal = ea[:, 0].to(torch.float32)
+    vote_signal = ea[:, 0]
 
+    src_nodes = ei[0]
     tgt_nodes = ei[1]
 
     num_bills = data['bill_version'].num_nodes
-    device = vote_signal.device
+    device = tgt_nodes.device
 
-    def _to_tensor(value, *, length=None):
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            tensor = value
-        elif isinstance(value, np.ndarray):
-            tensor = torch.from_numpy(value)
-        elif isinstance(value, (list, tuple)):
-            tensor = torch.tensor(value)
-        elif isinstance(value, (int, float)):
-            tensor = torch.tensor([float(value)])
-        else:
-            return None
-
-        tensor = tensor.to(device=device, dtype=torch.float32)
-        if tensor.dim() == 0:
-            tensor = tensor.unsqueeze(0)
-        if length is not None:
-            if tensor.numel() == 1 and length > 1:
-                tensor = tensor.repeat(length)
-            elif tensor.numel() != length:
-                return None
-        return tensor.view(-1)
-
-    def _fetch_store_attr(store, name):
-        if not isinstance(name, str):
-            return None
-        value = getattr(store, name, None)
-        if value is None:
-            try:
-                value = store[name]
-            except (KeyError, AttributeError, TypeError):
-                value = None
-        return value
-
-    def _normalize_session_key(key):
-        if isinstance(key, (int, float)):
-            return int(key)
-        if isinstance(key, str):
-            candidate = key.strip()
-            if candidate.isdigit():
-                return int(candidate)
-            try:
-                return int(float(candidate))
-            except ValueError:
-                return None
-        return None
-
-    session_tensor = None
-    if session_attr is not None:
-        session_values = session_attr
-        if isinstance(session_attr, str):
-            session_values = _fetch_store_attr(data['bill_version'], session_attr)
-        session_tensor = _to_tensor(session_values, length=num_bills)
-        if session_tensor is None:
-            raise ValueError(
-                f"Session attribute '{session_attr}' could not be resolved to a tensor."
-            )
-        if torch.is_floating_point(session_tensor):
-            session_tensor = session_tensor.round().long()
-        else:
-            session_tensor = session_tensor.to(torch.long)
-
-    yes_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
-    no_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
-    abstain_votes = torch.zeros(num_bills, dtype=torch.float32, device=device)
+    yes_votes = torch.zeros(num_bills, device=device)
+    no_votes = torch.zeros(num_bills, device=device)
 
     yes_votes.index_add_(0, tgt_nodes, (vote_signal > 0).float())
     no_votes.index_add_(0, tgt_nodes, (vote_signal < 0).float())
-    abstain_votes.index_add_(0, tgt_nodes, (vote_signal == 0).float())
 
-    observed_total = yes_votes + no_votes + abstain_votes
+    total_votes = yes_votes + no_votes + 1e-6
 
-    candidate_attrs = []
-    if total_possible_attr is not None:
-        candidate_attrs.append(total_possible_attr)
-    candidate_attrs.extend(
-        [
-            'total_possible_votes',
-            'possible_votes',
-            'committee_size',
-            'chamber_size',
-            'membership_size',
-        ]
-    )
+    yes_ratio = yes_votes / total_votes
+    no_ratio = no_votes / total_votes
 
-    total_possible = None
-    for attr in candidate_attrs:
-        value = None
-        if isinstance(attr, dict):
-            if session_tensor is None:
-                raise ValueError(
-                    "Session information is required when total_possible_attr is a mapping."
-                )
-            mapped = torch.zeros(num_bills, dtype=torch.float32, device=device)
-            for key, item in attr.items():
-                normalized_key = _normalize_session_key(key)
-                if normalized_key is None:
-                    continue
-                mask = session_tensor == normalized_key
-                if not torch.any(mask):
-                    continue
-                fill_tensor = _to_tensor(item, length=None)
-                if fill_tensor is None:
-                    continue
-                if fill_tensor.numel() == 1:
-                    mapped[mask] = fill_tensor.item()
-                elif fill_tensor.numel() == mask.sum().item():
-                    mapped[mask] = fill_tensor.to(device=device, dtype=torch.float32)
-                else:
-                    raise ValueError(
-                        "Mapping for total_possible_attr must provide either a scalar or "
-                        "a tensor matching the number of bills in the session."
-                    )
-            value = mapped
-        elif isinstance(attr, (str, torch.Tensor, np.ndarray, list, tuple, int, float)):
-            if isinstance(attr, str):
-                value = _fetch_store_attr(data['bill_version'], attr)
-            else:
-                value = attr
-        if value is None:
-            continue
-        total_possible = _to_tensor(value, length=num_bills)
-        if total_possible is not None:
-            break
-
-    if total_possible is None:
-        total_possible = observed_total.clone()
-
-    total_possible = torch.maximum(total_possible, observed_total)
-    total_possible = total_possible.clamp(min=1.0)
-
-    yes_ratio = yes_votes / total_possible
-    no_ratio = no_votes / total_possible
-    abstain_ratio = abstain_votes / total_possible
-    participation_ratio = (yes_votes + no_votes) / total_possible
-
-    controversy = 4 * yes_ratio * no_ratio * participation_ratio
+    controversy = 4 * yes_ratio * no_ratio
     controversy = controversy.clamp(0, 1)
-
     data['bill_version'].controversy = controversy
-    data['bill_version'].yes_votes = yes_votes
-    data['bill_version'].no_votes = no_votes
-    data['bill_version'].abstain_votes = abstain_votes
-    data['bill_version'].total_possible_votes = total_possible
-    data['bill_version'].participation_ratio = participation_ratio
-    data['bill_version'].abstain_ratio = abstain_ratio
-
-    if session_tensor is not None:
-        unique_sessions, inverse = torch.unique(session_tensor, return_inverse=True)
-        session_yes = torch.zeros(unique_sessions.size(0), dtype=torch.float32, device=device)
-        session_no = torch.zeros_like(session_yes)
-        session_abstain = torch.zeros_like(session_yes)
-        session_total = torch.zeros_like(session_yes)
-
-        session_yes.index_add_(0, inverse, yes_votes)
-        session_no.index_add_(0, inverse, no_votes)
-        session_abstain.index_add_(0, inverse, abstain_votes)
-        session_total.index_add_(0, inverse, total_possible)
-
-        session_total = session_total.clamp(min=1.0)
-        session_yes_ratio = session_yes / session_total
-        session_no_ratio = session_no / session_total
-        session_participation = (session_yes + session_no) / session_total
-
-        session_controversy = 4 * session_yes_ratio * session_no_ratio * session_participation
-        session_controversy = session_controversy.clamp(0, 1)
-
-        def _session_key(value):
-            scalar = value.item()
-            if isinstance(scalar, float) and scalar.is_integer():
-                return int(scalar)
-            return scalar
-
-        data['bill_version'].session_controversy = {
-            _session_key(sess.cpu()): float(session_controversy[i].item())
-            for i, sess in enumerate(unique_sessions)
-        }
-        data['bill_version'].session_participation = {
-            _session_key(sess.cpu()): float(session_participation[i].item())
-            for i, sess in enumerate(unique_sessions)
-        }
 
     return data
 
-def load_and_preprocess_data(path='data3.pt', controversy_kwargs=None):
+def load_and_preprocess_data(path='data3.pt'):
     full_data = torch.load(path, weights_only=False)
     for nt in full_data.node_types:
         if hasattr(full_data[nt], 'x') and full_data[nt].x is not None:
@@ -662,8 +238,7 @@ def load_and_preprocess_data(path='data3.pt', controversy_kwargs=None):
     del full_data
     gc.collect()
     data = RemoveIsolatedNodes()(data)
-    kwargs = controversy_kwargs or {}
-    data = compute_controversiality(clean_features(data), **kwargs)
+    data = compute_controversiality(clean_features(data))
 
     for nt in data.node_types:
         ids = torch.arange(data[nt].num_nodes, device='mps')
@@ -677,70 +252,30 @@ def load_and_preprocess_data(path='data3.pt', controversy_kwargs=None):
     return data
 
 # encoders
-class TGATRelativeTimeEncoder(nn.Module):
-    def __init__(self, hidden_dim, in_channels=5, num_frequencies=16):
-        super().__init__()
-        self.in_channels = in_channels
-        self.hidden_dim = hidden_dim
-        self.num_frequencies = max(1, min(num_frequencies, hidden_dim // 2))
-
-        self.frequencies = nn.Parameter(torch.randn(in_channels, self.num_frequencies))
-        self.phase = nn.Parameter(torch.zeros(self.num_frequencies))
-        self.proj = nn.Sequential(
-            nn.Linear(self.num_frequencies * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def forward(self, time_features):
-        if time_features.dim() == 1:
-            time_features = time_features.unsqueeze(-1)
-
-        features = torch.nan_to_num(time_features, nan=0.0, posinf=0.0, neginf=0.0)
-        if features.size(-1) != self.in_channels:
-            pad = self.in_channels - features.size(-1)
-            if pad > 0:
-                padding = torch.zeros(*features.shape[:-1], pad, device=features.device, dtype=features.dtype)
-                features = torch.cat([features, padding], dim=-1)
-            else:
-                features = features[..., :self.in_channels]
-
-        max_abs = features.abs().amax(dim=0, keepdim=True).clamp(min=1.0)
-        scaled = features / max_abs
-
-        angles = scaled @ self.frequencies + self.phase
-        sin_part = torch.sin(angles)
-        cos_part = torch.cos(angles)
-        encoding = torch.cat([sin_part, cos_part], dim=-1)
-        return self.proj(encoding)
-
-
 class LegislativeTemporalEncoder(nn.Module):
-    def __init__(self, d=hidden_dim, in_channels=5, num_frequencies=16):
+    def __init__(self, d=hidden_dim):
         super().__init__()
         self.hidden_dim = d
-        self.time_encoder = TGATRelativeTimeEncoder(d, in_channels=in_channels, num_frequencies=num_frequencies)
+        for h in ['vote_temporal', 'donation_temporal', 'lobbying_temporal']:
+            setattr(self, h, nn.Sequential(
+                nn.Linear(1, d // 4),
+                nn.ReLU(),
+                nn.Linear(d // 4, d),
+            ))
 
-        def _process_block():
-            return nn.Sequential(
-                nn.LayerNorm(d),
-                nn.Linear(d, d),
-                nn.GELU(),
-                nn.Linear(d, d),
-            )
+        self.vote_temporal = getattr(self, 'vote_temporal')
+        self.donation_temporal = getattr(self, 'donation_temporal')
+        self.lobbying_temporal = getattr(self, 'lobbying_temporal')
 
-        self.process_blocks = nn.ModuleDict({
-            'default': _process_block(),
-            'vote': _process_block(),
-            'donation': _process_block(),
-            'lobbying': _process_block(),
-            'hierarchy': _process_block(),
-        })
-
-    def forward(self, time_features, process_type):
-        encoded = self.time_encoder(time_features)
-        block = self.process_blocks.get(process_type, self.process_blocks['default'])
-        return block(encoded)
+    def forward(self, timestamps, process_type):
+        if process_type == 'vote':
+            return self.vote_temporal(timestamps.unsqueeze(-1))
+        elif process_type == 'donation':
+            return self.donation_temporal(timestamps.unsqueeze(-1))
+        elif process_type == 'lobbying':
+            return self.lobbying_temporal(timestamps.unsqueeze(-1))
+        else:
+            return self.vote_temporal(timestamps.unsqueeze(-1))
 
 class FeatureProjector(nn.Module):
     def __init__(self, in_dims, d_out=hidden_dim):
@@ -776,81 +311,50 @@ class ActorHead(nn.Module):
     def __init__(self, d, h=4):
         super().__init__()
         self.h = h
-        self.dk = d // h
-        self.attn = nn.MultiheadAttention(d, h, batch_first=True, dropout=0.0)
+        dk = d // h
+        self.Q = nn.Linear(d, d, bias=False)
+        self.K = nn.Linear(d, d, bias=False)
+        self.V = nn.Linear(d, d, bias=False)
+        self.dk = dk
 
     def forward(self, a_z, bv_z, mask, weight=None):
-        a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
-        bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(a_z).any() or torch.isinf(a_z).any():
+            a_z = torch.nan_to_num(a_z, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(bv_z).any() or torch.isinf(bv_z).any():
+            bv_z = torch.nan_to_num(bv_z, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        n_actor = a_z.size(0)
-        device = a_z.device
+        q = self.Q(a_z).view(-1, self.h, self.dk).transpose(0, 1)
+        k = self.K(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
+        v = self.V(bv_z).view(-1, self.h, self.dk).transpose(0, 1)
 
-        if n_actor == 0:
-            topic_align = torch.zeros((0, self.dk), device=device, dtype=a_z.dtype)
-            influence = torch.zeros(0, device=device, dtype=a_z.dtype)
+        att = (q @ k.transpose(-1, -2)) / np.sqrt(self.dk)
+        att = att.transpose(0, 1)
+
+        if mask.numel() == 0 or (~mask).all():
+            context = torch.zeros_like(v.transpose(0, 1))
+            topic_align = context.mean(0)
+            influence = torch.zeros(mask.size(0), device=mask.device)
             return topic_align, influence
 
-        if mask.numel() == 0 or bv_z.numel() == 0:
-            topic_align = torch.zeros((n_actor, self.dk), device=device, dtype=a_z.dtype)
-            influence = torch.zeros(n_actor, device=device, dtype=a_z.dtype)
-            return topic_align, influence
+        att = att.masked_fill(~mask.unsqueeze(1), -1e4)
 
-        mask = mask.to(device=device, dtype=torch.bool)
-        valid_actor_mask = mask.any(dim=1)
+        if weight is not None:
+            weight = torch.nan_to_num(weight, nan=0.0, posinf=1.0, neginf=-1.0)
+            att = att + weight.unsqueeze(1)
 
-        topic_align_full = torch.zeros((n_actor, self.dk), device=device, dtype=a_z.dtype)
-        influence_full = torch.zeros(n_actor, device=device, dtype=a_z.dtype)
+        att = torch.clamp(att, -10, 10)
+        att_max = att.max(dim=-1, keepdim=True)[0]
+        att_stable = att - att_max
+        p = F.softmax(att_stable, dim=-1)
+        if torch.isnan(p).any():
+            p = torch.nan_to_num(p, nan=1.0/p.size(-1))
+            p = p / p.sum(dim=-1, keepdim=True)
 
-        if not valid_actor_mask.any():
-            return topic_align_full, influence_full
-
-        valid_idx = valid_actor_mask.nonzero(as_tuple=False).squeeze(-1)
-
-        query = a_z[valid_idx].unsqueeze(1)
-        key = bv_z.unsqueeze(0).expand(query.size(0), -1, -1)
-        value = key
-
-        mask_valid = mask[valid_idx]
-        key_padding_mask = ~mask_valid
-
-        attn_mask = None
-        weight_valid = None
-        if weight is not None and weight.numel() > 0:
-            weight_valid = torch.nan_to_num(weight[valid_idx], nan=0.0, posinf=1.0, neginf=-1.0)
-            weight_valid = weight_valid.masked_fill(key_padding_mask, float('-inf'))
-            attn_mask = weight_valid.unsqueeze(1).repeat_interleave(self.h, dim=0).to(dtype=a_z.dtype)
-
-        attn_output, attn_weights = self.attn(
-            query=query,
-            key=key,
-            value=value,
-            key_padding_mask=key_padding_mask,
-            attn_mask=attn_mask,
-            need_weights=True,
-            average_attn_weights=True,
-        )
-
-        attn_output = torch.nan_to_num(attn_output.squeeze(1), nan=0.0, posinf=0.0, neginf=0.0).contiguous()
-        topic_align_valid = attn_output.view(query.size(0), self.h, self.dk).mean(dim=1)
-
-        attn_weights = torch.nan_to_num(attn_weights.squeeze(1), nan=0.0, posinf=0.0, neginf=0.0)
-        attn_weights = attn_weights * mask_valid.float()
-
-        if weight_valid is not None:
-            norm_scores = F.softmax(weight_valid, dim=-1)
-            norm_scores = torch.nan_to_num(norm_scores, nan=0.0, posinf=0.0, neginf=0.0)
-            norm_scores = norm_scores * mask_valid.float()
-            influence_valid = (norm_scores * attn_weights).sum(dim=-1)
-        else:
-            influence_valid = attn_weights.sum(dim=-1)
-
-        influence_valid = torch.nan_to_num(influence_valid, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        topic_align_full[valid_idx] = topic_align_valid
-        influence_full[valid_idx] = influence_valid
-
-        return topic_align_full, influence_full
+        context = torch.matmul(p.transpose(0, 1), v)
+        topic_align = context.mean(0)
+        influence = p.mean(1).sum(-1)
+        influence = torch.nan_to_num(influence, nan=0.0, posinf=1.0, neginf=-1.0)
+        return topic_align, influence
 
 class BillTopicHead(nn.Module):
     def __init__(self, hidden_dim, k):
@@ -873,231 +377,48 @@ class SuccessHead(nn.Module):
 
 
 class LegislativeGraphEncoder(nn.Module):
-    def __init__(self, hidden_dim, dropout, metadata, relation_weight_sharing=None, device=device, heads=2):
+    def __init__(self, hidden_dim, dropout, device=device):
         super().__init__()
         self.device = device
         self.hidden_dim = hidden_dim
 
-        node_types, edge_types = metadata
-        self.metadata = (tuple(node_types), [tuple(et) for et in edge_types])
-        self.relation_groups = _group_edge_types(self.metadata[1], relation_weight_sharing)
-        self.heads = heads
+        self.process_map = {
+            ('donor', 'donated_to', 'legislator_term'): 'donation',
+            ('lobby_firm', 'lobbied', 'legislator_term'): 'lobbying',
+            ('bill_version', 'is_version', 'bill'): 'hierarchy'
+        }
 
-        donation_edges = [
-            ('donor', 'donated_to', 'legislator_term'),
-            ('legislator_term', 'rev_donated_to', 'donor'),
-        ]
-        lobbying_edges = [
-            ('lobby_firm', 'lobbied', 'legislator_term'),
-            ('lobby_firm', 'lobbied', 'committee'),
-            ('committee', 'rev_lobbied', 'lobby_firm'),
-            ('legislator_term', 'rev_lobbied', 'lobby_firm'),
-        ]
-        vote_edges = [
-            ('legislator_term', 'voted_on', 'bill_version'),
-            ('bill_version', 'rev_voted_on', 'legislator_term'),
-        ]
-        hierarchy_edges = [
-            ('bill_version', 'is_version', 'bill'),
-            ('bill', 'rev_is_version', 'bill_version'),
-        ]
-
-        process_map = {}
-        for group, label in [
-            (donation_edges, 'donation'),
-            (lobbying_edges, 'lobbying'),
-            (vote_edges, 'vote'),
-            (hierarchy_edges, 'hierarchy'),
-        ]:
-            for et in group:
-                process_map[tuple(et)] = label
-                process_map[et[1]] = label
-
-        self.process_map = process_map
-
-        self.convs = nn.ModuleDict()
-        for group_name, relations in self.relation_groups.items():
-            metadata_subset = (self.metadata[0], relations)
-            self.convs[group_name] = HGTConv(hidden_dim, hidden_dim, metadata_subset, heads=self.heads)
+        self.convs = nn.ModuleDict({
+            _et_to_key(et): SAGEConv((hidden_dim, hidden_dim), hidden_dim, normalize=True)
+            for et in self.process_map.keys()
+        })
 
         self.temporal_encoder = LegislativeTemporalEncoder(hidden_dim)
         self.vote_conv = PolarityAwareConv(hidden_dim, 385, dropout)
 
-    def forward(
-        self,
-        x_dict,
-        edge_index_dict,
-        edge_attr_dict,
-        edge_ts_dict=None,
-        node_ts_dict=None,
-        edge_delta_dict=None,
-    ):
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict, ts_dict):
         out = {nt: torch.zeros_like(x, device=x.device) for nt, x in x_dict.items()}
 
-        edge_ts_dict = edge_ts_dict or {}
-        node_ts_dict = node_ts_dict or {}
-        edge_delta_dict = edge_delta_dict or {}
-
-        node_time_tensors = {}
-        for nt, ts in node_ts_dict.items():
-            if ts is None:
-                continue
-            tensor = sanitize(ts)
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-            node_time_tensors[nt] = tensor.view(-1)
-
-        edge_delta_tensors = {}
-        for et, delta in edge_delta_dict.items():
-            if delta is None:
-                continue
-            tensor = sanitize(delta)
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-            edge_delta_tensors[_normalize_edge_type(et)] = tensor.view(-1)
-
-        temporal_messages = {}
-
-        for et, timestamps in edge_ts_dict.items():
-            if timestamps is None:
+        for key, conv in self.convs.items():
+            et = _key_to_et(key)
+            src, rel, dst = et
+            if et not in edge_index_dict:
                 continue
 
-            norm_et = _normalize_edge_type(et)
-            if norm_et not in edge_index_dict:
-                continue
-
-            edge_index = edge_index_dict[norm_et]
+            edge_index = edge_index_dict[et]
             if edge_index.numel() == 0:
                 continue
+            x_src = x_dict[src]
+            if ts_dict is not None and et in ts_dict and ts_dict[et] is not None:
+                edge_temp = self.temporal_encoder(ts_dict[et], self.process_map.get(et, 'vote'))
+                if edge_index[0].max() < x_dict[src].size(0):
+                    node_temp = scatter_mean(edge_temp, edge_index[0], dim=0, dim_size=x_dict[src].size(0))
+                    x_src = x_src + node_temp
 
-            src_type, _, dst_type = norm_et
-            if dst_type not in x_dict:
-                continue
-
-            num_edges = edge_index.size(1)
-
-            ts_tensor = sanitize(timestamps).view(-1)
-            if ts_tensor.numel() == 0:
-                continue
-
-            ts_tensor = ts_tensor.to(x_dict[dst_type].device)
-            if ts_tensor.numel() != num_edges:
-                min_len = min(ts_tensor.numel(), num_edges)
-                ts_tensor = ts_tensor[:min_len]
-                if min_len < num_edges:
-                    pad_value = ts_tensor.mean() if min_len > 0 else torch.tensor(0.0, device=ts_tensor.device)
-                    pad_scalar = float(pad_value.item()) if isinstance(pad_value, torch.Tensor) else float(pad_value)
-                    ts_tensor = F.pad(ts_tensor, (0, num_edges - min_len), value=pad_scalar)
-
-            src_times = node_time_tensors.get(src_type)
-            dst_times = node_time_tensors.get(dst_type)
-
-            if src_times is not None:
-                src_times = src_times.to(ts_tensor.device)
-            if dst_times is not None:
-                dst_times = dst_times.to(ts_tensor.device)
-
-            src_idx = edge_index[0]
-            dst_idx = edge_index[1]
-
-            base_time = torch.nan_to_num(ts_tensor, nan=0.0, posinf=0.0, neginf=0.0)
-
-            src_delta = torch.zeros_like(base_time)
-            if src_times is not None and src_times.numel() > 0:
-                valid_src = src_idx < src_times.size(0)
-                if valid_src.any():
-                    src_delta[valid_src] = base_time[valid_src] - src_times[src_idx[valid_src]]
-            else:
-                valid_src = torch.zeros_like(base_time, dtype=torch.bool)
-
-            dst_delta = torch.zeros_like(base_time)
-            if dst_times is not None and dst_times.numel() > 0:
-                valid_dst = dst_idx < dst_times.size(0)
-                if valid_dst.any():
-                    dst_delta[valid_dst] = dst_times[dst_idx[valid_dst]] - base_time[valid_dst]
-            else:
-                valid_dst = torch.zeros_like(base_time, dtype=torch.bool)
-
-            src_dst_delta = torch.zeros_like(base_time)
-            if src_times is not None and dst_times is not None and src_times.numel() > 0 and dst_times.numel() > 0:
-                valid_pair = valid_src & valid_dst
-                if valid_pair.any():
-                    src_dst_delta[valid_pair] = dst_times[dst_idx[valid_pair]] - src_times[src_idx[valid_pair]]
-
-            delta_feature = torch.zeros_like(base_time)
-            delta_tensor = edge_delta_tensors.get(norm_et)
-            if delta_tensor is None:
-                delta_tensor = edge_delta_tensors.get(_et_to_key(norm_et))
-            if delta_tensor is not None:
-                delta_tensor = delta_tensor.to(base_time.device)
-                if delta_tensor.numel() != num_edges:
-                    min_len = min(delta_tensor.numel(), num_edges)
-                    delta_tensor = delta_tensor[:min_len]
-                    if min_len < num_edges:
-                        pad_value = delta_tensor.mean() if min_len > 0 else torch.tensor(0.0, device=delta_tensor.device)
-                        pad_scalar = float(pad_value.item()) if isinstance(pad_value, torch.Tensor) else float(pad_value)
-                        delta_tensor = F.pad(delta_tensor, (0, num_edges - min_len), value=pad_scalar)
-                delta_feature = torch.nan_to_num(delta_tensor, nan=0.0, posinf=0.0, neginf=0.0)
-
-            time_features = torch.stack([
-                base_time,
-                src_delta,
-                dst_delta,
-                src_dst_delta,
-                delta_feature,
-            ], dim=-1)
-
-            process = self.process_map.get(norm_et)
-            if process is None:
-                process = self.process_map.get(norm_et[1], 'vote')
-
-            encoded = self.temporal_encoder(time_features, process)
-            encoded = torch.nan_to_num(encoded, nan=0.0, posinf=0.0, neginf=0.0)
-
-            aggregated = scatter_mean(encoded, dst_idx, dim=0, dim_size=x_dict[dst_type].size(0))
-            temporal_messages[norm_et] = torch.nan_to_num(aggregated, nan=0.0, posinf=0.0, neginf=0.0)
-
-        remaining_temporal = dict(temporal_messages)
-
-        for group_name, conv in self.convs.items():
-            relations = self.relation_groups[group_name]
-            group_edge_index = {}
-
-            for et in relations:
-                if et not in edge_index_dict:
-                    continue
-                edge_index = edge_index_dict[et]
-                if edge_index.numel() == 0:
-                    continue
-                group_edge_index[et] = edge_index
-
-            if not group_edge_index:
-                continue
-
-            conv_out = conv(x_dict, group_edge_index)
-            for nt, value in conv_out.items():
-                cleaned = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-                if nt in out:
-                    out[nt] += cleaned
-                else:
-                    out[nt] = cleaned
-
-            for et in relations:
-                addition = remaining_temporal.pop(et, None)
-                if addition is None:
-                    continue
-                dst_type = et[2]
-                if dst_type in out:
-                    out[dst_type] += addition
-                else:
-                    out[dst_type] = addition
-
-        for et, addition in remaining_temporal.items():
-            dst_type = et[2]
-            if dst_type in out:
-                out[dst_type] += addition
-            else:
-                out[dst_type] = addition
+            if (edge_index[0].max() < x_src.size(0) and
+                edge_index[1].max() < x_dict[dst].size(0)):
+                conv_out = conv((x_src, x_dict[dst]), edge_index)
+                out[dst] += conv_out
 
         vote_et = ('legislator_term', 'voted_on', 'bill_version')
         if vote_et in edge_attr_dict and vote_et in edge_index_dict:
@@ -1119,26 +440,11 @@ class LegislativeGraphEncoder(nn.Module):
         return out
 
 class LegislativeGraphModel(nn.Module):
-    def __init__(
-        self,
-        in_dims,
-        cluster_id,
-        topic_onehot,
-        hidden_dim,
-        dropout,
-        metadata,
-        relation_weight_sharing=None,
-        device=device,
-        neg_sampling_ratio=1,
-        valid_destination_sets=None,
-        influence_supervision_weight=0.1,
-    ):
+    def __init__(self, in_dims, cluster_id, topic_onehot, hidden_dim, dropout, device=device):
         super().__init__()
         self.device = device
 
         self.node_types = in_dims.keys()
-        self.metadata = (tuple(metadata[0]), [tuple(et) for et in metadata[1]])
-        self.relation_weight_sharing = relation_weight_sharing
 
         self.feature_proj = nn.ModuleDict({
             nt: nn.Sequential(
@@ -1149,16 +455,7 @@ class LegislativeGraphModel(nn.Module):
             for nt in in_dims
         })
 
-        self.encoders = nn.ModuleList([
-            LegislativeGraphEncoder(
-                hidden_dim,
-                dropout,
-                self.metadata,
-                relation_weight_sharing=self.relation_weight_sharing,
-                device=device,
-            )
-            for _ in range(n_layers)
-        ])
+        self.encoders = nn.ModuleList([LegislativeGraphEncoder(hidden_dim, dropout, device) for _ in range(n_layers)])
 
         self.bill_alpha = nn.Parameter(torch.tensor(0.5))
         self.leg_alpha  = nn.Parameter(torch.tensor(0.5))
@@ -1175,16 +472,9 @@ class LegislativeGraphModel(nn.Module):
             nt: nn.Linear(dk, k_topics, bias=False) for nt in self.actor_types
         })
 
-        self.supervised_actor_types = {'donor', 'lobby_firm'}
-        self.influence_supervision_weight = float(influence_supervision_weight)
-
         self.register_buffer('cluster_id',  cluster_id)
         self.register_buffer('topic_onehot', topic_onehot)
-        self.loss_computer = StableLossComputer(
-            device=device,
-            neg_sampling_ratio=neg_sampling_ratio,
-            valid_destination_sets=valid_destination_sets,
-        )
+        self.loss_computer = StableLossComputer(device=device)
 
     def _aggregate_hierarchy(self, z, b):
         if ('bill_version', 'is_version', 'bill') in b.edge_index_dict:
@@ -1205,78 +495,17 @@ class LegislativeGraphModel(nn.Module):
 
         return z
 
-    def _compute_observable_targets(self, mask, weights):
-        if mask is None or weights is None:
-            return None, None
-        if mask.numel() == 0 or weights.numel() == 0:
-            return None, None
-
-        mask = mask.to(dtype=torch.bool)
-        masked_weights = torch.where(mask, weights, torch.zeros_like(weights))
-        signal = masked_weights.sum(dim=1)
-        if signal.numel() == 0:
-            return None, None
-
-        signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
-        positive_signal = signal.clamp_min(0.0)
-
-        if positive_signal.numel() == 0:
-            return None, None
-
-        log_signal = torch.log1p(positive_signal)
-        if log_signal.numel() == 0:
-            return None, None
-
-        max_val = torch.max(log_signal)
-        if torch.isnan(max_val) or torch.isinf(max_val) or max_val.item() <= 0:
-            normalized = torch.zeros_like(log_signal)
-        else:
-            normalized = (log_signal / max_val).clamp(0.0, 1.0)
-
-        return normalized, log_signal
-
     def encoder(self, batch):
         x_dict = {
             nt: self.feature_proj[nt](batch[nt].x)
             for nt in self.feature_proj if hasattr(batch[nt], 'x')
         }
 
-        edge_ts_dict = {}
-        edge_delta_dict = {}
-        for et in batch.edge_types:
-            store = batch[et]
-            if hasattr(store, 'timestamp') and getattr(store, 'timestamp') is not None:
-                edge_ts_dict[et] = store.timestamp
-
-            for attr_name in ('time_diff', 'time_diffs', 'time_delta', 'time_deltas', 'delta_time'):
-                if hasattr(store, attr_name):
-                    value = getattr(store, attr_name)
-                    if value is not None:
-                        edge_delta_dict[et] = value
-                        break
-
-        node_ts_dict = {}
-        if hasattr(batch, 'node_types'):
-            node_iter = batch.node_types
-        else:
-            node_iter = self.node_types
-
-        for nt in node_iter:
-            if not hasattr(batch, nt):
-                continue
-            store = batch[nt]
-            if hasattr(store, 'timestamp') and getattr(store, 'timestamp') is not None:
-                node_ts_dict[nt] = store.timestamp
+        ts_dict = {et: batch[et].timestamp for et in batch.edge_types
+                   if hasattr(batch[et], 'timestamp')}
 
         for encoder in self.encoders:
-            x_dict = encoder(
-                x_dict,
-                batch.edge_index_dict,
-                batch.edge_attr_dict,
-                edge_ts_dict,
-                node_ts_dict,
-                edge_delta_dict,
-            )
+            x_dict = encoder(x_dict, batch.edge_index_dict, batch.edge_attr_dict, ts_dict)
 
         return x_dict
 
@@ -1295,23 +524,13 @@ class LegislativeGraphModel(nn.Module):
         succ_scalar = torch.sigmoid(success_log).mean()
 
         align_dict, infl_dict = {}, {}
-        influence_targets, influence_weights = {}, {}
         for nt in self.actor_types:
-            if nt not in z or nt not in mask_weight_dict:
+            if nt not in z:
                 continue
             mvb, wvb = mask_weight_dict[nt]
-            mvb = mvb.to(self.device)
-            wvb = wvb.to(self.device)
-            ta, inf = self.actor_head[nt](z[nt], z_bv, mvb, wvb)
+            ta, inf  = self.actor_head[nt](z[nt], z_bv, mvb.to(self.device), wvb.to(self.device))
             align_dict[nt] = self.actor_topic_proj[nt](ta).softmax(-1)
-            infl = inf * succ_scalar
-            infl_dict[nt] = infl
-
-            if nt in self.supervised_actor_types:
-                targets, weights = self._compute_observable_targets(mvb, wvb)
-                if targets is not None and weights is not None:
-                    influence_targets[nt] = targets
-                    influence_weights[nt] = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            infl_dict[nt]  = inf * succ_scalar
 
         return {
             "node_embeddings": z,
@@ -1319,9 +538,7 @@ class LegislativeGraphModel(nn.Module):
             "bill_labels": bill_labels,
             "success_logit": success_log,
             "actor_topic_dict": align_dict,
-            "influence_dict" : infl_dict,
-            "influence_targets": influence_targets,
-            "influence_target_weights": influence_weights,
+            "influence_dict" : infl_dict
         }
     def compute_loss(self, outputs, batch):
         loss_dict = {}
@@ -1332,7 +549,7 @@ class LegislativeGraphModel(nn.Module):
         loss_dict['topic_loss'] = topic_loss
 
         embeddings = outputs["node_embeddings"]
-        link_loss = self.loss_computer.compute_link_loss(embeddings, batch)
+        link_loss = self.loss_computer.compute_link_loss(embeddings, batch.edge_index_dict)
         loss_dict['link_loss'] = link_loss
 
         success_loss = torch.tensor(0.0, device=self.device)
@@ -1348,153 +565,18 @@ class LegislativeGraphModel(nn.Module):
                 influence_reg += outputs['influence_dict'][nt].mean()
         loss_dict['influence_reg'] = influence_reg
 
-        regression_loss = torch.tensor(0.0, device=self.device)
-        reg_components = 0
-        influence_targets = outputs.get('influence_targets', {})
-        influence_weights = outputs.get('influence_target_weights', {})
-
-        if influence_targets and 'influence_dict' in outputs:
-            for nt, pred in outputs['influence_dict'].items():
-                target = influence_targets.get(nt)
-                weight = influence_weights.get(nt)
-
-                if target is None or weight is None:
-                    continue
-                if target.numel() == 0 or weight.numel() == 0:
-                    continue
-
-                pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
-                target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
-                weight = torch.nan_to_num(weight, nan=0.0, posinf=0.0, neginf=0.0)
-
-                positive_weight = weight.clamp_min(0.0)
-                if torch.count_nonzero(positive_weight) == 0:
-                    continue
-
-                normalized_weight = positive_weight / (positive_weight.sum() + 1e-6)
-                diff = (pred - target) ** 2
-                regression_loss = regression_loss + (diff * normalized_weight).sum()
-                reg_components += 1
-
-        if reg_components > 0:
-            regression_loss = regression_loss / reg_components
-
-        loss_dict['influence_regression_loss'] = regression_loss
-
-        total_loss = (
-            topic_loss
-            + link_loss
-            + success_loss
-            + influence_reg
-            + self.influence_supervision_weight * regression_loss
-        )
+        total_loss = (topic_loss + link_loss + success_loss + influence_reg)
         loss_dict['total_loss'] = total_loss
 
         return loss_dict
 
 class StableLossComputer:
-    def __init__(self, device=device, temp=0.1, neg_sampling_ratio=1, valid_destination_sets=None):
+    def __init__(self, device=device, temp=0.1, neg_sampling_ratio=1):
         self.device = device
         self.temp = temp
+        self.neg_sampling_ratio = neg_sampling_ratio
         self.bce = nn.BCEWithLogitsLoss()
         self.eps = 1e-8
-        self._set_neg_sampling_ratio(neg_sampling_ratio)
-        self.valid_destination_sets = self._prepare_valid_destination_sets(valid_destination_sets)
-
-    def _set_neg_sampling_ratio(self, ratio):
-        self.default_neg_sampling_ratio = 1
-        self.neg_sampling_ratio_map = {}
-
-        if isinstance(ratio, Mapping):
-            default_value = None
-            for key, value in ratio.items():
-                if isinstance(key, str) and key.lower() == 'default':
-                    default_value = value
-                    continue
-                try:
-                    edge_key = _normalize_edge_type(key)
-                except (TypeError, ValueError):
-                    continue
-                try:
-                    ratio_value = int(value)
-                except (TypeError, ValueError):
-                    continue
-                self.neg_sampling_ratio_map[edge_key] = max(0, ratio_value)
-
-            if default_value is not None:
-                try:
-                    self.default_neg_sampling_ratio = max(0, int(default_value))
-                except (TypeError, ValueError):
-                    self.default_neg_sampling_ratio = 0
-        else:
-            try:
-                self.default_neg_sampling_ratio = max(0, int(ratio))
-            except (TypeError, ValueError):
-                self.default_neg_sampling_ratio = 0
-
-    def _prepare_valid_destination_sets(self, mapping):
-        if not mapping:
-            return {}
-
-        prepared = {}
-        for key, value in mapping.items():
-            try:
-                edge_key = _normalize_edge_type(key)
-            except (TypeError, ValueError):
-                continue
-
-            if value is None:
-                continue
-
-            tensor = torch.as_tensor(value, dtype=torch.long)
-            if tensor.dim() == 0:
-                tensor = tensor.unsqueeze(0)
-            tensor = torch.unique(tensor)
-            if tensor.device.type != 'cpu':
-                tensor = tensor.to('cpu')
-
-            prepared[edge_key] = tensor
-
-        return prepared
-
-    def _get_neg_sampling_ratio(self, edge_type):
-        edge_key = tuple(edge_type)
-        return self.neg_sampling_ratio_map.get(edge_key, self.default_neg_sampling_ratio)
-
-    def _candidate_negative_indices(self, edge_type, embeddings, batch, dst_type):
-        num_nodes = embeddings[dst_type].size(0)
-        if num_nodes == 0:
-            return torch.zeros(0, dtype=torch.long, device=self.device)
-
-        candidates = torch.arange(num_nodes, device=self.device, dtype=torch.long)
-
-        if not self.valid_destination_sets:
-            return candidates
-
-        valid_global = self.valid_destination_sets.get(edge_type)
-        if valid_global is None:
-            return candidates
-        if valid_global.numel() == 0:
-            return torch.zeros(0, dtype=torch.long, device=self.device)
-
-        if hasattr(batch, 'node_types') and dst_type not in batch.node_types:
-            return torch.zeros(0, dtype=torch.long, device=self.device)
-
-        node_store = batch[dst_type]
-        node_ids = getattr(node_store, 'node_id', None)
-        if node_ids is None:
-            return candidates
-
-        node_ids_cpu = node_ids.detach()
-        if node_ids_cpu.device.type != 'cpu':
-            node_ids_cpu = node_ids_cpu.to('cpu')
-        node_ids_cpu = node_ids_cpu.to(dtype=torch.long)
-
-        mask_cpu = torch.isin(node_ids_cpu, valid_global)
-        if not mask_cpu.any():
-            return torch.zeros(0, dtype=torch.long, device=self.device)
-
-        return candidates[mask_cpu.to(device=candidates.device)]
 
     def compute_topic_loss(self, logits, labels):
         logits = torch.clamp(logits, -10, 10)
@@ -1508,272 +590,112 @@ class StableLossComputer:
 
         return safe_tensor_operation(lambda: loss, default_value=0.0).clamp(0, 1000)
 
-    def compute_link_loss(self, embeddings, batch):
+    def compute_link_loss(self, embeddings, edge_index_dict):
         total_loss = 0.0
         num_edges = 0
 
-        for edge_type, edge_index in batch.edge_index_dict.items():
-            if edge_index.numel() == 0:
+        for (s_t, _, d_t), ei in edge_index_dict.items():
+            if ei.numel() == 0:
                 continue
-
-            s, d = edge_index
+            s, d = ei
             if s.numel() == 0 or d.numel() == 0:
                 continue
-
-            s_t, _, d_t = edge_type
-            if s_t not in embeddings or d_t not in embeddings:
-                continue
-
             z_s = embeddings[s_t][s]
             z_d = embeddings[d_t][d]
             if torch.isnan(z_s).any() or torch.isinf(z_s).any():
                 continue
             if torch.isnan(z_d).any() or torch.isinf(z_d).any():
                 continue
-
             z_s = F.normalize(torch.clamp(z_s, -10, 10), dim=-1, eps=1e-8)
             z_d = F.normalize(torch.clamp(z_d, -10, 10), dim=-1, eps=1e-8)
 
             pos_scores = torch.clamp((z_s * z_d).sum(-1) / self.temp, -10, 10)
             pos_loss = self.bce(pos_scores, torch.ones_like(pos_scores))
-            relation_loss = pos_loss
 
-            neg_ratio = self._get_neg_sampling_ratio(edge_type)
-            if neg_ratio > 0:
-                candidates = self._candidate_negative_indices(edge_type, embeddings, batch, d_t)
-                if candidates.numel() > 0:
-                    max_candidates = int(candidates.numel())
-                    n_neg = min(s.size(0) * neg_ratio, max_candidates)
-                    if n_neg > 0:
-                        perm = torch.randperm(max_candidates, device=self.device)[:n_neg]
-                        neg_indices = candidates[perm]
 
-                        if z_s.size(0) >= n_neg:
-                            z_s_neg = z_s[:n_neg]
-                        else:
-                            repeat = math.ceil(n_neg / z_s.size(0))
-                            z_s_neg = z_s.repeat(repeat, 1)[:n_neg]
+            if self.neg_sampling_ratio > 0:
+                n_neg = min(s.size(0) * self.neg_sampling_ratio, embeddings[d_t].size(0))
+                neg_indices = torch.randperm(embeddings[d_t].size(0), device=self.device)[:n_neg]
 
-                        z_d_neg = F.normalize(
-                            torch.clamp(embeddings[d_t][neg_indices], -10, 10),
-                            dim=-1,
-                            eps=1e-8,
-                        )
+                z_s_neg = z_s[:n_neg] if n_neg <= s.size(0) else z_s.repeat(n_neg // s.size(0) + 1, 1)[:n_neg]
+                z_d_neg = F.normalize(torch.clamp(embeddings[d_t][neg_indices], -10, 10), dim=-1, eps=1e-8)
 
-                        neg_scores = torch.clamp((z_s_neg * z_d_neg).sum(-1) / self.temp, -10, 10)
-                        neg_loss = self.bce(neg_scores, torch.zeros_like(neg_scores))
+                neg_scores = torch.clamp((z_s_neg * z_d_neg).sum(-1) / self.temp, -10, 10)
+                neg_loss = self.bce(neg_scores, torch.zeros_like(neg_scores))
 
-                        if not torch.isnan(neg_loss) and not torch.isinf(neg_loss):
-                            relation_loss = relation_loss + neg_loss
+                if not torch.isnan(neg_loss) and not torch.isinf(neg_loss):
+                    total_loss += pos_loss + neg_loss
+                else:
+                    total_loss += pos_loss
+            else:
+                total_loss += pos_loss
 
-            total_loss += relation_loss
             num_edges += 1
-
         try:
             return torch.clamp(total_loss / max(num_edges, 1), 0, 1000)
-        except Exception:
+        except:
             return torch.tensor(0.0, device=self.device)
 
-class MetaPathMaskBuilder:
-    """Construct attention masks via cached meta-path enumeration.
+def _adj(data, et):
+    row, col = data.edge_index_dict[et]
+    ns, nd = data[et[0]].num_nodes, data[et[2]].num_nodes
+    return torch.sparse_coo_tensor(
+        torch.stack([row, col]), torch.ones_like(row, dtype=torch.float32), (ns, nd)
+    ).coalesce()
 
-    The builder avoids dense matrix products by traversing allowed meta-paths
-    on demand using lightweight adjacency lookups. Results are cached per
-    actor/path combination so repeated epochs can reuse previously computed
-    connectivity, and the produced mask/weight tensors are moved onto the
-    target accelerator device when available.
-    """
-    def __init__(self, data, allowed_paths, device=device):
-        self.device = torch.device(device)
-        self._edge_maps = self._prepare_edge_maps(data)
-        self._path_cache = {}
-        self._reachable_cache = {}
-        self._edge_index_dict = {
-            tuple(et): data.edge_index_dict[et].detach().cpu()
-            for et in data.edge_types
-        }
-        self._num_nodes_dict = {
-            nt: int(data[nt].num_nodes) for nt in data.node_types
-        }
+def build_masks_weights(d, acts, A_by, paths, device=device):
+    dev = torch.device('cpu')
+    rows = {nt: d[nt].node_id.cpu() for nt in acts}
+    cols = d['bill_version'].node_id.cpu()
+    out = {}
+    col_map = {int(g): i for i, g in enumerate(cols.tolist())}
+    for nt in acts:
+        n_ids = rows[nt]
+        row_map = {int(g): i for i, g in enumerate(n_ids.tolist())}
+        n_r = n_ids.size(0)
+        n_c = cols.size(0)
+        m = torch.zeros(n_r, n_c, dtype=torch.bool, device=dev)
+        w = torch.zeros(n_r, n_c, dtype=torch.float32, device=dev)
 
-        normalized_paths = {}
-        self._path_lookup = {}
-        for nt, paths in allowed_paths.items():
-            norm_set = []
-            for path in paths:
-                norm_path = tuple(tuple(step) for step in path)
-                norm_set.append(norm_path)
-                self._path_lookup[norm_path] = norm_path
-            normalized_paths[nt] = norm_set
-        self.allowed_paths = normalized_paths
+        for path in paths[nt]:
+            S = A_by[path[0]]
+            for et in path[1:]:
+                S = (S @ A_by[et]).coalesce()
 
-    def _prepare_edge_maps(self, data):
-        edge_maps = {}
-        for et in data.edge_types:
-            edge_index = data.edge_index_dict[et]
-            if edge_index.numel() == 0:
-                edge_maps[tuple(et)] = {
-                    'src': np.empty(0, dtype=np.int64),
-                    'dst': np.empty(0, dtype=np.int64),
-                    'ptr': np.zeros(1, dtype=np.int64),
-                }
+            r, c = S.indices()
+            keep = torch.isin(r, rows[nt]) & torch.isin(c, cols)
+            if not keep.any():
                 continue
+            r_kept = r[keep].tolist()
+            c_kept = c[keep].tolist()
+            r_sub = [row_map[int(g)] for g in r_kept]
+            c_sub = [col_map[int(g)] for g in c_kept]
+            m[r_sub, c_sub] = True
+            if any(e in path[0][1] or e in path[1][1] for e in {'donated_to','wrote','lobbied','member_of'}):
+                ei = A_by[path[0]].indices()
+                ea = A_by[path[0]].values()
+                Wsp = torch.sparse_coo_tensor(ei, ea, A_by[path[0]].shape, device=dev).coalesce()
+                for et in path[1:]:
+                    Wsp = (Wsp @ A_by[et]).coalesce()
 
-            src = edge_index[0].detach().cpu().numpy().astype(np.int64, copy=False)
-            dst = edge_index[1].detach().cpu().numpy().astype(np.int64, copy=False)
-            order = np.argsort(src, kind='mergesort')
-            src_sorted = src[order]
-            dst_sorted = dst[order]
-            unique, counts = np.unique(src_sorted, return_counts=True)
-            ptr = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+                wr, wc = Wsp.indices()
+                keep_w = torch.isin(wr, rows[nt]) & torch.isin(wc, cols)
+                if keep_w.any():
+                    wr_sub = [row_map[int(g)] for g in wr[keep_w].tolist()]
+                    wc_sub = [col_map[int(g)] for g in wc[keep_w].tolist()]
+                    w[wr_sub, wc_sub] += Wsp.values()[keep_w]
 
-            edge_maps[tuple(et)] = {
-                'src': unique,
-                'dst': dst_sorted,
-                'ptr': ptr,
-            }
-        return edge_maps
-
-    def _neighbors(self, edge_data, src_id):
-        src_nodes = edge_data['src']
-        if src_nodes.size == 0:
-            return None
-        idx = np.searchsorted(src_nodes, int(src_id))
-        if idx >= src_nodes.size or src_nodes[idx] != int(src_id):
-            return None
-        start = edge_data['ptr'][idx]
-        end = edge_data['ptr'][idx + 1]
-        if start == end:
-            return None
-        return edge_data['dst'][start:end]
-
-    def _get_reachable_map(self, path_key):
-        if metapath_reachable_graph is None:
-            return None
-        if path_key in self._reachable_cache:
-            return self._reachable_cache[path_key]
-
-        metapath = [tuple(step) for step in self._path_lookup[path_key]]
-        try:
-            reachable = metapath_reachable_graph(
-                self._edge_index_dict,
-                metapath,
-                num_nodes_dict=self._num_nodes_dict,
-            )
-        except TypeError:
-            reachable = metapath_reachable_graph(self._edge_index_dict, metapath)
-        except Exception:
-            reachable = None
-
-        mapping = defaultdict(set)
-        if isinstance(reachable, torch.Tensor) and reachable.numel() > 0:
-            reach_cpu = reachable.detach().cpu()
-            src_nodes = reach_cpu[0].tolist()
-            dst_nodes = reach_cpu[1].tolist()
-            for s, d in zip(src_nodes, dst_nodes):
-                mapping[int(s)].add(int(d))
-        elif SparseTensor is not None and isinstance(reachable, SparseTensor):
-            row, col, _ = reachable.coo()
-            if row is not None and col is not None:
-                src_nodes = row.detach().cpu().tolist()
-                dst_nodes = col.detach().cpu().tolist()
-                for s, d in zip(src_nodes, dst_nodes):
-                    mapping[int(s)].add(int(d))
-
-        self._reachable_cache[path_key] = mapping if mapping else None
-        return self._reachable_cache[path_key]
-
-    def _enumerate_path(self, path_key, src_id):
-        cache_key = (path_key, int(src_id))
-        if cache_key in self._path_cache:
-            return self._path_cache[cache_key]
-
-        path = self._path_lookup[path_key]
-        reachable_map = self._get_reachable_map(path_key)
-        if reachable_map is not None and int(src_id) not in reachable_map:
-            self._path_cache[cache_key] = {}
-            return {}
-
-        frontier = {int(src_id): 1.0}
-        for step in path:
-            edge_data = self._edge_maps.get(step)
-            if edge_data is None:
-                frontier = {}
-                break
-
-            next_frontier = {}
-            for node, weight in frontier.items():
-                neighbors = self._neighbors(edge_data, node)
-                if neighbors is None:
-                    continue
-                for nbr in neighbors.tolist():
-                    next_frontier[nbr] = next_frontier.get(nbr, 0.0) + weight
-
-            frontier = next_frontier
-            if not frontier:
-                break
-
-        dest_counts = {int(dst): float(cnt) for dst, cnt in frontier.items()}
-        if reachable_map is not None:
-            allowed = reachable_map.get(int(src_id))
-            if allowed:
-                dest_counts = {dst: cnt for dst, cnt in dest_counts.items() if dst in allowed}
-        self._path_cache[cache_key] = dest_counts
-        return dest_counts
-
-    def __call__(self, batch, actor_types):
-        result = {}
-        bill_store = batch['bill_version']
-        cols_tensor = getattr(bill_store, 'node_id', None)
-        if cols_tensor is None:
-            cols_tensor = torch.arange(bill_store.num_nodes)
-        cols = cols_tensor.detach().cpu().tolist()
-        col_map = {int(g): i for i, g in enumerate(cols)}
-        n_cols = len(cols)
-
-        for nt in actor_types:
-            actor_store = getattr(batch, nt, None)
-            if actor_store is None or nt not in self.allowed_paths:
-                result[nt] = (
-                    torch.zeros((0, n_cols), dtype=torch.bool, device=self.device),
-                    torch.zeros((0, n_cols), dtype=torch.float32, device=self.device),
-                )
-                continue
-
-            node_ids_tensor = getattr(actor_store, 'node_id', None)
-            if node_ids_tensor is None:
-                node_ids_tensor = torch.arange(actor_store.num_nodes)
-            row_ids = node_ids_tensor.detach().cpu().tolist()
-            n_rows = len(row_ids)
-            mask = torch.zeros((n_rows, n_cols), dtype=torch.bool, device=self.device)
-            weight = torch.zeros((n_rows, n_cols), dtype=torch.float32, device=self.device)
-            row_map = {int(g): i for i, g in enumerate(row_ids)}
-
-            for path in self.allowed_paths[nt]:
-                for actor_id in row_ids:
-                    dest_counts = self._enumerate_path(path, actor_id)
-                    if not dest_counts:
-                        continue
-                    row_idx = row_map[int(actor_id)]
-                    for dst_id, count in dest_counts.items():
-                        col_idx = col_map.get(int(dst_id))
-                        if col_idx is None:
-                            continue
-                        mask[row_idx, col_idx] = True
-                        weight[row_idx, col_idx] += float(count)
-
-            result[nt] = (mask, weight)
-
-        return result
+        out[nt] = (m.to(device), w.to(device))
+    return out
 
 class TrainingManager:
-    def __init__(self, model, optimizer, logger, mask_builder, actor_types):
+    def __init__(self, model, optimizer, logger, A_by, ALLOWED):
         self.model = model
         self.optimizer = optimizer
         self.logger = logger
         self.loss_computer = StableLossComputer()
-        self.mask_builder = mask_builder
-        self.actor_types = actor_types
+        self.A_by = A_by
+        self.ALLOWED = ALLOWED
 
         self.best_loss = float('inf')
         self.patience_counter = 0
@@ -1791,8 +713,7 @@ class TrainingManager:
                     print(loss)
                     epoch_losses.append(loss)
                     if batch_idx % 10 == 0:
-                        if getattr(torch, 'mps', None) is not None and torch.backends.mps.is_available():
-                            torch.mps.empty_cache()
+                        torch.mps.empty_cache()
                         gc.collect()
 
                 except Exception as e:
@@ -1814,7 +735,7 @@ class TrainingManager:
     def train_step(self, batch):
         batch = batch.to(device)
         self.optimizer.zero_grad()
-        mw_dict = self.mask_builder(batch, self.actor_types)
+        mw_dict = build_masks_weights(batch, ['legislator','committee','donor','lobby_firm'], self.A_by, self.ALLOWED)
 
         outputs = self.model(batch, mw_dict)
         loss_dict = self.model.compute_loss(outputs, batch)
@@ -1859,8 +780,7 @@ def main():
 
     topic_onehot_bill = F.one_hot(cluster_bill.clamp(max=num_topics-1), num_classes=num_topics).float()
     cluster_bill, topic_onehot_bill = cluster_bill.to(device), topic_onehot_bill.to(device)
-    valid_destination_sets = build_valid_destination_sets(data)
-    neg_sampling_ratios = compute_relation_neg_sampling_ratios(data)
+    A_by = {et: _adj(data, et).coalesce() for et in data.edge_types}
 
     ALLOWED = {
         "donor": [
@@ -1895,30 +815,12 @@ def main():
             ('legislator_term','wrote','bill_version') )
         ]
     }
-    mask_builder = MetaPathMaskBuilder(data, ALLOWED, device=device)
-    actor_types = ['legislator', 'committee', 'donor', 'lobby_firm']
     in_dims = {nt: data[nt].x.size(1) for nt in data.node_types if hasattr(data[nt], 'x') and data[nt].x is not None}
-    metadata = data.metadata()
 
-    relation_weight_sharing = DEFAULT_RELATION_WEIGHT_SHARING
-
-    model = LegislativeGraphModel(
-        in_dims,
-        cluster_bill,
-        topic_onehot_bill,
-        hidden_dim,
-        dropout_p,
-        metadata,
-        relation_weight_sharing=relation_weight_sharing,
-        device=device,
-        neg_sampling_ratio=neg_sampling_ratios,
-        valid_destination_sets=valid_destination_sets,
-        influence_supervision_weight=inf_reg_weight,
-    ).to(device)
+    model = LegislativeGraphModel(in_dims, cluster_bill, topic_onehot_bill, hidden_dim, dropout_p).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-6, eps=1e-8)
 
-    if getattr(torch, 'mps', None) is not None and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    torch.mps.empty_cache()
     gc.collect()
 
     for nt in data.node_types:
@@ -1945,13 +847,7 @@ def main():
     patience = 5
     # model.load_state_dict(torch.load("best_model5.pt"), strict=False)
     # optimizer.load_state_dict(torch.load("best_opt5.pt"))
-    trainer = TrainingManager(
-        optimizer=optimizer,
-        logger=logger,
-        model=model,
-        mask_builder=mask_builder,
-        actor_types=actor_types,
-    )
+    trainer = TrainingManager(optimizer=optimizer, logger=logger, model=model, A_by=A_by, ALLOWED=ALLOWED)
 
     for epoch in tqdm(range(epochs), position=0, total=epochs):
         avg_loss = trainer.train_epoch(loader, epoch)
