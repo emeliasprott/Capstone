@@ -79,6 +79,16 @@
         <h2>Pipeline explainer <span class="caption">Explore the legislative funnel from introduction to final action.</span></h2>
         <p class="caption">Each ribbon shows how many bills advance between stages and how long they typically wait.</p>
         <div class="chart-container tall" id="pipeline-sankey"></div>
+        <div class="split" style="margin-top: 24px; gap: 24px;">
+          <div style="flex: 2 1 0;">
+            <h3>Stage duration benchmarks <span class="caption">Median and tail time-in-stage for filtered bills.</span></h3>
+            <div class="chart-container" id="stage-duration"></div>
+          </div>
+          <div style="flex: 1 1 0;">
+            <h3>At-risk bills <span class="caption">Heuristic flags based on delays, churn, and route history.</span></h3>
+            <div class="side-panel content" id="risk-register"></div>
+          </div>
+        </div>
       </div>
       <div class="card">
         <h2>Route archetypes <span class="caption">Common committee pathways at-a-glance.</span></h2>
@@ -111,9 +121,18 @@
 
     <section id="page-3" class="page" aria-label="Rooms Where It Happens">
       <div class="card">
-        <h2>Gatekeeping dashboard <span class="caption">Committees that most often slow down bills.</span></h2>
-        <p class="caption">Higher gatekeeping scores signal committees where few bills emerge.</p>
-        <div class="chart-container" id="gatekeeping-lollipop"></div>
+        <div class="split">
+          <div>
+            <h2>Gatekeeping dashboard <span class="caption">Committees that most often slow down bills.</span></h2>
+            <p class="caption">Higher gatekeeping scores signal committees where few bills emerge.</p>
+            <div class="chart-container" id="gatekeeping-lollipop"></div>
+          </div>
+          <div>
+            <h2>Workload vs efficiency <span class="caption">How hearing volume relates to time-to-disposition.</span></h2>
+            <p class="caption">Bubble size shows the number of distinct bills considered.</p>
+            <div class="chart-container" id="committee-workload"></div>
+          </div>
+        </div>
       </div>
       <div class="card">
         <h2>Committee vs floor drift <span class="caption">Legislators who shift positions between rooms.</span></h2>
@@ -127,6 +146,11 @@
         <h2>Voting blocs network <span class="caption">Communities of legislators who vote together.</span></h2>
         <p class="caption">Lines connect legislators with similar voting records; clusters reveal blocs.</p>
         <div class="chart-container" id="voting-network"></div>
+      </div>
+      <div class="card">
+        <h2>Survival curves <span class="caption">Probability a bill remains active over time.</span></h2>
+        <p class="caption">Compare the staying power of topics under the current filters.</p>
+        <div class="chart-container" id="survival-curves"></div>
       </div>
       <div class="card">
         <div class="vis-2col">
