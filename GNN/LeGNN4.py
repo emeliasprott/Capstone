@@ -7,14 +7,31 @@ from torch_geometric.nn import HeteroConv, MessagePassing
 from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes, RemoveDuplicatedEdges
 from tqdm import tqdm
 
-# — device, seeds
+# --------------------------
+# Device, seeds, small utils
+# --------------------------
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 torch.set_float32_matmul_precision('high')
 random.seed(42); np.random.seed(42); torch.manual_seed(42)
 
-# — hparams
-hidden_dim=124; drop_p=0.15
-epochs_stage1=20; epochs_stage2=5
+def mps_gc():
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.synchronize()
+        except Exception:
+            pass
+        try:
+            # available in newer PyTorch; guard for older versions
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
+
+# --------------------------
+# Hyperparameters
+# --------------------------
+hidden_dim=116; drop_p=0.15
+epochs_stage1=15; epochs_stage2=5
 w_bill=1.0; w_stance=0.35; w_contrast=0.05; w_inf=0.5; w_dose=0.3; w_route=0.2
 lambda_l2=1e-4; tau_contrast=0.7
 max_pos_pairs_per_batch=64; neutral_cls=1; min_conf=3.0
@@ -30,12 +47,18 @@ manual_time_cols_edges={k:[-1] for k in [
     ('lobby_firm','lobbied','legislator_term'),
 ]}
 
-# — data
+# Single-process, macOS/MPS-safe NeighborLoader defaults
+loader_kwargs = dict(num_workers=0, persistent_workers=False, pin_memory=False)
+
+# --------------------------
+# Data
+# --------------------------
 data=torch.load('data4.pt', weights_only=False)
 data=ToUndirected()(data); data=RemoveIsolatedNodes()(data); data=RemoveDuplicatedEdges()(data)
 for store in data.node_stores+data.edge_stores:
     for k,v in list(store.items()):
-        if isinstance(v, torch.Tensor) and v.dtype.is_floating_point: torch.nan_to_num_(v, nan=0.0, posinf=0.0, neginf=0.0)
+        if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+            torch.nan_to_num_(v, nan=0.0, posinf=0.0, neginf=0.0)
 
 def _l2_mean(t): return t.pow(2).mean()
 
@@ -70,7 +93,7 @@ def pick_ts_from_cols(mat, cols):
     if not cols: return None
     v=torch.nan_to_num(m[:,cols], nan=0.0, posinf=0.0, neginf=0.0).float()
     for c in range(v.size(1)):
-        col=v[:,c];
+        col=v[:,c]
         if col.max()>1e17: v[:,c]=col/1e9
     nz=(v>0).float()
     mins=torch.where(nz.bool(), v, torch.full_like(v,1e30)).min(1).values
@@ -96,7 +119,9 @@ def make_rng(dev,seed=42):
 
 rng=make_rng('cpu'); rngg=make_rng(device)
 
-# — labels/topics
+# --------------------------
+# Labels / topics
+# --------------------------
 y_raw=data['bill'].y.clone() if hasattr(data['bill'],'y') else torch.full((data['bill'].num_nodes,),-1,dtype=torch.long)
 data['bill'].y=torch.where(y_raw>=0,y_raw,torch.full_like(y_raw,-1))
 if hasattr(data['bill'],'cluster'):
@@ -110,7 +135,9 @@ def _infer_success_labels_from_y(y):
 y_success=data['bill'].y_success.clone() if hasattr(data['bill'],'y_success') else _infer_success_labels_from_y(data['bill'].y.clone())
 data['bill'].y_success=y_success
 
-# — bill ts
+# --------------------------
+# Bill timestamps
+# --------------------------
 bill_ts=pick_ts_from_cols(data['bill'].get('x',None), get_time_cols_for_node('bill'))
 bv_to_bill=None
 if ('bill_version','is_version','bill') in data.edge_types:
@@ -145,7 +172,9 @@ if bill_ts is None or bill_ts.max()==0:
     tmp=_bill_ts_from_edges(); bill_ts=tmp if tmp is not None else torch.zeros(data['bill'].num_nodes)
 data['bill'].ts=bill_ts.float()
 
-# — temporal split
+# --------------------------
+# Temporal split
+# --------------------------
 def temporal_holdout_by_year(val_year=None):
     ts=data['bill'].ts
     if ts is None or ts.max()==0:
@@ -163,7 +192,9 @@ def temporal_holdout_by_year(val_year=None):
 
 train_mask, val_mask=temporal_holdout_by_year(None)
 
-# — encoders
+# --------------------------
+# Encoders & GNN
+# --------------------------
 encoders=nn.ModuleDict(); proj=nn.ModuleDict(); proj_dropout=nn.ModuleDict()
 for nt in data.node_types:
     if 'x' in data[nt]:
@@ -174,7 +205,9 @@ norms=nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in data.node_types})
 
 class EdgeTimeEncoder(nn.Module):
     def __init__(self,in_dim):
-        super().__init__(); h=max(8,min(64,in_dim)); self.mlp=nn.Identity() if in_dim<=0 else nn.Sequential(nn.Linear(in_dim,h), nn.GELU(), nn.Linear(h,h)); self.out_dim=0 if in_dim<=0 else h
+        super().__init__(); h=max(8,min(64,in_dim))
+        self.mlp=nn.Identity() if in_dim<=0 else nn.Sequential(nn.Linear(in_dim,h), nn.GELU(), nn.Linear(h,h))
+        self.out_dim=0 if in_dim<=0 else h
     def forward(self,eattr): return None if eattr is None else self.mlp(eattr)
 
 edge_attr_dims={et:(data[et].edge_attr.size(-1) if 'edge_attr' in data[et] else 0) for et in data.edge_types}
@@ -185,7 +218,7 @@ class EdgeGatedSAGEConv(MessagePassing):
         super().__init__(aggr=aggr)
         self.lin_src = nn.Linear(in_src, out_ch, bias=False)
         self.lin_dst = nn.Linear(in_dst, out_ch, bias=True)
-        self.e_dim = int(e_dim)  # <- store for runtime padding
+        self.e_dim = int(e_dim)
         gdim = in_src + in_dst + (self.e_dim if self.e_dim > 0 else 0)
         self.gate = nn.Linear(gdim, 1)
         self.lin_upd = nn.Linear(out_ch, out_ch)
@@ -195,19 +228,14 @@ class EdgeGatedSAGEConv(MessagePassing):
         x_src, x_dst = x if isinstance(x, tuple) else (x, x)
         xs = self.lin_src(x_src)
         xd = self.lin_dst(x_dst)
-
-        # ensure edge_attr has the expected width if this conv was built with e_dim>0
         if (edge_attr is None or edge_attr.numel() == 0) and self.e_dim > 0:
             edge_attr = xs.new_zeros(edge_index.size(1), self.e_dim)
-
         a_in = [x_src[edge_index[0]], x_dst[edge_index[1]]]
         if edge_attr is not None:
             a_in.append(edge_attr)
-
         alpha = torch.sigmoid(self.gate(torch.cat(a_in, dim=-1))).view(-1)
         if time_decay is not None:
             alpha = alpha * time_decay.view(-1)
-
         self.last_alpha = alpha.detach()
         out = self.propagate(edge_index, x=xs, alpha=alpha, size=(x_src.size(0), x_dst.size(0)))
         out = out + xd
@@ -239,10 +267,16 @@ for md in (encoders,proj,proj_dropout,norms,post_conv_dropout1,post_conv_dropout
 if topic_emb is not None: topic_emb.to(device)
 if stance_head_LT is not None: stance_head_LT.to(device)
 
-# — neighbors
+# --------------------------
+# Neighbors & loaders (Stage 1)
+# --------------------------
 num_neighbors={}
 for et in data.edge_types:
-    if et in [('legislator_term','voted_on','bill_version'), ('bill_version','read','committee'), ('committee','rev_read','bill_version')]:
+    if et in [
+        ('legislator_term','voted_on','bill_version'),
+        ('bill_version','read','committee'),
+        ('committee','rev_read','bill_version')
+    ]:
         num_neighbors[et]=[6,4]
     elif et==('bill_version','priorVersion','bill_version'):
         num_neighbors[et]=[12,8]
@@ -254,8 +288,16 @@ for et in data.edge_types:
 train_bill_ids=torch.arange(data['bill'].num_nodes)[train_mask]
 val_bill_ids=torch.arange(data['bill'].num_nodes)[val_mask]
 
-bill_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('bill',train_bill_ids), batch_size=1024, shuffle=True)
-val_bill_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('bill',val_bill_ids), batch_size=2048, shuffle=False)
+bill_loader=NeighborLoader(
+    data, num_neighbors=num_neighbors,
+    input_nodes=('bill',train_bill_ids),
+    batch_size=1024, shuffle=True, **loader_kwargs
+)
+val_bill_loader=NeighborLoader(
+    data, num_neighbors=num_neighbors,
+    input_nodes=('bill',val_bill_ids),
+    batch_size=2048, shuffle=False, **loader_kwargs
+)
 
 num_neighbors_bv={('bill_version','priorVersion','bill_version'):[4,2], ('bill_version','is_version','bill'):[1,0]}
 for et in data.edge_types: num_neighbors_bv.setdefault(et,[0,0])
@@ -410,12 +452,14 @@ eligible_dn=labeled_indices_from(don_topic_label, data['donor'].num_nodes) if 'd
 eligible_lb=labeled_indices_from(lob_lt_label if lob_lt_label is not None else lob_cm_label, data['lobby_firm'].num_nodes) if 'lobby_firm' in data.node_types else torch.tensor([],dtype=torch.long)
 eligible_lt=labeled_indices_from(lt_topic_label, data['legislator_term'].num_nodes) if 'legislator_term' in data.node_types else torch.tensor([],dtype=torch.long)
 
-lt_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('legislator_term', eligible_lt), batch_size=248, shuffle=True) if eligible_lt.numel()>0 else None
-comm_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('committee', eligible_cm), batch_size=248, shuffle=True) if eligible_cm.numel()>0 else None
-don_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('donor', eligible_dn), batch_size=248, shuffle=True) if eligible_dn.numel()>0 else None
-lob_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('lobby_firm', eligible_lb), batch_size=248, shuffle=True) if eligible_lb.numel()>0 else None
+lt_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('legislator_term', eligible_lt), batch_size=248, shuffle=True, **loader_kwargs) if eligible_lt.numel()>0 else None
+comm_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('committee', eligible_cm), batch_size=248, shuffle=True, **loader_kwargs) if eligible_cm.numel()>0 else None
+don_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('donor', eligible_dn), batch_size=248, shuffle=True, **loader_kwargs) if eligible_dn.numel()>0 else None
+lob_loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('lobby_firm', eligible_lb), batch_size=248, shuffle=True, **loader_kwargs) if eligible_lb.numel()>0 else None
 
-# — positive pairs (global)
+# --------------------------
+# Positive pairs (global)
+# --------------------------
 pos_pairs=[]
 if ('bill_version','priorVersion','bill_version') in data.edge_types:
     ei=data[('bill_version','priorVersion','bill_version')].edge_index; a,b=ei[0].tolist(), ei[1].tolist()
@@ -428,6 +472,9 @@ stance_head_comm  = nn.Linear(hidden_dim, K_topics*3).to(device) if K_topics>0 a
 stance_head_donor = nn.Linear(hidden_dim, K_topics*3).to(device) if K_topics>0 and don_topic_label  is not None else None
 stance_head_lobby = nn.Linear(hidden_dim, K_topics*3).to(device) if K_topics>0 and (lob_lt_label is not None or lob_cm_label is not None) else None
 
+# --------------------------
+# Calibration utils
+# --------------------------
 def ece(probs, targets, n_bins=15):
     conf, pred=probs.max(1); acc=pred.eq(targets); bins=torch.linspace(0,1,n_bins+1)
     e=torch.zeros(1)
@@ -450,7 +497,10 @@ class TemperatureScaling(nn.Module):
         optT.step(_c); return torch.exp(self.log_T).item()
 
 def collect_bill_logits_embeddings(head, ids):
-    loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('bill', ids), batch_size=4096, shuffle=False)
+    loader=NeighborLoader(
+        data, num_neighbors=num_neighbors, input_nodes=('bill', ids),
+        batch_size=4096, shuffle=False, **loader_kwargs
+    )
     all_logits,all_targets,all_topics=[],[],[]
     for batch in loader:
         batch=batch.to(device)
@@ -458,6 +508,8 @@ def collect_bill_logits_embeddings(head, ids):
         tid=(batch['bill'].cluster[:n_b].to(device).long() if (K_topics>0 and hasattr(batch['bill'],'cluster')) else torch.zeros(n_b,dtype=torch.long,device=device))
         logits2=head(h2['bill'][:n_b], tid); targets=batch['bill'].y_success[:n_b].to(device)
         all_logits.append(logits2.detach().cpu()); all_targets.append(targets.detach().cpu()); all_topics.append(tid.detach().cpu())
+        del batch, h2, tid, logits2, targets
+        mps_gc()
     return torch.cat(all_logits,0), torch.cat(all_targets,0), torch.cat(all_topics,0)
 
 class TopicConditionedBillHead(nn.Module):
@@ -467,7 +519,10 @@ class TopicConditionedBillHead(nn.Module):
         if self.topic_emb is not None: h=h+self.mix(self.topic_emb(topic_ids))
         return self.base_head(h)
 
-bill_head_tc=TopicConditionedBillHead(bill_head_bin.to(device), topic_emb if topic_emb is not None else nn.Embedding(1,hidden_dim).to(device)).to(device)
+bill_head_tc=TopicConditionedBillHead(
+    bill_head_bin.to(device),
+    topic_emb if topic_emb is not None else nn.Embedding(1,hidden_dim).to(device)
+).to(device)
 
 class CalibratedPerTopic(nn.Module):
     def __init__(self, head, K):
@@ -518,31 +573,27 @@ params=list(encoders.parameters())+list(proj.parameters())+list(conv1.parameters
 opt=torch.optim.AdamW(params, lr=1e-3, weight_decay=1e-4, betas=(0.9,0.999))
 sched=torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs_stage1+epochs_stage2, eta_min=3e-4)
 
+# --------------------------
+# Forward helpers
+# --------------------------
 def edge_modules_inputs(batch):
     eattr_dict = {}
     tdec_dict = {}
     for et in batch.edge_types:
         e = batch[et]
-        # fast path for empty edge sets in the mini-batch
         if e.edge_index.numel() == 0:
             eattr_dict[et] = None
             tdec_dict[et] = None
             continue
-
         raw_eattr = e.get('edge_attr', None)
         enc = edge_encoders[str(et)]
-        # encode if present
         eenc = enc(raw_eattr.to(device) if raw_eattr is not None else None)
-
         if (eenc is None or eenc.numel() == 0) and enc.out_dim > 0:
             eenc = torch.zeros(e.edge_index.size(1), enc.out_dim, device=device)
-
         eattr_dict[et] = eenc
-
         tdec = build_temporal_decay_for_batch(batch, et)
         tdec_dict[et] = tdec.to(device) if tdec is not None else None
     return eattr_dict, tdec_dict
-
 
 def forward_block(batch, edge_w_override=None):
     edge_index_dict={k:v.to(device) for k,v in batch.edge_index_dict.items()}
@@ -697,122 +748,158 @@ class MetricsLog:
     def log(self,k,v): self.hist.setdefault(k,[]).append(v)
 metrics=MetricsLog()
 
-# — cached bill_version embeddings for contrast
+# --------------------------
+# Stage 1 — Cached bill_version embeddings for contrast (revised)
+# --------------------------
 @torch.no_grad()
 def compute_bv_embeddings(sample_frac=0.5, max_nodes=120_000):
-    if ('bill_version','priorVersion','bill_version') not in data.edge_types: return None,None
+    if ('bill_version','priorVersion','bill_version') not in data.edge_types:
+        return None, None
     nodes=participating_bv
+    if nodes.numel()==0:
+        return None, None
     if sample_frac<1.0:
         k=max(1,int(sample_frac*nodes.numel()))
-        idx=torch.randperm(nodes.numel(), generator=rng, device=nodes.device)[:k]
+        idx=torch.randperm(nodes.numel(), generator=rng)[:k]
         nodes=nodes[idx]
     if max_nodes is not None and nodes.numel()>max_nodes:
-        idx=torch.randperm(nodes.numel(), generator=rng, device=nodes.device)[:max_nodes]
+        idx=torch.randperm(nodes.numel(), generator=rng)[:max_nodes]
         nodes=nodes[idx]
+
     nn_bv_embed={('bill_version','priorVersion','bill_version'):[2,0], ('bill_version','is_version','bill'):[1,0]}
     for et in data.edge_types: nn_bv_embed.setdefault(et,[0,0])
-    loader=NeighborLoader(data, num_neighbors=nn_bv_embed, input_nodes=('bill_version', nodes), batch_size=2048, shuffle=False)
-    Z=torch.empty(nodes.numel(), hidden_dim, device='cpu'); nid_map=torch.empty(nodes.numel(), dtype=torch.long, device='cpu'); first=True
+    loader=NeighborLoader(
+        data, num_neighbors=nn_bv_embed,
+        input_nodes=('bill_version', nodes),
+        batch_size=2048, shuffle=False, **loader_kwargs
+    )
+    Z=torch.empty(nodes.numel(), hidden_dim, device='cpu')
+    rev=-torch.ones(data['bill_version'].num_nodes, dtype=torch.long)
+    rev[nodes.cpu()]=torch.arange(nodes.numel(), dtype=torch.long)
+
     for batch in loader:
         batch=batch.to(device); _,h2,_,_=forward_block(batch); n=batch['bill_version'].batch_size
-        g=batch['bill_version'].n_id[:n].to('cpu')
-        if first:
-            rev=-torch.ones(data['bill_version'].num_nodes, dtype=torch.long); rev[nodes.cpu()]=torch.arange(nodes.numel())
-            first=False
-        rows=rev[g]
+        g=batch['bill_version'].n_id[:n].to('cpu'); rows=rev[g]
         Z[rows]=h2['bill_version'][:n].detach().to('cpu')
-        nid_map[rows]=g
-    return F.normalize(Z,dim=-1), nid_map
+        del batch, h2, g, rows
+        mps_gc()
+    return F.normalize(Z,dim=-1), nodes.cpu()
 
-# — training
+def _valid_idx(idx, size):
+    idx = idx.to(torch.long)
+    return idx[(idx >= 0) & (idx < size)]
+
+def _take_rows(Z, idx):
+    idx = _valid_idx(idx, Z.size(0))
+    if idx.numel() == 0:
+        return None, idx
+    return Z[idx], idx
+
+def _select_pos_pairs_in(nodes_cpu):
+    if not pos_pairs:
+        return None
+    present=set(nodes_cpu.tolist())
+    keep=[(a,b) for (a,b) in pos_pairs if (a in present and b in present)]
+    if len(keep)==0:
+        return None
+    return torch.tensor(keep, dtype=torch.long)  # [M,2] on CPU
+
+def _contrast_epoch(Z_cpu, pairs_cpu, bsz=4096, neg_pool_size=8192):
+    assert Z_cpu.device.type=='cpu'
+    Npairs=pairs_cpu.size(0)
+    total_loss=0.0
+    for s in range(0, Npairs, bsz):
+        e=min(s+bsz, Npairs)
+        batch_pairs=pairs_cpu[s:e]
+        ii=batch_pairs[:,0]; jj=batch_pairs[:,1]
+
+        base_pool=torch.randperm(Z_cpu.size(0), generator=rng)[:neg_pool_size]
+        pool=torch.unique(torch.cat([base_pool, ii, jj], dim=0))
+        sorted_pool,_=torch.sort(pool)
+        sorted_pool = sorted_pool.contiguous()
+        ii = ii.contiguous()
+        pos_i = torch.searchsorted(sorted_pool, ii)
+        pos_j=torch.searchsorted(sorted_pool, jj)
+        Zpool, sorted_pool = _take_rows(Z_cpu, sorted_pool)
+        if Zpool is None:
+            return 0.0
+        sorted_pool = torch.unique(sorted_pool)          # drop duplicates
+        sorted_pool = _valid_idx(sorted_pool, Z_cpu.size(0))
+        if sorted_pool.numel() == 0:
+            return 0.0
+
+        Zpool = proj_contrast(Z_cpu[sorted_pool].to(device))
+        Zpool=F.normalize(Zpool, dim=-1)
+        Zi=Zpool[pos_i.to(device)]
+        logits=(Zi @ Zpool.T) / tau_contrast
+        targets=pos_j.to(device)
+
+        loss_c=F.cross_entropy(logits, targets, label_smoothing=0.02) + lambda_l2 * _l2_mean(Zpool)
+        (w_contrast*loss_c*(1.0/accum_contrast)).backward()
+        total_loss+=float((w_contrast*loss_c).item())
+
+        del base_pool, pool, sorted_pool, pos_i, pos_j, Zpool, Zi, logits, targets, loss_c
+        if (((e // bsz) + 1) % accum_contrast) == 0:
+            nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
+        mps_gc()
+
+    if (Npairs // bsz) % accum_contrast != 0:
+        nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
+    return total_loss
+
+# --------------------------
+# Stage 1 — Training
+# --------------------------
 for epoch in range(1,epochs_stage1+1):
     total=0.0; opt.zero_grad()
 
-    # bills
+    # 1) Bills
     micro=0
     for batch in tqdm(bill_loader, desc=f'epoch {epoch} bills'):
         batch=batch.to(device); _,h2,_,_=forward_block(batch)
-        loss= w_bill*bill_loss(batch,h2)
+        loss=w_bill*bill_loss(batch,h2)
         (loss*(1.0/accum_bill)).backward(); total+=float(loss.item()); micro+=1
         if micro%accum_bill==0:
             nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
+        del batch, h2, loss
+        mps_gc()
     if micro%accum_bill!=0:
         nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
 
-    # LT stance
+    # 2) LT stance
     if stance_head_LT and lt_loader and (lt_topic_label is not None):
         micro=0
         for batch in tqdm(lt_loader, desc=f'epoch {epoch} LT-stance'):
             batch=batch.to(device); loss=stance_training_step(batch,'legislator_term',stance_head_LT,lt_topic_label,lt_topic_conf)
-            if loss is not None:
+            if loss is not None and loss.requires_grad:
                 (loss*(1.0/accum_stance)).backward(); total+=float(loss.item()); micro+=1
                 if micro%accum_stance==0:
                     nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
+            del batch, loss
+            mps_gc()
         if micro%accum_stance!=0:
             nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
 
-    # Contrast (cached)
+    # 3) Contrast (cached, efficient pool mapping)
     if pos_pairs:
         with torch.no_grad():
-            Z, gid = compute_bv_embeddings(sample_frac=0.5, max_nodes=120_000)
-            if Z is not None:
-                rev = -torch.ones(data['bill_version'].num_nodes, dtype=torch.long)
-                rev[gid] = torch.arange(gid.numel())
-                pi = []; pj = []
-                for a, b in pos_pairs:
-                    ia, ib = rev[a].item(), rev[b].item()
-                    if ia >= 0 and ib >= 0:
-                        pi.append(ia); pj.append(ib)
-                if len(pi) > 0:
-                    pi = torch.tensor(pi, dtype=torch.long)
-                    pj = torch.tensor(pj, dtype=torch.long)
+            Z_cpu, nodes_cpu = compute_bv_embeddings(sample_frac=0.5, max_nodes=120_000)
+            pairs_cpu = _select_pos_pairs_in(nodes_cpu) if (Z_cpu is not None) else None
 
-        if 'Z' in locals() and Z is not None and 'pi' in locals() and pi.numel() > 0:
-            Npairs = pi.numel()
-            bsz = 4096
-            micro = 0
-            for s in range(0, Npairs, bsz):
-                e = min(s + bsz, Npairs)
-                ii = pi[s:e]       # indices into Z (CPU)
-                jj = pj[s:e]
+        if (Z_cpu is not None) and (pairs_cpu is not None) and (pairs_cpu.size(0) > 0):
+            M = pairs_cpu.size(0)
+            if M > 200_000:
+                sel = torch.randperm(M, generator=rng)[:200_000]
+                pairs_cpu = pairs_cpu[sel]
+            total += _contrast_epoch(Z_cpu, pairs_cpu, bsz=4096, neg_pool_size=8192)
+            del Z_cpu, nodes_cpu, pairs_cpu
+            mps_gc()
 
-                # build negative pool and ensure positives are included
-                pool = torch.randperm(Z.size(0), generator=rng, device=torch.device('cpu'))[:8192]
-                pool = torch.unique(torch.cat([pool, ii, jj], dim=0))  # union on CPU
+    mps_gc(); sched.step(); print(epoch, round(total,4)); metrics.log('loss_stage1', total)
 
-                # project ONLY the pool this micro-batch (fresh graph per micro)
-                Zpool = F.normalize(proj_contrast(Z[pool].to(device)), dim=-1)  # [P, d]
-
-                # map global indices -> pool positions
-                revp = -torch.ones(Z.size(0), dtype=torch.long, device=device)
-                revp[pool.to(device)] = torch.arange(pool.numel(), device=device)
-
-                pos_i = revp[ii.to(device)]   # [B]
-                pos_j = revp[jj.to(device)]   # [B]
-
-                Zi = Zpool[pos_i]             # [B, d]
-                logits = (Zi @ Zpool.T) / tau_contrast
-                targets = pos_j
-
-                loss_c = F.cross_entropy(logits, targets, label_smoothing=0.02) \
-                        + lambda_l2 * _l2_mean(Zpool)
-
-                (w_contrast * loss_c * (1.0/accum_contrast)).backward()
-                total += float((w_contrast * loss_c).item())
-                micro += 1
-                if micro % accum_contrast == 0:
-                    nn.utils.clip_grad_norm_(params, 1.0)
-                    opt.step(); opt.zero_grad()
-
-            if micro % accum_contrast != 0:
-                nn.utils.clip_grad_norm_(params, 1.0)
-                opt.step(); opt.zero_grad()
-
-
-    if torch.backends.mps.is_available(): torch.mps.synchronize()
-    gc.collect(); sched.step(); print(epoch, round(total,4)); metrics.log('loss_stage1', total)
-
-# — stage 2
+# --------------------------
+# Stage 2
+# --------------------------
 h2_cache={'committee':None}; MAX_SNAPSHOTS_PER_ET=50; SNAP_PROB_PER_BATCH=0.01; MAX_EDGES_PER_SNAPSHOT=5000
 
 def snapshot_alphas(batch,alphas):
@@ -900,6 +987,8 @@ for epoch in range(epochs_stage1+1, epochs_stage1+epochs_stage2+1):
         micro+=1
         if micro%accum_bill==0:
             nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
+        del batch, h2, alphas, loss
+        mps_gc()
     if micro%accum_bill!=0:
         nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
 
@@ -917,14 +1006,17 @@ for epoch in range(epochs_stage1+1, epochs_stage1+epochs_stage2+1):
                     (loss*(1.0/accum_stance)).backward(); total+=float(loss.item()); micro+=1
                     if micro%accum_stance==0:
                         nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
+                del batch, loss
+                mps_gc()
             if micro%accum_stance!=0:
                 nn.utils.clip_grad_norm_(params,1.0); opt.step(); opt.zero_grad()
 
-    sched.step();
-    if torch.backends.mps.is_available(): torch.mps.synchronize()
+    sched.step(); mps_gc()
     print(epoch, round(total,4)); metrics.log('loss_stage2', total)
 
-# — calibration
+# --------------------------
+# Calibration
+# --------------------------
 class BillHeadWrapper(nn.Module):
     def __init__(self, base): super().__init__(); self.base=base
     def forward(self,h,topic_ids): return self.base(h,topic_ids)
@@ -954,7 +1046,9 @@ with torch.no_grad():
         fp=((pred==1)&(yt==0)).sum().item(); fn=((pred==0)&(yt==1)).sum().item()
         acc=(tp+tn)/max(1,tp+tn+fp+fn); per_topic_stat[t]={'Acc':acc,'PosRate':float(p.mean().item()),'Count':int(m.sum().item())}
 
-# — attribution + export
+# --------------------------
+# Attribution + export
+# --------------------------
 def topk_actor_attributions_for_batch(batch, alphas, edge_index_dict, n_b, k=5):
     out=[[] for _ in range(n_b)]
     for et,a in alphas.items():
@@ -973,12 +1067,18 @@ def compute_version_drift():
     drift={}
     if ('bill_version','priorVersion','bill_version') not in data.edge_types: return drift
     ei=data[('bill_version','priorVersion','bill_version')].edge_index
-    loader=NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('bill_version', torch.arange(data['bill_version'].num_nodes)), batch_size=4096, shuffle=False)
+    loader=NeighborLoader(
+        data, num_neighbors=num_neighbors,
+        input_nodes=('bill_version', torch.arange(data['bill_version'].num_nodes)),
+        batch_size=4096, shuffle=False, **loader_kwargs
+    )
     reps=torch.zeros(data['bill_version'].num_nodes, hidden_dim)
     with torch.no_grad():
         for batch in loader:
             batch=batch.to(device); _,h2,_,_=forward_block(batch); n=batch['bill_version'].batch_size
             reps[batch['bill_version'].n_id[:n].cpu()]=h2['bill_version'][:n].detach().cpu()
+            del batch, h2
+            mps_gc()
     z=F.normalize(reps,dim=-1)
     for i in range(ei.size(1)):
         a=int(ei[0,i]); b=int(ei[1,i]); d=float(1.0-(z[a]*z[b]).sum().item())
@@ -989,7 +1089,11 @@ export_payload={'bills':{},'actors':{},'topics':{},'meta':{}}
 
 class InferenceBillIterator:
     def __iter__(self):
-        return NeighborLoader(data, num_neighbors=num_neighbors, input_nodes=('bill', torch.arange(data['bill'].num_nodes)), batch_size=1024, shuffle=False).__iter__()
+        return NeighborLoader(
+            data, num_neighbors=num_neighbors,
+            input_nodes=('bill', torch.arange(data['bill'].num_nodes)),
+            batch_size=1024, shuffle=False, **loader_kwargs
+        ).__iter__()
 
 def export_all():
     with torch.no_grad():
