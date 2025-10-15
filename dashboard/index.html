@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Legislative Intelligence Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-o9N1j7kUN+1pglI1hb8qG9G73e3neCEr87X3Hq0p5Yc=" crossorigin="">
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.dataTables.min.css">
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <aside>
+    <div class="brand">
+      <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M10.5 8A2.5 2.5 0 0 0 8 10.5v27A2.5 2.5 0 0 0 10.5 40h27a2.5 2.5 0 0 0 2.5-2.5v-27A2.5 2.5 0 0 0 37.5 8h-27Zm0-4h27A6.5 6.5 0 0 1 44 10.5v27A6.5 6.5 0 0 1 37.5 44h-27A6.5 6.5 0 0 1 4 37.5v-27A6.5 6.5 0 0 1 10.5 4Z"/></svg>
+      Legislative Intelligence
+    </div>
+    <nav aria-label="Page navigation">
+      <button class="active" data-target="page-1">How a Bill Moves <span class="badge">1</span></button>
+      <button data-target="page-2">Amendments & Negotiation <span class="badge">2</span></button>
+      <button data-target="page-3">Rooms Where It Happens <span class="badge">3</span></button>
+      <button data-target="page-4">Votes, Blocs & Splits <span class="badge">4</span></button>
+      <button data-target="page-5">Money as Influence <span class="badge">5</span></button>
+      <button data-target="page-6">Explore Bills <span class="badge">6</span></button>
+    </nav>
+    <div>
+      <h4 style="margin-bottom: 8px;">Glossary</h4>
+      <div class="glossary">
+        <div class="term" data-term="gatekeeping">
+          <button type="button">Gatekeeping</button>
+          <div class="popover">Share of bills entering a committee that do not advance out of it.</div>
+        </div>
+        <div class="term" data-term="party-line share">
+          <button type="button">Party-line share</button>
+          <div class="popover">Portion of votes where major parties opposed each other.</div>
+        </div>
+        <div class="term" data-term="polarization">
+          <button type="button">Polarization</button>
+          <div class="popover">Gap between party voting patterns measured across roll calls.</div>
+        </div>
+        <div class="term" data-term="amendment similarity">
+          <button type="button">Amendment similarity</button>
+          <div class="popover">Textual alignment between successive bill versions.</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+  <main>
+    <header class="global-controls">
+      <div>
+        <h1>California Legislative Flow Observatory</h1>
+        <div class="subheader-note">Updated periodically (not real-time).</div>
+      </div>
+      <div class="controls-grid">
+        <div class="control">
+          <label for="term-select">Term</label>
+          <select id="term-select" multiple aria-label="Select legislative terms"></select>
+        </div>
+        <div class="control">
+          <label for="topic-select">Topic</label>
+          <select id="topic-select" multiple aria-label="Select policy topics"></select>
+        </div>
+        <div class="control">
+          <label>Chamber context</label>
+          <div class="chamber-toggle" role="group" aria-label="Select chamber context">
+            <button data-chamber="Assembly">Assembly</button>
+            <button data-chamber="Senate">Senate</button>
+            <button class="active" data-chamber="Both">Both</button>
+          </div>
+        </div>
+      </div>
+      <div class="filters-bar" id="active-filters"></div>
+    </header>
+
+    <section id="page-1" class="page active" aria-label="How a Bill Moves">
+      <div class="card">
+        <h2>Pipeline explainer <span class="caption">Explore the legislative funnel from introduction to final action.</span></h2>
+        <p class="caption">Each ribbon shows how many bills advance between stages and how long they typically wait.</p>
+        <div class="chart-container tall" id="pipeline-sankey"></div>
+      </div>
+      <div class="card">
+        <h2>Route archetypes <span class="caption">Common committee pathways at-a-glance.</span></h2>
+        <p class="caption">Lines reveal the most traveled committee routes, scaled by volume and colored by passage odds.</p>
+        <div class="toolbar">
+          <div class="chip-group" id="route-topic-chips" aria-label="Filter route archetypes by topic"></div>
+          <div class="pill" id="route-selection-pill" hidden>Selected route: <span></span></div>
+        </div>
+        <svg id="route-metro" class="chart-container"></svg>
+      </div>
+    </section>
+
+    <section id="page-2" class="page" aria-label="Amendments and Negotiation">
+      <div class="card">
+        <h2>Amendment churn <span class="caption">How often bills get reworked and how drastic the edits are.</span></h2>
+        <p class="caption">Dots highlight bills with many versions and how similar those versions remain.</p>
+        <div class="chart-container" id="amendment-scatter"></div>
+      </div>
+      <div class="card">
+        <h2>Passage-tilted phrasing <span class="caption">Language that correlates with success or failure.</span></h2>
+        <p class="caption">Tokens left of center skew toward stalled bills; rightward terms appear in measures that pass.</p>
+        <div class="token-controls">
+          <label for="token-min-slider" style="margin-right: 4px;">Minimum occurrences</label>
+          <input type="range" id="token-min-slider" min="0" max="50" value="0">
+          <span class="badge" id="token-min-value">0+</span>
+        </div>
+        <div class="chart-container" id="token-bars"></div>
+      </div>
+    </section>
+
+    <section id="page-3" class="page" aria-label="Rooms Where It Happens">
+      <div class="card">
+        <h2>Gatekeeping dashboard <span class="caption">Committees that most often slow down bills.</span></h2>
+        <p class="caption">Higher gatekeeping scores signal committees where few bills emerge.</p>
+        <div class="chart-container" id="gatekeeping-lollipop"></div>
+      </div>
+      <div class="card">
+        <h2>Committee vs floor drift <span class="caption">Legislators who shift positions between rooms.</span></h2>
+        <p class="caption">Dots positioned to the left vote "yes" in committee but diverge on the floor.</p>
+        <div class="chart-container" id="drift-beeswarm"></div>
+      </div>
+    </section>
+
+    <section id="page-4" class="page" aria-label="Votes, Blocs, and Splits">
+      <div class="card">
+        <h2>Voting blocs network <span class="caption">Communities of legislators who vote together.</span></h2>
+        <p class="caption">Lines connect legislators with similar voting records; clusters reveal blocs.</p>
+        <div class="chart-container" id="voting-network"></div>
+      </div>
+      <div class="card">
+        <div class="vis-2col">
+          <div>
+            <h2>Controversy by topic <span class="caption">Where party lines hold firm.</span></h2>
+            <p class="caption">Heatmap intensity marks the share of party-line votes for each topic and term.</p>
+            <div class="chart-container" id="controversy-heatmap"></div>
+          </div>
+          <div>
+            <h2>Party gaps detail <span class="caption">Compare partisan support side-by-side.</span></h2>
+            <p class="caption">Each line shows how Democratic and Republican support diverges on the selected term.</p>
+            <div class="chart-container" id="controversy-dumbbell"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-5" class="page" aria-label="Money as Influence">
+      <div class="card">
+        <div class="split">
+          <div>
+            <h2>Funding geography <span class="caption">Where money enters the legislative process.</span></h2>
+            <p class="caption">Map shades counties by the volume of contributions; click to explore who benefits.</p>
+            <div class="token-controls">
+              <label for="funding-metric">Metric</label>
+              <select id="funding-metric">
+                <option value="total_donations">Total donations</option>
+                <option value="total_lobbying">Total lobbying</option>
+                <option value="total_received">Total received</option>
+              </select>
+            </div>
+            <div id="funding-map" class="map-container"></div>
+          </div>
+          <div>
+            <h2>County drilldown <span class="caption">Who is tied to this geography?</span></h2>
+            <p class="caption">The list spotlights legislators and districts associated with the selected county.</p>
+            <div class="side-panel content" id="funding-county-detail" style="position: static; box-shadow: none; height: auto; border: none;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="vis-2col">
+          <div>
+            <h2>Topic funding over time <span class="caption">Contribution trends by policy area.</span></h2>
+            <p class="caption">Stacked bars show how donations and lobbying ebb across terms.</p>
+            <div class="chart-container" id="topic-funding-term"></div>
+          </div>
+          <div>
+            <h2>Legislator topic mix <span class="caption">Influence profile of a member.</span></h2>
+            <p class="caption">Choose a legislator to see their funding mix by topic.</p>
+            <div class="token-controls">
+              <label for="legislator-select">Legislator</label>
+              <select id="legislator-select"></select>
+            </div>
+            <div class="chart-container" id="legislator-topic-mix"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="page-6" class="page" aria-label="Explore Bills">
+      <div class="card">
+        <h2>Bill browser <span class="caption">Search and filter bills with contextual insights.</span></h2>
+        <p class="caption">Use the table to find measures, then open any row for stage history and vote detail.</p>
+        <div class="toolbar">
+          <input type="search" id="bill-search" placeholder="Search by bill ID, author, or keyword" style="flex:1; min-width:220px;">
+          <button id="clear-bill-filters" class="link-button" type="button">Reset selections</button>
+        </div>
+        <table id="bill-table" class="display" style="width:100%">
+          <thead>
+            <tr>
+              <th>Bill</th>
+              <th>Topic</th>
+              <th>Term</th>
+              <th>First action</th>
+              <th>Longevity (days)</th>
+              <th>Versions</th>
+              <th>Similarity</th>
+              <th>Outcome</th>
+            </tr>
+          </thead>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div class="drawer" id="drawer">
+    <header>
+      <h3 id="drawer-title">Details</h3>
+      <button type="button" id="drawer-close" aria-label="Close details">✕</button>
+    </header>
+    <div class="content" id="drawer-content"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-o9N1j7kUN+1pglI1hb8qG9G73e3neCEr87X3Hq0p5Yc=" crossorigin=""></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/dataTables.min.js"></script>
+  <script src="assets/main.js"></script>
+</body>
+</html>
