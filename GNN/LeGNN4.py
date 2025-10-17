@@ -152,10 +152,16 @@ class HeteroSAGEBackbone(nn.Module):
         self.norms = nn.ModuleDict({node_type: nn.LayerNorm(d) for node_type in metadata[0]})
         self.drop = nn.Dropout(drop)
 
-    def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Tensor]) -> Dict[str, Tensor]:
+    def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Optional[Tensor]]) -> Dict[str, Tensor]:
         for conv in self.convs:
-            edge_attr = {edge_type: self.edge_mlps[str(edge_type)](edge_time[edge_type]) for edge_type in data.edge_types}
-            h = conv(h, {edge_type: data[edge_type].edge_index for edge_type in data.edge_types}, edge_attr)
+            edge_attr: Dict[Tuple[str, str, str], Optional[Tensor]] = {}
+            for edge_type in data.edge_types:
+                feats = edge_time.get(edge_type)
+                if feats is None:
+                    edge_attr[edge_type] = None
+                else:
+                    edge_attr[edge_type] = self.edge_mlps[str(edge_type)](feats)
+            h = conv(h, {edge_type: data[edge_type].edge_index for edge_type in data.edge_types if data[edge_type].edge_index.size(1) > 0}, edge_attr)
             h = {node_type: self.norms[node_type](self.drop(rep)) for node_type, rep in h.items()}
         return h
 
@@ -181,8 +187,17 @@ class HGTBackbone(nn.Module):
         self.norms = nn.ModuleDict({node_type: nn.LayerNorm(d) for node_type in metadata[0]})
         self.drop = nn.Dropout(drop)
 
-    def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Tensor]) -> Dict[str, Tensor]:
-        edge_attr = {edge_type: self.edge_lin[str(edge_type)](edge_time[edge_type]) for edge_type in data.edge_types}
+    def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Optional[Tensor]]) -> Dict[str, Tensor]:
+        edge_attr: Dict[Tuple[str, str, str], Tensor] = {}
+        for edge_type in data.edge_types:
+            feats = edge_time.get(edge_type)
+            lin = self.edge_lin[str(edge_type)]
+            if feats is None:
+                num_edges = data[edge_type].edge_index.size(1)
+                zeros = lin.weight.new_zeros((num_edges, lin.in_features))
+                edge_attr[edge_type] = lin(zeros)
+            else:
+                edge_attr[edge_type] = lin(feats)
         for conv in self.convs:
             h = conv(h, {edge_type: data[edge_type].edge_index for edge_type in data.edge_types}, edge_attr)
             h = {node_type: self.norms[node_type](self.drop(rep)) for node_type, rep in h.items()}
@@ -313,17 +328,27 @@ class MaskNet(nn.Module):
         return torch.sigmoid(logits)
 
 
-def edge_time_features(data: HeteroData, module: Time2Vec, device: torch.device) -> Dict[Tuple[str, str, str], Tensor]:
-    feats: Dict[Tuple[str, str, str], Tensor] = {}
+def edge_time_features(data: HeteroData, module: Time2Vec, device: torch.device) -> Dict[Tuple[str, str, str], Optional[Tensor]]:
+    feats: Dict[Tuple[str, str, str], Optional[Tensor]] = {}
     for edge_type in data.edge_types:
         store = data[edge_type]
-        if hasattr(store, "edge_time") and store.edge_time is not None:
-            dt = store.edge_time.to(device)
-        elif hasattr(store, "edge_attr") and store.edge_attr is not None:
-            dt = store.edge_attr[:, -1].to(device)
+        dt: Optional[Tensor] = None
+        edge_time = getattr(store, "edge_time", None)
+        if edge_time is not None:
+            dt = edge_time.to(device).float()
         else:
-            dt = torch.zeros(store.edge_index.size(1), device=device)
-        feats[edge_type] = module(dt.float())
+            edge_attr = getattr(store, "edge_attr", None)
+            if edge_attr is not None:
+                if edge_attr.dim() == 1:
+                    dt = edge_attr.to(device).float()
+                elif edge_attr.size(-1) > 0:
+                    dt = edge_attr[:, -1].to(device).float()
+        if dt is None:
+            # Some relation types do not track timestamps/attributes; return None so downstream
+            # layers avoid constructing artificial edge features that break SAGEConv.
+            feats[edge_type] = None
+            continue
+        feats[edge_type] = module(dt)
     return feats
 
 
@@ -549,16 +574,26 @@ class LeGNN4(nn.Module):
 def build_neighbor_loaders(data: HeteroData, cfg: ModelConfig) -> Tuple[NeighborLoader, NeighborLoader, LinkNeighborLoader]:
     vote_neighbors = {
         ("legislator_term", "voted_on", "bill_version"): [64, 64, 64],
+        ("bill_version", "rev_voted_on", "legislator_term"): [0, 0, 0],
         ("bill_version", "is_version", "bill"): [10, 10, 10],
+        ("bill", "rev_is_version", "bill_version"): [0, 0, 0],
         ("bill_version", "priorVersion", "bill_version"): [4, 4, 4],
+        ("bill_version", "rev_priorVersion", "bill_version"): [0, 0, 0],
         ("bill_version", "read", "committee"): [6, 6, 6],
+        ("committee", "rev_read", "bill_version"): [0, 0, 0],
         ("legislator_term", "member_of", "committee"): [8, 8, 8],
+        ("committee", "rev_member_of", "legislator_term"): [0, 0, 0],
         ("legislator", "samePerson", "legislator_term"): [4, 4, 4],
+        ("legislator_term", "rev_samePerson", "legislator"): [0, 0, 0],
         ("topic", "has", "bill"): [16, 16, 16],
         ("legislator_term", "wrote", "bill_version"): [6, 6, 6],
+        ("bill_version", "rev_wrote", "legislator_term"): [0, 0, 0],
         ("donor", "donated_to", "legislator_term"): [16, 16, 16],
+        ("legislator_term", "rev_donated_to", "donor"): [0, 0, 0],
         ("lobby_firm", "lobbied", "legislator_term"): [16, 16, 16],
+        ("legislator_term", "rev_lobbied", "lobby_firm"): [0, 0, 0],
         ("lobby_firm", "lobbied", "committee"): [16, 16, 16],
+        ("committee", "rev_lobbied", "lobby_firm"): [0, 0, 0],
     }
     vote_loader = NeighborLoader(
         data,
@@ -635,6 +670,10 @@ class Trainer:
         base = data.clone()
         base = ToUndirected()(base)
         base = RemoveIsolatedNodes()(base)
+        for edge_type in base.edge_types:
+            edge_index = base[edge_type].edge_index
+            if isinstance(edge_index, torch.Tensor) and edge_index.dtype != torch.long:
+                base[edge_type].edge_index = edge_index.long()
         self.topic_builder = TopicBuilder(cfg.topics_expected)
         self.num_topics, self.topic_values, self.topic_for_bill = self.topic_builder(base)
         self.data = base
@@ -895,5 +934,5 @@ def run_training(data: HeteroData, epochs: int = 3, cfg: Optional[ModelConfig] =
 
 
 if __name__ == "__main__":
-    graph = torch.load("data4.pt")
+    graph = torch.load("data4.pt", weights_only=False)
     trainer, embeddings, outputs = run_training(graph, epochs=1)
