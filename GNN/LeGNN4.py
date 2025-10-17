@@ -167,28 +167,36 @@ class HeteroSAGEBackbone(nn.Module):
             for edge_type in data.edge_types:
                 store = data[edge_type]
                 edge_index = getattr(store, "edge_index", None)
-                if edge_index is None or edge_index.numel() == 0:
-                    continue
+
+                if edge_index is None:
+                    src_type, _, _ = edge_type
+                    device = h[src_type].device
+                    # ``HeteroConv`` still iterates over every relation in the
+                    # metadata, so provide an explicit empty adjacency tensor
+                    # to prevent ``SAGEConv`` from receiving ``None``.
+                    edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+                elif edge_index.numel() == 0:
+                    # Preserve the tensor instance (and device placement) to
+                    # avoid unnecessary data copies when the loader materialises
+                    # empty relations on the target device.
+                    edge_index = edge_index.view(2, 0)
 
                 edge_index_dict[edge_type] = edge_index
 
                 feats = edge_time.get(edge_type)
-                if feats is None:
+                if feats is None or edge_index.size(1) == 0:
                     edge_bias[edge_type] = None
                 else:
                     edge_bias[edge_type] = self.edge_mlps[str(edge_type)](feats)
 
-            if edge_index_dict:
-                conv_out = conv(h, edge_index_dict)
-            else:
-                conv_out = {node_type: h[node_type] for node_type in h}
+            conv_out = conv(h, edge_index_dict)
             # Inject the learned edge time/context embeddings as residual biases
             # so the information is not lost even though ``SAGEConv`` cannot
             # consume dense edge attributes directly.
             for edge_type, bias in edge_bias.items():
                 if bias is None:
                     continue
-                dst = data[edge_type].edge_index[1]
+                dst = edge_index_dict[edge_type][1]
                 dst_type = edge_type[2]
                 aggregated = scatter_mean(
                     bias,
