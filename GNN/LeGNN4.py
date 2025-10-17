@@ -144,6 +144,14 @@ class FeatureProjector(nn.Module):
 class HeteroSAGEBackbone(nn.Module):
     def __init__(self, metadata: Tuple[List[str], List[Tuple[str, str, str]]], d: int, layers: int, drop: float, edge_dim: int):
         super().__init__()
+        # NOTE:
+        # ``SAGEConv`` only supports scalar ``edge_weight`` values.  The previous
+        # implementation attempted to pass dense edge embeddings which triggered
+        # ``MessagePassing`` to interpret the tensor as an ``edge_index`` argument,
+        # resulting in the runtime error raised in the bug report.  To keep the
+        # door open for future feature engineering we still construct MLPs for
+        # edge features, but their outputs are consumed inside this module (as an
+        # additive bias) instead of being forwarded directly to ``SAGEConv``.
         self.edge_mlps = nn.ModuleDict({str(edge_type): mlp([edge_dim, d]) for edge_type in metadata[1]})
         self.convs = nn.ModuleList()
         for _ in range(layers):
@@ -154,15 +162,54 @@ class HeteroSAGEBackbone(nn.Module):
 
     def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Optional[Tensor]]) -> Dict[str, Tensor]:
         for conv in self.convs:
-            edge_attr: Dict[Tuple[str, str, str], Optional[Tensor]] = {}
+            edge_bias: Dict[Tuple[str, str, str], Optional[Tensor]] = {}
+            edge_index_dict: Dict[Tuple[str, str, str], Tensor] = {}
             for edge_type in data.edge_types:
+                store = data[edge_type]
+                edge_index = getattr(store, "edge_index", None)
+
+                if edge_index is None:
+                    src_type, _, _ = edge_type
+                    device = h[src_type].device
+                    # ``HeteroConv`` still iterates over every relation in the
+                    # metadata, so provide an explicit empty adjacency tensor
+                    # to prevent ``SAGEConv`` from receiving ``None``.
+                    edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+                elif edge_index.numel() == 0:
+                    # Preserve the tensor instance (and device placement) to
+                    # avoid unnecessary data copies when the loader materialises
+                    # empty relations on the target device.
+                    edge_index = edge_index.view(2, 0)
+
+                edge_index_dict[edge_type] = edge_index
+
                 feats = edge_time.get(edge_type)
-                if feats is None:
-                    edge_attr[edge_type] = None
+                if feats is None or edge_index.size(1) == 0:
+                    edge_bias[edge_type] = None
                 else:
-                    edge_attr[edge_type] = self.edge_mlps[str(edge_type)](feats)
-            h = conv(h, {edge_type: data[edge_type].edge_index for edge_type in data.edge_types if data[edge_type].edge_index.size(1) > 0}, edge_attr)
-            h = {node_type: self.norms[node_type](self.drop(rep)) for node_type, rep in h.items()}
+                    edge_bias[edge_type] = self.edge_mlps[str(edge_type)](feats)
+
+            conv_out = conv(h, edge_index_dict)
+            # Inject the learned edge time/context embeddings as residual biases
+            # so the information is not lost even though ``SAGEConv`` cannot
+            # consume dense edge attributes directly.
+            for edge_type, bias in edge_bias.items():
+                if bias is None:
+                    continue
+                dst = edge_index_dict[edge_type][1]
+                dst_type = edge_type[2]
+                aggregated = scatter_mean(
+                    bias,
+                    dst,
+                    dim=0,
+                    dim_size=conv_out[dst_type].size(0),
+                )
+                conv_out[dst_type] = conv_out[dst_type] + aggregated
+
+            h = {
+                node_type: self.norms[node_type](self.drop(rep))
+                for node_type, rep in conv_out.items()
+            }
         return h
 
 
