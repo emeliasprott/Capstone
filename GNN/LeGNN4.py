@@ -163,24 +163,30 @@ class HeteroSAGEBackbone(nn.Module):
     def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Optional[Tensor]]) -> Dict[str, Tensor]:
         for conv in self.convs:
             edge_bias: Dict[Tuple[str, str, str], Optional[Tensor]] = {}
+            edge_index_dict: Dict[Tuple[str, str, str], Tensor] = {}
             for edge_type in data.edge_types:
+                store = data[edge_type]
+                edge_index = getattr(store, "edge_index", None)
+                if edge_index is None or edge_index.numel() == 0:
+                    continue
+
+                edge_index_dict[edge_type] = edge_index
+
                 feats = edge_time.get(edge_type)
                 if feats is None:
                     edge_bias[edge_type] = None
                 else:
                     edge_bias[edge_type] = self.edge_mlps[str(edge_type)](feats)
 
-            edge_index_dict = {
-                edge_type: data[edge_type].edge_index
-                for edge_type in data.edge_types
-            }
-
-            conv_out = conv(h, edge_index_dict)
+            if edge_index_dict:
+                conv_out = conv(h, edge_index_dict)
+            else:
+                conv_out = {node_type: h[node_type] for node_type in h}
             # Inject the learned edge time/context embeddings as residual biases
             # so the information is not lost even though ``SAGEConv`` cannot
             # consume dense edge attributes directly.
             for edge_type, bias in edge_bias.items():
-                if bias is None or data[edge_type].edge_index.size(1) == 0:
+                if bias is None:
                     continue
                 dst = data[edge_type].edge_index[1]
                 dst_type = edge_type[2]
