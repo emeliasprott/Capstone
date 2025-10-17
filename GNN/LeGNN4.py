@@ -173,7 +173,6 @@ class HeteroSAGEBackbone(nn.Module):
             edge_index_dict = {
                 edge_type: data[edge_type].edge_index
                 for edge_type in data.edge_types
-                if data[edge_type].edge_index.size(1) > 0
             }
 
             conv_out = conv(h, edge_index_dict)
