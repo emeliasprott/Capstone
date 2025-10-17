@@ -152,7 +152,8 @@ class HeteroSAGEBackbone(nn.Module):
         # door open for future feature engineering we still construct MLPs for
         # edge features, but their outputs are consumed inside this module (as an
         # additive bias) instead of being forwarded directly to ``SAGEConv``.
-        self.edge_mlps = nn.ModuleDict({str(edge_type): mlp([edge_dim, d]) for edge_type in metadata[1]})
+        self.edge_types = list(metadata[1])
+        self.edge_mlps = nn.ModuleDict({self._edge_key(edge_type): mlp([edge_dim, d]) for edge_type in self.edge_types})
         self.convs = nn.ModuleList()
         for _ in range(layers):
             rel_convs = {edge_type: SAGEConv((d, d), d) for edge_type in metadata[1]}
@@ -160,34 +161,34 @@ class HeteroSAGEBackbone(nn.Module):
         self.norms = nn.ModuleDict({node_type: nn.LayerNorm(d) for node_type in metadata[0]})
         self.drop = nn.Dropout(drop)
 
+    @staticmethod
+    def _edge_key(edge_type: Tuple[str, str, str]) -> str:
+        return "__".join(edge_type)
+
     def forward(self, h: Dict[str, Tensor], data: HeteroData, edge_time: Dict[Tuple[str, str, str], Optional[Tensor]]) -> Dict[str, Tensor]:
         for conv in self.convs:
             edge_bias: Dict[Tuple[str, str, str], Optional[Tensor]] = {}
             edge_index_dict: Dict[Tuple[str, str, str], Tensor] = {}
-            for edge_type in data.edge_types:
-                store = data[edge_type]
-                edge_index = getattr(store, "edge_index", None)
+            for edge_type in self.edge_types:
+                key = self._edge_key(edge_type)
+                src_type = edge_type[0]
+                store = data[edge_type] if edge_type in data.edge_types else None
+                edge_index = None if store is None else getattr(store, "edge_index", None)
 
                 if edge_index is None:
-                    src_type, _, _ = edge_type
                     device = h[src_type].device
-                    # ``HeteroConv`` still iterates over every relation in the
-                    # metadata, so provide an explicit empty adjacency tensor
-                    # to prevent ``SAGEConv`` from receiving ``None``.
                     edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-                elif edge_index.numel() == 0:
-                    # Preserve the tensor instance (and device placement) to
-                    # avoid unnecessary data copies when the loader materialises
-                    # empty relations on the target device.
-                    edge_index = edge_index.view(2, 0)
 
                 edge_index_dict[edge_type] = edge_index
 
+                if edge_index.numel() == 0:
+                    continue
+
                 feats = edge_time.get(edge_type)
-                if feats is None or edge_index.size(1) == 0:
+                if feats is None:
                     edge_bias[edge_type] = None
                 else:
-                    edge_bias[edge_type] = self.edge_mlps[str(edge_type)](feats)
+                    edge_bias[edge_type] = self.edge_mlps[key](feats)
 
             conv_out = conv(h, edge_index_dict)
             # Inject the learned edge time/context embeddings as residual biases
@@ -196,7 +197,7 @@ class HeteroSAGEBackbone(nn.Module):
             for edge_type, bias in edge_bias.items():
                 if bias is None:
                     continue
-                dst = edge_index_dict[edge_type][1]
+                dst = data[edge_type].edge_index[1]
                 dst_type = edge_type[2]
                 aggregated = scatter_mean(
                     bias,
