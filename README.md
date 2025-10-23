@@ -51,8 +51,13 @@ The project is structured into multiple phases:
             <td>Notebook to clean and standardize text</td>
         </tr>
         <tr>
-            <td rowspan="2"><strong>GNN/</strong></td>
-            <td>LeGNN.py</td>
+            <td rowspan="1"><strong>dashboard/shiny/</strong></td>
+            <td>app.R</td>
+            <td>R Shiny app for the dashboard</td>
+        </tr>
+        <tr>
+            <td rowspan="6"><strong>Root</strong></td>
+            <td>LeGNN4.py</td>
             <td>Script to create and train the GNN</td>
         </tr>
         <tr>
@@ -60,16 +65,10 @@ The project is structured into multiple phases:
             <td>Script to create topic embeddings</td>
         </tr>
         <tr>
-            <td rowspan="2"><strong>dashboard/backend/scripts/</strong></td>
-            <td>precomputations.ipynb</td>
+            <td>comps.ipynb</td>
             <td>Notebook to extract metrics for dashboard</td>
         </tr>
         <tr>
-            <td>app.R</td>
-            <td>R Shiny app for the dashboard</td>
-        </tr>
-        <tr>
-            <td rowspan="3"><strong>Root Directory</strong></td>
             <td>combining.ipynb</td>
             <td>Notebook to combine data from different sources</td>
         </tr>
