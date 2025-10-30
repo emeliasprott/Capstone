@@ -77,7 +77,7 @@ The project is structured into multiple phases:
             <td>Exploratory data analysis project</td>
         </tr>
         <tr>
-            <td>graph-construction.ipynb</td>
+            <td>preprocessing.ipynb</td>
             <td>Notebook to construct the graph</td>
         </tr>
     </tbody>
