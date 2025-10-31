@@ -21,42 +21,6 @@ if (!length(TERMS)) {
 DEFAULT_TERM <- TERMS[[1]]
 TOPICS <- tryCatch(sort(unique(get_topic_summary(0)$topic)), error = function(e) character())
 
-mod_header_ui <- function(id, terms, topics) {
-    ns <- NS(id)
-    term_choices <- setNames(terms, terms)
-    topic_choices <- c(TOPIC_ALL_LABEL, sort(unique(topics)))
-    tagList(
-        span(class = "app-title", APP_TITLE),
-        bslib::nav_spacer(),
-        div(
-            class = "header-controls d-flex align-items-center gap-2",
-            shiny::selectInput(
-                inputId = ns("term"),
-                label = shiny::span(class = "visually-hidden", "Select term"),
-                choices = term_choices,
-                selected = term_choices[1],
-                width = "140px"
-            ),
-            shiny::selectizeInput(
-                inputId = ns("topic"),
-                label = shiny::span(class = "visually-hidden", "Filter by topic"),
-                choices = topic_choices,
-                selected = TOPIC_ALL_LABEL,
-                options = list(placeholder = "All topics", plugins = list("remove_button")),
-                width = "220px"
-            ),
-            shiny::textInput(
-                inputId = ns("search"),
-                label = shiny::span(class = "visually-hidden", "Search"),
-                placeholder = "Search tables",
-                width = "200px"
-            ),
-            shiny::actionButton(ns("copy_link"), label = NULL, icon = shiny::icon("link"), title = "Copy link to this view"),
-            bslib::toggle_dark_mode(id = ns("dark_toggle"), class = "ms-2")
-        )
-    )
-}
-
 
 app_theme <- function() {
     bslib::bs_theme(
