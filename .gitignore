@@ -43,3 +43,6 @@ automate
 *pt
 *json
 raw_comps.ipynb
+outs/*
+subject_clusters.csv
+Untitled-1.py
