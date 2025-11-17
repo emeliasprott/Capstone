@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e # exit on error
+
 # DIRECTORIES AND ENVIRONMENT
 BAT_DIR="/etl_data/format_files"
 TABLES_LC="$BAT_DIR/tables_lc.lst"
@@ -8,9 +9,13 @@ NUM_PROCS=$(nproc || echo 4)
 TEMP_DIR="/etl_data/temp"
 OUTPUT_DIR="/etl_data/LOB"
 mkdir -p "${TEMP_DIR}" "${OUTPUT_DIR}"
-ZIP_FILES=$(ls "${BATCH_DIR}"/pubinfo_*.zip)
+
+# include both yearly and daily files from BATCH_DIR
+ZIP_FILES=$(ls "${BATCH_DIR}"/pubinfo_*.zip "${BATCH_DIR}"/pubinfo_daily_*.zip)
+
 # DATABASE CONNECTION
 PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -c "CREATE EXTENSION IF NOT EXISTS lo;"
+
 # loading .dat files
 copy_file() {
     local file="$1"
@@ -18,6 +23,7 @@ copy_file() {
     PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" \
         -c "\COPY $target_table FROM '$file' WITH (FORMAT csv, DELIMITER E'\t', HEADER false, NULL 'NULL', QUOTE '\`', ESCAPE '\\');"
 }
+
 # loading .lob files and converting to text
 process_lob() {
     local data_dir="$1"
@@ -32,11 +38,20 @@ process_lob() {
     (cd "${lob_dir}" && zip -r "${output_dir}/${year}_lob_files.zip" .)
     rm -rf "${lob_dir}"
 }
+
 export -f copy_file
 export DB_PASSWORD DB_HOST DB_USER DB_NAME
+
 for ZIP_FILE in ${ZIP_FILES}; do
+    # default: try to extract 4-digit year
     YEAR=$(basename "${ZIP_FILE}" | grep -o '[0-9]\{4\}')
-    echo "Processing ${ZIP_FILE}..."
+
+    # if no 4-digit year and it's a daily file, force 2025
+    if [[ -z "$YEAR" && "$(basename "${ZIP_FILE}")" == pubinfo_daily_*.zip ]]; then
+        YEAR=2025
+    fi
+
+    echo "Processing ${ZIP_FILE} as year ${YEAR}..."
     DATA_DIR="${TEMP_DIR}/pubinfo_${YEAR}"
     unzip -q "${ZIP_FILE}" -d "${DATA_DIR}"
 
@@ -65,4 +80,5 @@ for ZIP_FILE in ${ZIP_FILES}; do
     rm -rf "$DATA_DIR"
     echo "Finished $ZIP_FILE"
 done
+
 echo "ETL process complete."

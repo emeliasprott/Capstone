@@ -1,1075 +1,1147 @@
-import os, json, gc, random, warnings, torch, numpy as np, pandas as pd
-from dataclasses import dataclass
-from torch import nn
-from torch.nn import functional as F
-from torch_geometric.data import HeteroData
+import random
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from torch_geometric.loader import NeighborLoader
-from tqdm.auto import tqdm
-
-warnings.filterwarnings("ignore")
-torch.set_float32_matmul_precision("high")
-torch.set_num_threads(1)
-
-
-def _dev():
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+from torch_geometric.transforms import ToUndirected, RemoveIsolatedNodes
+from torch_geometric.nn import SAGEConv, HeteroConv
 
 
 class CFG:
-    seed = 42
-    d = 164
-    layers = 2
-    drop = 0.1
-    lr = 1e-3
-    wd = 1e-4
-    epochs = 7
-    bsz = 1024
-    neigh_budgets = {
-        "bill_version": [32, 12, 6],
-        "bill": [32, 12, 6],
-        "legislator_term": [16, 8, 4],
-        "committee": [16, 8, 4],
-        "lobby_firm": [12, 8, 4],
-        "donor": [12, 8, 4],
+    hidden_dim = 148
+    num_layers = 3
+    dropout = 0.15
+    lr = 3e-4
+    weight_decay = 1e-4
+    epochs = 5
+
+    num_topics = 66
+    actor_types = ["legislator_term", "committee", "donor", "lobby_firm"]
+    input_type = "bill"
+
+    num_neighbors = {
+        ("bill_version", "is_version", "bill"): [2, 1, 0],
+        ("bill_version", "priorVersion", "bill_version"): [4, 2, 1],
+        ("legislator", "samePerson", "legislator_term"): [4, 2, 1],
+        ("legislator_term", "wrote", "bill_version"): [16, 8, 4],
+        ("legislator_term", "member_of", "committee"): [8, 4, 4],
+        ("lobby_firm", "lobbied", "legislator_term"): [4, 4, 2],
+        ("lobby_firm", "lobbied", "committee"): [4, 4, 2],
+        ("donor", "donated_to", "legislator_term"): [4, 4, 2],
+        ("legislator_term", "voted_on", "bill_version"): [32, 16, 4],
+        ("bill_version", "read", "committee"): [16, 8, 4],
     }
-    lambda_outcome = 1.0
-    lambda_contrast = 0.15
-    lambda_temporal = 0.08
-    lambda_actor_topic = 1.0
-    save_dir = "dashboard/backend/data/outs"
-    max_snapshots = 10
-    contrastive_tau = 0.07
+
+    batch_size = 3048
     num_workers = 0
-    actor_types = ("legislator_term", "committee", "donor", "lobby_firm")
-    infer_types = (
-        "bill",
-        "legislator",
-        "legislator_term",
-        "committee",
-        "donor",
-        "lobby_firm",
-        "bill_version",
+
+    lambda_bill = 1.0
+    lambda_vote = 1.0
+    lambda_donation = 0.2
+    lambda_lobby = 0.2
+
+    lambda_stance_reg = 1e-2
+    lambda_infl_reg = 5e-3
+
+    lambda_vote_orient = 2e-4
+    lambda_money_orient = 5e-4
+
+    device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available() else "cpu"
     )
-    msg_chunk_edges = 30000
 
 
-ACCUM_STEPS = 2
-DEVICE = _dev()
-random.seed(CFG.seed)
-np.random.seed(CFG.seed)
-torch.manual_seed(CFG.seed)
-
-MANUAL_EDGE_TCOLS = {
-    ("legislator_term", "voted_on", "bill_version"): [0],
-    ("committee", "rev_read", "bill_version"): [-1],
-    ("donor", "donated_to", "legislator_term"): [0],
-    ("lobby_firm", "lobbied", "legislator_term"): [0],
-    ("lobby_firm", "lobbied", "committee"): [0],
-    ("bill_version", "read", "committee"): [-1],
-}
+def seed_all(seed=42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def empty_cache_mps():
-    if hasattr(torch, "mps") and torch.backends.mps.is_available():
-        try:
-            torch.mps.empty_cache()
-        except:
-            pass
+# ---------- Label prep ----------
 
 
-def load_hetero(path):
-    return torch.load(path, map_location="cpu", weights_only=False)
+def pad_bill_outcomes(data):
+    if "bill" not in data.node_types:
+        raise ValueError("Missing 'bill' node type.")
+    if not hasattr(data["bill"], "y"):
+        raise ValueError("data['bill'].y missing.")
+
+    y_raw = data["bill"].y.view(-1).long()
+    n = data["bill"].num_nodes
+
+    if y_raw.size(0) < n:
+        pad = torch.zeros(n - y_raw.size(0), dtype=torch.long)
+        y = torch.cat([y_raw, pad], dim=0)
+    else:
+        y = y_raw[:n]
+
+    mask = torch.zeros_like(y, dtype=torch.bool)
+    mask[: min(n, y_raw.size(0))] = True
+
+    data["bill"].y = y
+    data["bill"].y_mask = mask
 
 
-def ensure_bidirectional(data: HeteroData):
-    for s, r, t in list(data.edge_types):
-        e = data[(s, r, t)]
-        rev = (t, r + "_rev", s)
-        if rev not in data.edge_types:
-            if e.edge_index.numel() == 0:
-                data[rev].edge_index = e.edge_index.flip(0)
-            else:
-                src, dst = e.edge_index
-                data[rev].edge_index = torch.stack([dst, src], dim=0)
-                if (
-                    "edge_attr" in e
-                    and e.edge_attr is not None
-                    and e.edge_attr.size(0) == src.size(0)
-                ):
-                    data[rev].edge_attr = e.edge_attr.clone()
+def ensure_bill_topics(data, num_topics):
+    if not hasattr(data["bill"], "cluster"):
+        raise ValueError("data['bill'].cluster missing.")
+    t = data["bill"].cluster.view(-1).long()
+    n = data["bill"].num_nodes
+    if t.size(0) != n:
+        raise ValueError("bill.cluster length mismatch.")
+    valid = t[t >= 0]
+    if valid.numel() > 0 and (valid.min() < 0 or valid.max() >= num_topics):
+        raise ValueError("bill.cluster out of range.")
+    data["bill"].topic_id = t
+    data["bill"].has_topic = t >= 0
 
 
-def normalize_node_features(data):
-    for nt in data.node_types:
-        if "x" in data[nt]:
-            x = data[nt].x
-            if x is None or x.numel() == 0:
-                continue
-            if x.dtype not in (torch.float16, torch.float32, torch.float64):
-                continue
-            x = x.clone()
-            mask = torch.isfinite(x)
-            if not mask.all():
-                x[~mask] = 0.0
-            m = x.mean(0, keepdim=True)
-            v = x.var(0, unbiased=False, keepdim=True).clamp_min(1e-8)
-            data[nt].x = (x - m) / torch.sqrt(v)
+def attach_bill_version_labels(data, num_topics):
+    pad_bill_outcomes(data)
+    ensure_bill_topics(data, num_topics)
+
+    et = ("bill_version", "is_version", "bill")
+    if et not in data.edge_types:
+        raise ValueError("Missing ('bill_version','is_version','bill') edges.")
+
+    rel = data[et]
+    bv = rel.edge_index[0]
+    b = rel.edge_index[1]
+
+    num_bv = data["bill_version"].num_nodes
+    outcome_y = torch.zeros(num_bv, dtype=torch.long)
+    outcome_mask = torch.zeros(num_bv, dtype=torch.bool)
+    topic_id = torch.full((num_bv,), -1, dtype=torch.long)
+    has_topic = torch.zeros(num_bv, dtype=torch.bool)
+
+    by = data["bill"].y
+    by_mask = data["bill"].y_mask
+    bt = data["bill"].topic_id
+    b_has = data["bill"].has_topic
+
+    outcome_y[bv] = by[b]
+    outcome_mask[bv] = by_mask[b]
+    topic_id[bv] = bt[b]
+    has_topic[bv] = b_has[b]
+
+    data["bill_version"].outcome_y = outcome_y
+    data["bill_version"].outcome_mask = outcome_mask
+    data["bill_version"].topic_id = topic_id
+    data["bill_version"].has_topic = has_topic
 
 
-def get_edge_time_attr(data, etype, default_t=0.0):
-    try:
-        e = data[etype]
-        E = e.edge_index.size(1)
-        if "edge_attr" in e and e.edge_attr is not None and e.edge_attr.size(0) == E:
-            cols = MANUAL_EDGE_TCOLS.get(etype, None)
-            if cols is not None and len(cols) > 0:
-                return e.edge_attr[:, cols[0]].float()
-        for key in ("time", "timestamp", "date"):
-            if key in e:
-                v = e[key]
-                if isinstance(v, torch.Tensor) and v.numel() == E:
-                    return v.float()
-    except:
-        pass
-    return torch.full((data[etype].edge_index.size(1),), float(default_t))
+# ---------- Encoders ----------
 
 
-def build_time_slices(data):
-    caps_per_edge = 150000
-    cap_total = 600000
-    ts = []
-    for et in data.edge_types:
-        t = get_edge_time_attr(data, et)
-        if t.numel() == 0:
-            continue
-        t = t.detach().cpu().float()
-        n = t.numel()
-        if n > caps_per_edge:
-            idx = torch.randint(0, n, (caps_per_edge,))
-            t = t[idx]
-        ts.append(t)
-    if len(ts) == 0:
-        return [None]
-    all_t = torch.cat(ts)
-    if all_t.numel() > cap_total:
-        idx = torch.randint(0, all_t.numel(), (cap_total,))
-        all_t = all_t[idx]
-    arr = all_t.numpy()
-    qs = np.quantile(arr, np.linspace(0.0, 1.0, CFG.max_snapshots + 1))
-    return [(float(qs[s]), float(qs[s + 1])) for s in range(CFG.max_snapshots)]
-
-
-def filter_graph_by_time(data, time_window):
-    if time_window is None:
-        return data
-    lo, hi = time_window
-    out = HeteroData()
-    for nt in data.node_types:
-        out[nt].num_nodes = data[nt].num_nodes
-        for f in data[nt].keys():
-            out[nt][f] = data[nt][f]
-    for et in data.edge_types:
-        eidx = data[et].edge_index
-        if eidx.numel() == 0:
-            out[et].edge_index = eidx
-            for f in data[et].keys():
-                if f != "edge_index":
-                    out[et][f] = data[et][f]
-            continue
-        t = get_edge_time_attr(data, et)
-        if t.numel() == 0:
-            out[et].edge_index = eidx
-            for f in data[et].keys():
-                if f != "edge_index":
-                    out[et][f] = data[et][f]
-            continue
-        mask = (t >= lo) & (t <= hi)
-        keep = torch.where(mask)[0]
-        out[et].edge_index = eidx[:, keep]
-        for f in data[et].keys():
-            if f == "edge_index":
-                continue
-            val = data[et][f]
-            if isinstance(val, torch.Tensor) and val.size(0) == eidx.size(1):
-                out[et][f] = val[keep]
-            else:
-                out[et][f] = val
-    return out
-
-
-def per_type_laplacian_pe(data):
-    pe = {}
-    for nt in data.node_types:
-        pe[nt] = torch.zeros(data[nt].num_nodes, 0)
-    return pe
-
-
-class TypeLinear(nn.Module):
-    def __init__(self, in_dims, d, drop, pe_dims, base_embeds):
+class NodeEncoder(nn.Module):
+    def __init__(self, data, hidden_dim, dropout):
         super().__init__()
-        self.ts = list(in_dims.keys())
-        self.pe_dims = pe_dims
-        self.base = nn.ModuleDict(base_embeds)
-        self.lins = nn.ModuleDict(
-            {
-                t: nn.Sequential(
-                    nn.Linear(in_dims[t] + pe_dims.get(t, 0), d),
-                    nn.ReLU(),
-                    nn.Dropout(drop),
-                )
-                for t in self.ts
-            }
-        )
+        self.lins = nn.ModuleDict()
+        self.embeds = nn.ModuleDict()
+        self.norms = nn.ModuleDict()
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, batch, pedict):
-        out = {}
-        for t in self.ts:
-            if "x" in batch[t]:
-                x = batch[t].x
-            else:
-                n = batch[t].num_nodes
-                x = self.base[t](torch.arange(n, device=DEVICE))
-            pe = pedict.get(t, None)
-            if pe is not None:
-                if pe.size(0) != x.size(0):
-                    pe = torch.zeros(
-                        x.size(0), pe.size(1), device=x.device, dtype=x.dtype
-                    )
-                x = torch.cat([x, pe.to(x.device, dtype=x.dtype)], dim=-1)
-            lin0 = self.lins[t][0]
-            exp = lin0.in_features
-            cur = x.size(1)
-            if cur < exp:
-                pad = torch.zeros(x.size(0), exp - cur, device=x.device, dtype=x.dtype)
-                x = torch.cat([x, pad], dim=-1)
-            elif cur > exp:
-                x = x[:, :exp]
-            if x.size(0) == 0:
-                out[t] = torch.zeros(
-                    0, lin0.out_features, device=x.device, dtype=x.dtype
-                )
-            else:
-                out[t] = self.lins[t](x)
-        return out
-
-
-class RelAttnConv(nn.Module):
-    def __init__(self, d, n_heads=2, drop=0.1, edge_dim=0, time_dim=8):
-        super().__init__()
-        self.d = d
-        self.h = n_heads
-        self.dk = d // n_heads
-        self.drop = nn.Dropout(drop)
-        self.time_pe = nn.Linear(1, time_dim) if time_dim > 0 else None
-        self.rel_film = nn.ModuleDict()
-        self.rel_bias = nn.ParameterDict()
-        self.edge_dim = edge_dim
-        self.time_dim = time_dim
-
-    def _rel_params(self, key, device):
-        if key not in self.rel_film:
-            in_dim = self.edge_dim + (self.time_dim if self.time_dim > 0 else 0)
-            self.rel_film[key] = nn.Sequential(
-                nn.Linear(in_dim, self.d // 2),
-                nn.ReLU(),
-                nn.Linear(self.d // 2, 2 * self.d),
-            ).to(device)
-            self.rel_bias[key] = nn.Parameter(torch.zeros(self.h, device=device))
-
-    def forward(self, q, k, v, edge_index, edge_attr=None, edge_time=None, relkey=None):
-        if edge_index.numel() == 0 or q.size(0) == 0:
-            return torch.zeros_like(q)
-        device = q.device
-        dtype = q.dtype
-        self._rel_params(relkey, device)
-        src, dst = edge_index
-        Q = q.view(-1, self.h, self.dk).to(dtype)
-        K = k.view(-1, self.h, self.dk).to(dtype)
-        V = v.view(-1, self.h, self.dk).to(dtype)
-        out_acc = torch.zeros(q.size(0), self.h * self.dk, device=device, dtype=dtype)
-        step = CFG.msg_chunk_edges
-        rf = self.rel_film[relkey]
-        rb = self.rel_bias[relkey]
-
-        for start in range(0, src.numel(), step):
-            end = min(start + step, src.numel())
-            s = src[start:end]
-            d = dst[start:end]
-            qh = Q[d]
-            kh = K[s]
-            vh = V[s]
-
-            if edge_attr is not None or edge_time is not None:
-                feats = []
-                if edge_attr is not None:
-                    feats.append(edge_attr[start:end].to(device=device, dtype=dtype))
-                if edge_time is not None:
-                    t = edge_time[start:end].to(device).view(-1, 1).float()
-                    t = self.time_pe(t) if self.time_pe is not None else t
-                    feats.append(t.to(dtype))
-                if feats:
-                    feat = torch.cat(feats, dim=-1)
-                    gb = rf(feat).to(dtype)
-                    gamma, beta = gb.chunk(2, dim=-1)
-                    gamma = gamma.view(-1, self.h, self.dk).tanh()
-                    beta = beta.view(-1, self.h, self.dk).tanh()
-                    vh = vh * (1 + gamma) + beta
-
-            score = (qh * kh).sum(-1) / (self.dk**0.5) + rb.unsqueeze(0)
-            score = score.to(dtype)
-            att = torch.softmax(score, dim=0)
-            m = (att.unsqueeze(-1) * vh).reshape(-1, self.h * self.dk).to(dtype)
-            out_acc.index_add_(0, d, m)
-
-        return self.drop(out_acc)
-
-
-class RelationalAttnBackbone(nn.Module):
-    def __init__(self, metadata, d, layers, drop, edge_dims):
-        super().__init__()
-        self.node_types, self.edge_types = metadata
-        self.q_proj = nn.ModuleDict(
-            {nt: nn.Linear(d, d, bias=False) for nt in self.node_types}
-        )
-        self.k_proj = nn.ModuleDict(
-            {nt: nn.Linear(d, d, bias=False) for nt in self.node_types}
-        )
-        self.v_proj = nn.ModuleDict(
-            {nt: nn.Linear(d, d, bias=False) for nt in self.node_types}
-        )
-        self.o_proj = nn.ModuleDict(
-            {nt: nn.Linear(d, d, bias=True) for nt in self.node_types}
-        )
-        self.layers = nn.ModuleList()
-        for _ in range(layers):
-            layer = nn.ModuleDict()
-            for s, r, t in self.edge_types:
-                key = f"{s}|{r}|{t}"
-                e_dim = edge_dims.get((s, r, t), 0)
-                layer[key] = RelAttnConv(
-                    d, n_heads=2, drop=drop, edge_dim=e_dim, time_dim=8
-                )
-            self.layers.append(layer)
-        self.layer_drop = nn.Parameter(torch.tensor(0.15))
-
-    def forward(self, h, batch):
-        x = h
-        for layer in self.layers:
-            new = {nt: torch.zeros_like(x[nt]) for nt in x}
-            q = {nt: self.q_proj[nt](x[nt]) for nt in x}
-            k = {nt: self.k_proj[nt](x[nt]) for nt in x}
-            v = {nt: self.v_proj[nt](x[nt]) for nt in x}
-            for s, r, t in batch.edge_types:
-                key = f"{s}|{r}|{t}"
-                if key not in layer:
-                    continue
-                conv = layer[key]
-                e = batch[(s, r, t)]
-                eattr = (
-                    e.edge_attr
-                    if ("edge_attr" in e and e.edge_attr is not None)
-                    else None
-                )
-                etime = get_edge_time_attr(batch, (s, r, t)).to(x[s].device)
-                msg = conv(
-                    q[t],
-                    k[s],
-                    v[s],
-                    e.edge_index,
-                    edge_attr=eattr,
-                    edge_time=etime,
-                    relkey=key,
-                )
-                new[t] += F.relu(self.o_proj[t](msg))
-
-            if self.training and torch.rand(()) < self.layer_drop.sigmoid():
-                x = x
-            else:
-                x = new
-        return x
-
-
-class OutcomeHead(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d, d), nn.ReLU(), nn.Dropout(0.1), nn.Linear(d, 3)
-        )
-
-    def forward(self, bill_emb):
-        return self.mlp(bill_emb)
-
-
-class VoteHead(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * d, d), nn.ReLU(), nn.Dropout(0.1), nn.Linear(d, 3)
-        )
-
-    def forward(self, src, dst):
-        return self.mlp(torch.cat([src, dst], dim=-1))
-
-
-class GatekeepHead(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Linear(d, 2))
-
-    def forward(self, bv, cmte):
-        return self.mlp(torch.cat([bv, cmte], dim=-1))
-
-
-class ContrastiveProj(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.p = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d))
-
-    def forward(self, x):
-        return F.normalize(self.p(x), dim=-1)
-
-
-class ActorTopicHead(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.stance = nn.Sequential(nn.Linear(d, d), nn.Tanh(), nn.Linear(d, 1))
-        self.conf = nn.Sequential(
-            nn.Linear(d, d // 2), nn.ReLU(), nn.Linear(d // 2, 1), nn.Softplus()
-        )
-
-    def forward(self, actor_emb, topic_proto):
-        z = actor_emb * topic_proto
-        s = torch.tanh(self.stance(z)).squeeze(-1)
-        c = self.conf(z).squeeze(-1)
-        return s, c
-
-
-class InfluenceHead(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d, d // 2), nn.ReLU(), nn.Linear(d // 2, 1), nn.Softplus()
-        )
-
-    def forward(self, x):
-        return self.mlp(x).squeeze(-1)
-
-
-class TopicPrototypes(nn.Module):
-    def __init__(self, K, d):
-        super().__init__()
-        self.protos = nn.Parameter(F.normalize(torch.randn(K, d), dim=-1))
-
-    @torch.no_grad()
-    def set_from_embeddings(self, bill_cluster, bill_emb, K):
-        if bill_cluster is None or bill_emb is None:
-            return
-        e = F.normalize(bill_emb, dim=-1)
-        for t in range(K):
-            mask = bill_cluster == t
-            if mask.any():
-                self.protos.data[t] = F.normalize(e[mask].mean(0), dim=-1)
-            else:
-                self.protos.data[t] = F.normalize(self.protos.data[t], dim=-1)
-
-    def get(self):
-        return F.normalize(self.protos, dim=-1)
-
-
-class Model(nn.Module):
-    def __init__(self, data, d, layers, drop, pe, K):
-        super().__init__()
-        in_dims = {}
-        base_embeds = {}
         for nt in data.node_types:
-            if "x" in data[nt]:
-                in_dims[nt] = int(data[nt].x.size(1))
+            if hasattr(data[nt], "x"):
+                in_dim = data[nt].x.size(1)
+                self.lins[nt] = nn.Linear(in_dim, hidden_dim)
+                self.norms[nt] = nn.LayerNorm(hidden_dim)
             else:
-                in_dims[nt] = d
-                base_embeds[nt] = nn.Embedding(int(data[nt].num_nodes), d)
-        pe_dims = {
-            nt: (pe[nt].size(1) if (pe is not None and nt in pe) else 0)
-            for nt in data.node_types
-        }
-        self.enc = TypeLinear(in_dims, d, drop, pe_dims, base_embeds)
-        edge_dims = {}
-        for s, r, t in data.edge_types:
-            e = data[(s, r, t)]
-            edge_dims[(s, r, t)] = (
-                e.edge_attr.size(1)
-                if "edge_attr" in e and e.edge_attr is not None
-                else 0
-            )
-        self.backbone = RelationalAttnBackbone(
-            data.metadata(), d, layers, drop, edge_dims
-        )
-        self.outcome = OutcomeHead(d)
-        self.vote = VoteHead(d)
-        self.gatekeep = GatekeepHead(d)
-        self.cproj = ContrastiveProj(d)
-        self.actor_topic = ActorTopicHead(d)
-        self.influence = InfluenceHead(d)
-        self.d = d
-        self.pe = pe
-        self.pe_dims = pe_dims
-        self.topic_bank = TopicPrototypes(K, d)
-        self.actor_types = CFG.actor_types
+                self.embeds[nt] = nn.Embedding(data[nt].num_nodes, hidden_dim)
+                self.norms[nt] = nn.LayerNorm(hidden_dim)
 
     def forward(self, batch):
-        pedict = {}
+        h = {}
         for nt in batch.node_types:
-            exp = self.pe_dims.get(nt, 0)
-            if exp > 0:
-                if (
-                    (self.pe is not None)
-                    and (nt in self.pe)
-                    and (self.pe[nt] is not None)
-                    and (self.pe[nt].numel() > 0)
-                ):
-                    if hasattr(batch[nt], "n_id"):
-                        idx = batch[nt].n_id.to(torch.long, non_blocking=True)
-                        pe_nt = self.pe[nt][idx.cpu()].to(DEVICE)
-                    else:
-                        pe_nt = self.pe[nt].to(DEVICE)
-                    if pe_nt.size(0) != batch[nt].num_nodes:
-                        pe_nt = torch.zeros(batch[nt].num_nodes, exp, device=DEVICE)
+            if nt in self.lins and hasattr(batch[nt], "x"):
+                x = batch[nt].x
+                h_nt = self.lins[nt](x)
+            elif nt in self.embeds:
+                if hasattr(batch[nt], "n_id"):
+                    idx = batch[nt].n_id
                 else:
-                    pe_nt = torch.zeros(batch[nt].num_nodes, exp, device=DEVICE)
-                pedict[nt] = pe_nt
-        h0 = self.enc(batch, pedict)
-        h = self.backbone(h0, batch)
+                    idx = torch.arange(
+                        batch[nt].num_nodes,
+                        device=self.embeds[nt].weight.device,
+                    )
+                h_nt = self.embeds[nt](idx)
+            else:
+                continue
+
+            h_nt = self.norms[nt](h_nt)
+            h[nt] = self.dropout(F.relu(h_nt))
+
         return h
 
 
-def _node_attr(batch, nt, key, expected_len):
-    if key not in batch[nt]:
-        return None
-    v = batch[nt][key]
-    if (
-        isinstance(v, torch.Tensor)
-        and v.size(0) != expected_len
-        and hasattr(batch[nt], "n_id")
+class HeteroSAGE(nn.Module):
+    def __init__(self, data, hidden_dim, num_layers, dropout):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dropout = nn.Dropout(dropout)
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        node_types, edge_types = data.metadata()
+
+        for _ in range(num_layers):
+            conv_dict = {}
+            for src, rel, dst in edge_types:
+                conv_dict[(src, rel, dst)] = SAGEConv(
+                    (hidden_dim, hidden_dim),
+                    hidden_dim,
+                    aggr="mean",
+                )
+            self.convs.append(HeteroConv(conv_dict, aggr="sum"))
+            self.norms.append(
+                nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in node_types})
+            )
+
+    def forward(self, x_dict, edge_index_dict):
+        h = x_dict
+        for layer in range(self.num_layers):
+            h = self.convs[layer](h, edge_index_dict)
+            for nt in h:
+                h_nt = self.norms[layer][nt](h[nt])
+                h[nt] = self.dropout(F.relu(h_nt))
+        return h
+
+
+# ---------- Latent modules ----------
+
+
+class TopicStanceModule(nn.Module):
+    def __init__(
+        self,
+        hidden_dim,
+        num_topics,
+        actor_types,
+        tau=3.0,
+        target_norm=0.3,
+        target_abs=0.3,
     ):
-        v = v[batch[nt].n_id]
-    return v
+        super().__init__()
+        self.actor_types = actor_types
+        self.tau = tau
+        self.target_norm = target_norm
+        self.target_abs = target_abs
+        self.proj = nn.ModuleDict(
+            {at: nn.Linear(hidden_dim, num_topics) for at in actor_types}
+        )
+
+    def forward(self, h_dict):
+        out = {}
+        for at in self.actor_types:
+            if at in h_dict:
+                logits = self.proj[at](h_dict[at])
+                out[at] = torch.tanh(logits / self.tau)
+        return out
+
+    def regularization(self, stance_dict):
+        total = 0.0
+        count = 0
+        for S in stance_dict.values():
+            if S.numel() == 0:
+                continue
+            mean_per_topic = S.mean(dim=0)
+            total = total + (mean_per_topic**2).mean()
+            l2 = S.pow(2).mean(dim=1)
+            total = total + ((l2 - self.target_norm) ** 2).mean()
+            mean_abs = S.abs().mean()
+            total = total + ((mean_abs - self.target_abs) ** 2)
+            count += 1
+        if count == 0:
+            return None
+        return total / count
 
 
-def outcome_loss(model, h, batch):
+class InfluenceModule(nn.Module):
+    def __init__(self, hidden_dim, actor_types):
+        super().__init__()
+        self.actor_types = actor_types
+        self.mlp = nn.ModuleDict()
+        for at in actor_types:
+            self.mlp[at] = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+    def forward(self, h_dict):
+        out = {}
+        for at in self.actor_types:
+            if at in h_dict:
+                v = self.mlp[at](h_dict[at]).squeeze(-1)
+                out[at] = F.softplus(v)
+        return out
+
+    def regularization(self, infl_dict):
+        vals = []
+        for v in infl_dict.values():
+            if v.numel() > 0:
+                vals.append(torch.log1p(v))
+        if not vals:
+            return None
+        all_v = torch.cat(vals, dim=0)
+        mean = all_v.mean()
+        std = all_v.std()
+        if std < 1e-6:
+            std = all_v.new_tensor(1.0)
+        reg_mean = mean.pow(2)
+        reg_std = (std - 1.0).pow(2)
+        return reg_mean + reg_std
+
+
+# ---------- Task heads ----------
+
+
+class BillOutcomeHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, h_bill):
+        return self.mlp(h_bill)
+
+
+class VoteHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * hidden_dim + 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, lt_h, bv_h, s_topic, i_lt):
+        x = torch.cat(
+            [
+                lt_h,
+                bv_h,
+                s_topic.unsqueeze(-1),
+                i_lt.unsqueeze(-1),
+                (s_topic * i_lt).unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return self.mlp(x)
+
+
+class EdgeAmountHead(nn.Module):
+    def __init__(self, in_dim=3):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, features):
+        return self.mlp(features).squeeze(-1)
+
+
+# ---------- Full model ----------
+
+
+class LegModel(nn.Module):
+    def __init__(self, data, cfg: CFG):
+        super().__init__()
+        self.cfg = cfg
+        self.node_encoder = NodeEncoder(data, cfg.hidden_dim, cfg.dropout)
+        self.gnn = HeteroSAGE(
+            data,
+            cfg.hidden_dim,
+            cfg.num_layers,
+            cfg.dropout,
+        )
+        self.topic_module = TopicStanceModule(
+            cfg.hidden_dim,
+            cfg.num_topics,
+            cfg.actor_types,
+            tau=3.0,
+            target_norm=0.3,
+            target_abs=0.3,
+        )
+        self.infl_module = InfluenceModule(cfg.hidden_dim, cfg.actor_types)
+        self.bill_head = BillOutcomeHead(cfg.hidden_dim)
+        self.vote_head = VoteHead(cfg.hidden_dim)
+        self.edge_head = EdgeAmountHead(in_dim=3)
+
+    def forward(self, batch):
+        x = self.node_encoder(batch)
+        h = self.gnn(x, batch.edge_index_dict)
+        stance = self.topic_module(h)
+        infl = self.infl_module(h)
+        return h, stance, infl
+
+
+def zero_loss_like(model):
+    p = next(model.parameters())
+    return p.new_zeros(())
+
+
+# ---------- Losses ----------
+
+
+def loss_bill_outcome(model, h, batch, cfg):
     if "bill" not in batch.node_types:
-        return torch.tensor(0.0, device=DEVICE)
-    y = _node_attr(batch, "bill", "y", h["bill"].size(0))
-    if y is None:
-        return torch.tensor(0.0, device=DEVICE)
-    y = y.to(DEVICE).long()
-    logits = model.outcome(h["bill"])
-    return F.cross_entropy(logits, y, ignore_index=-1)
+        return zero_loss_like(model)
+    node = batch["bill"]
+    if not hasattr(node, "y") or not hasattr(node, "y_mask"):
+        return zero_loss_like(model)
+
+    y = node.y.view(-1)
+    m = node.y_mask.view(-1)
+    if m.sum() == 0 or "bill" not in h:
+        return zero_loss_like(model)
+
+    logits = model.bill_head(h["bill"])
+    y3 = (y[m] + 1).clamp(0, 2)
+    return F.cross_entropy(logits[m], y3)
 
 
-def _paired_bill_bv_indices(batch):
-    if ("bill_version", "is_version", "bill") not in batch.edge_types:
-        return None
-    e = batch[("bill_version", "is_version", "bill")].edge_index
-    if e.numel() == 0:
-        return None
-    bv = e[0]
-    b = e[1]
-    n = min(bv.size(0), b.size(0))
-    return bv[:n], b[:n]
-
-
-def contrastive_loss(model, h, batch, tau):
-    if "bill" not in h or "bill_version" not in h:
-        return torch.tensor(0.0, device=DEVICE)
-    pairs = _paired_bill_bv_indices(batch)
-    if pairs is None:
-        return torch.tensor(0.0, device=DEVICE)
-    bv_idx, b_idx = pairs
-    if bv_idx.numel() < 2:
-        return torch.tensor(0.0, device=DEVICE)
-    a = model.cproj(h["bill_version"][bv_idx.to(DEVICE)])
-    b = model.cproj(h["bill"][b_idx.to(DEVICE)])
-    n = min(a.size(0), b.size(0), 4096)
-    a = a[:n]
-    b = b[:n]
-    sim = a @ b.t()
-    targets = torch.arange(n, device=DEVICE)
-    return 0.5 * (
-        F.cross_entropy(sim / tau, targets) + F.cross_entropy(sim.t() / tau, targets)
-    )
-
-
-def temporal_smooth_loss(h_prev, h_curr, keys):
-    if h_prev is None:
-        return torch.tensor(0.0, device=DEVICE)
-    ks = []
-    for k in keys:
-        if (
-            k in h_prev
-            and k in h_curr
-            and h_prev[k].size(0) > 0
-            and h_curr[k].size(0) > 0
-        ):
-            n = min(h_prev[k].size(0), h_curr[k].size(0))
-            ks.append(F.mse_loss(h_curr[k][:n], h_prev[k][:n]))
-    if len(ks) == 0:
-        return torch.tensor(0.0, device=DEVICE)
-    return torch.stack(ks).mean()
-
-
-def vote_loss(model, h, batch):
+def loss_vote_ce(model, h, stance, infl, batch, cfg):
     et = ("legislator_term", "voted_on", "bill_version")
     if et not in batch.edge_types:
-        return torch.tensor(0.0, device=DEVICE)
-    e = batch[et]
-    if e.edge_index.numel() == 0 or e.edge_attr is None:
-        return torch.tensor(0.0, device=DEVICE)
-    y = e.edge_attr[:, 0].to(DEVICE).long() + 1
-    logits = model.vote(
-        h["legislator_term"][e.edge_index[0]], h["bill_version"][e.edge_index[1]]
-    )
-    cw = torch.tensor([1.0, 0.6, 1.0], device=DEVICE)
-    return F.cross_entropy(logits, y, weight=cw)
+        return zero_loss_like(model)
+    rel = batch[et]
+    if rel.edge_attr is None or rel.edge_attr.size(0) == 0:
+        return zero_loss_like(model)
+
+    if "legislator_term" not in h or "bill_version" not in h:
+        return zero_loss_like(model)
+    if "legislator_term" not in stance or "legislator_term" not in infl:
+        return zero_loss_like(model)
+    if not (
+        hasattr(batch["bill_version"], "topic_id")
+        and hasattr(batch["bill_version"], "has_topic")
+    ):
+        return zero_loss_like(model)
+
+    lt = rel.edge_index[0]
+    bv = rel.edge_index[1]
+    vote = rel.edge_attr[:, -1].long()
+    tb = batch["bill_version"].topic_id[bv]
+    has_t = batch["bill_version"].has_topic[bv]
+
+    m = (vote != 0) & has_t
+    if m.sum() == 0:
+        return zero_loss_like(model)
+
+    lt = lt[m]
+    bv = bv[m]
+    v = vote[m]
+    topics = tb[m].clamp(min=0, max=cfg.num_topics - 1)
+
+    lt_h = h["legislator_term"][lt]
+    bv_h = h["bill_version"][bv]
+
+    S_lt = stance["legislator_term"][lt]
+    s_topic = S_lt[torch.arange(S_lt.size(0), device=S_lt.device), topics]
+    i_lt = infl["legislator_term"][lt]
+
+    logits = model.vote_head(lt_h, bv_h, s_topic, i_lt)
+    y3 = (v + 1).clamp(0, 2)
+    return F.cross_entropy(logits, y3)
 
 
-def gatekeep_labels(batch):
-    et = ("bill_version", "read", "committee")
+def loss_vote_orient(stance, batch, cfg):
+    et = ("legislator_term", "voted_on", "bill_version")
     if et not in batch.edge_types:
         return None
-    e = batch[et]
-    if e.edge_index.numel() == 0:
+    if "legislator_term" not in stance:
         return None
-    if "advance" in e:
-        return e
-    return None
-
-
-def gatekeep_loss(model, h, batch):
-    e = gatekeep_labels(batch)
-    if e is None:
-        return torch.tensor(0.0, device=DEVICE)
-    logits = model.gatekeep(
-        h["bill_version"][e.edge_index[0]], h["committee"][e.edge_index[1]]
-    )
-    y = e.advance.to(DEVICE).long()
-    return F.cross_entropy(logits, y)
-
-
-def actor_topic_signals(batch, h, topic_protos):
-    if ("legislator_term", "voted_on", "bill_version") not in batch.edge_types:
+    if not (
+        hasattr(batch["bill_version"], "topic_id")
+        and hasattr(batch["bill_version"], "has_topic")
+    ):
         return None
-    vote = batch[("legislator_term", "voted_on", "bill_version")]
-    pair = (
-        batch[("bill_version", "is_version", "bill")]
-        if ("bill_version", "is_version", "bill") in batch.edge_types
-        else None
-    )
-    if vote.edge_index.numel() == 0 or pair is None or pair.edge_index.numel() == 0:
+
+    rel = batch[et]
+    if rel.edge_attr is None or rel.edge_attr.size(0) == 0:
         return None
-    lt = vote.edge_index[0].to(DEVICE)
-    bv = vote.edge_index[1].to(DEVICE)
-    bv2b = torch.full(
-        (batch["bill_version"].num_nodes,), -1, device=DEVICE, dtype=torch.long
-    )
-    bv2b[pair.edge_index[0].to(DEVICE)] = pair.edge_index[1].to(DEVICE)
-    b = bv2b[bv]
-    keep = b >= 0
-    if keep.sum() == 0:
+
+    lt = rel.edge_index[0]
+    bv = rel.edge_index[1]
+    v = rel.edge_attr[:, -1].float()
+
+    tb = batch["bill_version"].topic_id[bv]
+    has_t = batch["bill_version"].has_topic[bv]
+
+    m = (v != 0) & has_t
+    if m.sum() == 0:
         return None
-    lt, b = lt[keep], b[keep]
-    vote_val = vote.edge_attr[:, 0].to(DEVICE).float()[keep]
-    cluster = _node_attr(batch, "bill", "cluster", h["bill"].size(0))
-    if cluster is None:
-        return None
-    topic = cluster.to(DEVICE).long()[b]
-    a_emb = h["legislator_term"][lt]
-    t_proto = topic_protos[topic]
-    y = vote_val.clamp(-1, 1)
-    w = vote_val.abs().clamp_min(0.3)
-    return a_emb, t_proto, y, w, lt, topic
+
+    lt = lt[m]
+    v = v[m]
+    topics = tb[m].clamp(min=0, max=cfg.num_topics - 1)
+
+    S_lt = stance["legislator_term"]
+    s_topic = S_lt[lt, topics]
+
+    margin = 0.05
+    prod = v * s_topic
+    viol = F.relu(margin - prod)
+    return viol.mean()
 
 
-def actor_topic_loss_new(model, batch, h, protos):
-    sig = actor_topic_signals(batch, h, protos)
-    if sig is None:
-        return torch.tensor(0.0, device=DEVICE)
-    a_emb, t_proto, y, w, lt, topic = sig
-    s, c = model.actor_topic(a_emb, t_proto)
-    reg = F.mse_loss(s, y, reduction="none")
-    reg = (reg * w).mean()
-    perm = torch.randperm(lt.size(0), device=DEVICE)
-    i, j = lt, lt[perm]
-    mask = (i == j) & (y != y[perm])
-    if mask.any():
-        diff = s[mask] - s[perm][mask]
-        sign = (y[mask] - y[perm][mask]).sign()
-        rank_loss = F.relu(1.0 - diff * sign).mean()
+def normalize_log_amount(amount):
+    log_amt = torch.log1p(torch.clamp(amount, min=0.0))
+    if log_amt.numel() == 0:
+        return log_amt
+    mean = log_amt.mean()
+    std = log_amt.std()
+    if std < 1e-6:
+        std = torch.tensor(1.0, device=log_amt.device)
+    return (log_amt - mean) / std
+
+
+def loss_donation(model, h, stance, infl, batch, cfg):
+    et = ("donor", "donated_to", "legislator_term")
+    if et not in batch.edge_types:
+        return zero_loss_like(model)
+    if "donor" not in stance or "legislator_term" not in stance:
+        return zero_loss_like(model)
+
+    rel = batch[et]
+    if rel.edge_attr is None or rel.edge_attr.size(0) == 0:
+        return zero_loss_like(model)
+
+    d = rel.edge_index[0]
+    lt = rel.edge_index[1]
+    amount = rel.edge_attr[:, 0].float()
+    m = amount > 0
+    if m.sum() == 0:
+        return zero_loss_like(model)
+
+    d = d[m]
+    lt = lt[m]
+    amount = amount[m]
+
+    S_d = stance["donor"][d]
+    S_lt = stance["legislator_term"][lt]
+    sim = (S_d * S_lt).mean(dim=-1)
+
+    i_d = infl.get("donor")
+    i_lt = infl.get("legislator_term")
+    if i_d is not None and i_lt is not None:
+        i_feat = i_d[d] + i_lt[lt]
     else:
-        rank_loss = torch.tensor(0.0, device=DEVICE)
-    return 0.7 * reg + 0.3 * rank_loss
+        i_feat = sim.new_zeros(sim.size(0))
+
+    feat = torch.stack([sim, i_feat, sim * i_feat], dim=-1)
+    target = normalize_log_amount(amount)
+    if target.numel() == 0:
+        return zero_loss_like(model)
+
+    pred = model.edge_head(feat)
+    return F.mse_loss(pred, target)
 
 
-def prepare_num_neighbors(data):
-    depth = CFG.layers
-    out = {}
+def loss_donation_orient(stance, batch, cfg):
+    et = ("donor", "donated_to", "legislator_term")
+    if et not in batch.edge_types:
+        return None
+    if "donor" not in stance or "legislator_term" not in stance:
+        return None
+
+    rel = batch[et]
+    if rel.edge_attr is None or rel.edge_attr.size(0) == 0:
+        return None
+
+    d = rel.edge_index[0]
+    lt = rel.edge_index[1]
+    amt = rel.edge_attr[:, 0].float()
+
+    m = amt > 0
+    if m.sum() == 0:
+        return None
+
+    d = d[m]
+    lt = lt[m]
+
+    S_d = stance["donor"][d]
+    S_lt = stance["legislator_term"][lt]
+    sim = (S_d * S_lt).mean(dim=-1)
+
+    viol = F.relu(-sim)
+    return viol.mean()
+
+
+def loss_lobby(model, h, stance, infl, batch, cfg):
+    total = None
+    count = 0
+
+    if "lobby_firm" in stance:
+        if (
+            "lobby_firm",
+            "lobbied",
+            "legislator_term",
+        ) in batch.edge_types and "legislator_term" in stance:
+            rel = batch[("lobby_firm", "lobbied", "legislator_term")]
+            if rel.edge_attr is not None and rel.edge_attr.size(0) > 0:
+                lf = rel.edge_index[0]
+                lt = rel.edge_index[1]
+                amount = rel.edge_attr[:, 0].float()
+                m = amount > 0
+                if m.sum() > 0:
+                    lf = lf[m]
+                    lt = lt[m]
+                    amount = amount[m]
+                    S_lf = stance["lobby_firm"][lf]
+                    S_lt = stance["legislator_term"][lt]
+                    sim = (S_lf * S_lt).mean(dim=-1)
+                    i_lf = infl.get("lobby_firm")
+                    i_lt = infl.get("legislator_term")
+                    if i_lf is not None and i_lt is not None:
+                        i_feat = i_lf[lf] + i_lt[lt]
+                    else:
+                        i_feat = sim.new_zeros(sim.size(0))
+                    feat = torch.stack([sim, i_feat, sim * i_feat], dim=-1)
+                    target = normalize_log_amount(amount)
+                    if target.numel() > 0:
+                        pred = model.edge_head(feat)
+                        val = F.mse_loss(pred, target)
+                        total = val if total is None else total + val
+                        count += 1
+
+        if (
+            "lobby_firm",
+            "lobbied",
+            "committee",
+        ) in batch.edge_types and "committee" in stance:
+            rel = batch[("lobby_firm", "lobbied", "committee")]
+            if rel.edge_attr is not None and rel.edge_attr.size(0) > 0:
+                lf = rel.edge_index[0]
+                cm = rel.edge_index[1]
+                amount = rel.edge_attr[:, 0].float()
+                m = amount > 0
+                if m.sum() > 0:
+                    lf = lf[m]
+                    cm = cm[m]
+                    amount = amount[m]
+                    S_lf = stance["lobby_firm"][lf]
+                    S_cm = stance["committee"][cm]
+                    sim = (S_lf * S_cm).mean(dim=-1)
+                    i_lf = infl.get("lobby_firm")
+                    i_cm = infl.get("committee")
+                    if i_lf is not None and i_cm is not None:
+                        i_feat = i_lf[lf] + i_cm[cm]
+                    else:
+                        i_feat = sim.new_zeros(sim.size(0))
+                    feat = torch.stack([sim, i_feat, sim * i_feat], dim=-1)
+                    target = normalize_log_amount(amount)
+                    if target.numel() > 0:
+                        pred = model.edge_head(feat)
+                        val = F.mse_loss(pred, target)
+                        total = val if total is not None else val
+                        count += 1
+
+    if count == 0:
+        return zero_loss_like(model)
+    return total / count
+
+
+def loss_lobby_orient(stance, batch, cfg):
+    if "lobby_firm" not in stance:
+        return None
+
+    losses = []
+
+    if (
+        "lobby_firm",
+        "lobbied",
+        "legislator_term",
+    ) in batch.edge_types and "legislator_term" in stance:
+        rel = batch[("lobby_firm", "lobbied", "legislator_term")]
+        if rel.edge_attr is not None and rel.edge_attr.size(0) > 0:
+            lf = rel.edge_index[0]
+            lt = rel.edge_index[1]
+            amt = rel.edge_attr[:, 0].float()
+            m = amt > 0
+            if m.sum() > 0:
+                lf = lf[m]
+                lt = lt[m]
+                S_lf = stance["lobby_firm"][lf]
+                S_lt = stance["legislator_term"][lt]
+                sim = (S_lf * S_lt).mean(dim=-1)
+                losses.append(F.relu(-sim).mean())
+
+    if (
+        "lobby_firm",
+        "lobbied",
+        "committee",
+    ) in batch.edge_types and "committee" in stance:
+        rel = batch[("lobby_firm", "lobbied", "committee")]
+        if rel.edge_attr is not None and rel.edge_attr.size(0) > 0:
+            lf = rel.edge_index[0]
+            cm = rel.edge_index[1]
+            amt = rel.edge_attr[:, 0].float()
+            m = amt > 0
+            if m.sum() > 0:
+                lf = lf[m]
+                cm = cm[m]
+                S_lf = stance["lobby_firm"][lf]
+                S_cm = stance["committee"][cm]
+                sim = (S_lf * S_cm).mean(dim=-1)
+                losses.append(F.relu(-sim).mean())
+
+    if not losses:
+        return None
+    return sum(losses) / len(losses)
+
+
+# ---------- Sampling / training / inference ----------
+
+
+def resolve_num_neighbors(data, cfg):
+    base = dict(cfg.num_neighbors)
     for et in data.edge_types:
-        dst = et[2]
-        budget = CFG.neigh_budgets.get(dst, [16, 8, 4])
-        if len(budget) < depth:
-            budget = budget + [budget[-1]] * (depth - len(budget))
-        elif len(budget) > depth:
-            budget = budget[:depth]
-        out[et] = budget
-    return out
-
-
-def subsample_edges_epoch(data: HeteroData, caps):
-    out = HeteroData()
-    for nt in data.node_types:
-        out[nt].num_nodes = data[nt].num_nodes
-        for f in data[nt].keys():
-            out[nt][f] = data[nt][f]
-    g = torch.Generator().manual_seed(torch.randint(0, 10_000, (1,)).item())
-    for et in data.edge_types:
-        e = data[et]
-        E = e.edge_index.size(1)
-        cap = caps.get(et, None)
-        if cap is None or E <= cap:
-            out[et] = e
+        if et in base:
             continue
-        idx = torch.randperm(E, generator=g)[:cap]
-        out[et].edge_index = e.edge_index[:, idx]
-        for k, v in e.items():
-            if k == "edge_index":
-                continue
-            if isinstance(v, torch.Tensor) and v.size(0) == E:
-                out[et][k] = v[idx]
-            else:
-                out[et][k] = v
-    return out
+        rev = (et[2], et[1], et[0])
+        if rev in base:
+            v = base[rev]
+            base[et] = [max(1, v[0] // 2)] * len(v)
+        else:
+            base[et] = [2, 2, 2]
+    return base
+
+
+def make_loader(data, cfg):
+    if cfg.input_type not in data.node_types:
+        raise ValueError(f"Input node type {cfg.input_type} not found in data.")
+    n_neighbors = resolve_num_neighbors(data, cfg)
+    input_nodes = (cfg.input_type, torch.arange(data[cfg.input_type].num_nodes))
+    return NeighborLoader(
+        data,
+        num_neighbors=n_neighbors,
+        input_nodes=input_nodes,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+    )
+
+
+def train_epoch(model, loader, optimizer, cfg):
+    model.train()
+    device = cfg.device
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in tqdm(loader):
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        h, stance, infl = model(batch)
+
+        l_bill = loss_bill_outcome(model, h, batch, cfg)
+        l_vote = loss_vote_ce(model, h, stance, infl, batch, cfg)
+        l_don = loss_donation(model, h, stance, infl, batch, cfg)
+        l_lobby = loss_lobby(model, h, stance, infl, batch, cfg)
+
+        stance_reg = model.topic_module.regularization(stance) if stance else None
+        infl_reg = model.infl_module.regularization(infl) if infl else None
+        vote_orient = loss_vote_orient(stance, batch, cfg)
+        don_orient = loss_donation_orient(stance, batch, cfg)
+        lob_orient = loss_lobby_orient(stance, batch, cfg)
+
+        loss = (
+            cfg.lambda_bill * l_bill
+            + cfg.lambda_vote * l_vote
+            + cfg.lambda_donation * l_don
+            + cfg.lambda_lobby * l_lobby
+        )
+
+        if stance_reg is not None:
+            loss = loss + cfg.lambda_stance_reg * stance_reg
+        if infl_reg is not None:
+            loss = loss + cfg.lambda_infl_reg * infl_reg
+        if vote_orient is not None:
+            loss = loss + cfg.lambda_vote_orient * vote_orient
+        if don_orient is not None:
+            loss = loss + cfg.lambda_money_orient * don_orient
+        if lob_orient is not None:
+            loss = loss + cfg.lambda_money_orient * lob_orient
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += float(loss.detach().cpu())
+        n_batches += 1
+
+        del batch, h, stance, infl
+        if device == "mps":
+            torch.mps.empty_cache()
+
+    return total_loss / max(n_batches, 1)
 
 
 @torch.no_grad()
-def infer_embeddings(model, data, bsz):
+def infer_all(model, data, cfg, batch_size=None):
     model.eval()
-    out_dtype = next(model.parameters()).dtype
-    embs = {}
-    for nt in CFG.infer_types:
-        if nt not in data.node_types:
+    device = cfg.device
+    model.to(device)
+    n_neighbors = resolve_num_neighbors(data, cfg)
+    if batch_size is None:
+        batch_size = min(cfg.batch_size, 4096)
+
+    embs, topic_pred, inf_pred, topic_infl = {}, {}, {}, {}
+
+    for nt in data.node_types:
+        num_nodes = data[nt].num_nodes
+        if num_nodes == 0:
             continue
-        embs[nt] = torch.zeros(
-            data[nt].num_nodes, model.d, device=DEVICE, dtype=out_dtype
-        )
-    for nt in CFG.infer_types:
-        if nt not in data.node_types:
-            continue
-        input_nodes = (nt, torch.arange(data[nt].num_nodes))
-        num_neighbors = {et: [-1] * CFG.layers for et in data.edge_types}
+
         loader = NeighborLoader(
             data,
-            input_nodes=input_nodes,
-            num_neighbors=num_neighbors,
-            batch_size=bsz,
+            num_neighbors=n_neighbors,
+            input_nodes=(nt, torch.arange(num_nodes)),
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=CFG.num_workers,
-            persistent_workers=False,
-            pin_memory=False,
+            num_workers=cfg.num_workers,
         )
-        for batch in tqdm(loader, desc=f"infer {nt}", leave=False):
-            batch = batch.to(DEVICE)
-            with torch.autocast(
-                device_type=DEVICE.type, dtype=torch.bfloat16, enabled=True
-            ):
-                h = model(batch)
-            gidx = batch[nt].n_id.to(DEVICE)
-            embs[nt][gidx] = h[nt].to(out_dtype)
-            del h, batch
-            gc.collect()
-            empty_cache_mps()
-    for nt in embs:
-        embs[nt] = F.normalize(embs[nt].float(), dim=-1).cpu().numpy()
-    return embs
 
+        out = torch.zeros((num_nodes, cfg.hidden_dim), dtype=torch.float32)
 
-def compute_topic_protos_from_full(data, emb):
-    if "bill" not in emb:
-        return torch.randn(1, CFG.d, device=DEVICE)
-    if "cluster" not in data["bill"]:
-        return torch.randn(1, CFG.d, device=DEVICE)
-    k = torch.as_tensor(data["bill"].cluster, dtype=torch.long, device=DEVICE)
-    e = torch.from_numpy(emb["bill"]).to(DEVICE).float()
-    K = int(torch.max(k).item()) + 1
-    protos = torch.zeros(K, e.size(1), device=DEVICE)
-    for t in range(K):
-        mask = k == t
-        if mask.any():
-            protos[t] = F.normalize(e[mask].mean(0), dim=-1)
-        else:
-            protos[t] = F.normalize(torch.randn_like(protos[t]), dim=-1)
-    return protos
+        for batch in loader:
+            batch = batch.to(device)
+            h, stance, infl = model(batch)
 
-
-def vote_loss_weight():
-    return 0.8
-
-
-def gatekeep_loss_weight():
-    return 0.6
-
-
-def train_one_snapshot(model, data, optimizer, sid, protos):
-    model.train()
-    caps = {
-        ("legislator_term", "voted_on", "bill_version"): 1200000,
-        ("bill_version", "read", "committee"): 40000,
-        ("donor", "donated_to", "legislator_term"): 2000,
-        ("lobby_firm", "lobbied", "committee"): 3000,
-        ("lobby_firm", "lobbied", "legislator_term"): 180,
-    }
-    data_e = subsample_edges_epoch(data, caps)
-    base_nt = "bill" if "bill" in data_e.node_types else list(data_e.node_types)[0]
-    input_nodes = (base_nt, torch.arange(data_e[base_nt].num_nodes))
-    num_neighbors = prepare_num_neighbors(data_e)
-    loader = NeighborLoader(
-        data_e,
-        input_nodes=input_nodes,
-        num_neighbors=num_neighbors,
-        batch_size=CFG.bsz,
-        shuffle=True,
-        num_workers=CFG.num_workers,
-        persistent_workers=False,
-        pin_memory=False,
-    )
-    prev = None
-    keys = [
-        "legislator_term",
-        "committee",
-        "donor",
-        "lobby_firm",
-        "bill",
-        "bill_version",
-    ]
-    total = 0.0
-    steps = 0
-    optimizer.zero_grad(set_to_none=True)
-    for step, batch in enumerate(
-        tqdm(loader, desc=f"snapshot {sid} train", leave=False)
-    ):
-        batch = batch.to(DEVICE, non_blocking=False)
-        with torch.autocast(
-            device_type=DEVICE.type, dtype=torch.bfloat16, enabled=True
-        ):
-            h = model(batch)
-            l_out = outcome_loss(model, h, batch) * CFG.lambda_outcome
-            l_vote = vote_loss(model, h, batch) * vote_loss_weight()
-            l_gate = gatekeep_loss(model, h, batch) * gatekeep_loss_weight()
-            l_ctr = (
-                contrastive_loss(model, h, batch, CFG.contrastive_tau)
-                * CFG.lambda_contrast
-            )
-            l_tmp = temporal_smooth_loss(prev, h, keys) * CFG.lambda_temporal
-            l_at = (
-                actor_topic_loss_new(model, batch, h, model.topic_bank.get())
-                * CFG.lambda_actor_topic
-            )
-            loss = (l_out + l_vote + l_gate + l_ctr + l_tmp + l_at) / ACCUM_STEPS
-        loss.backward()
-        if (step + 1) % ACCUM_STEPS == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-        total += loss.item() * ACCUM_STEPS
-        steps += 1
-        prev = {k: v.detach() for k, v in h.items()}
-        del h, batch
-        gc.collect()
-        empty_cache_mps()
-    return total / max(1, steps)
-
-
-@torch.no_grad()
-def infer_actor_topic_stance(model, data, emb, topic_protos, topk=10):
-    te = F.normalize(topic_protos, dim=-1)
-    outs = []
-    for at in CFG.actor_types:
-        if at not in emb:
-            continue
-        A = torch.from_numpy(emb[at]).to(DEVICE).float()
-        Z = A.unsqueeze(1) * te.unsqueeze(0)
-        Z2 = Z.view(-1, Z.size(-1))
-        s = torch.tanh(model.actor_topic.stance(Z2)).view(A.size(0), te.size(0))
-        c = model.actor_topic.conf(Z2).view(A.size(0), te.size(0))
-
-        top_idx = torch.topk(s, k=min(topk, s.size(1)), dim=1).indices
-        rows = []
-        for i in range(A.size(0)):
-            sel = top_idx[i]
-            for j in sel:
-                rows.append(
-                    [at, i, int(j), float(s[i, j].item()), float(c[i, j].item())]
-                )
-        outs.append(
-            pd.DataFrame(
-                rows,
-                columns=["actor_type", "actor_idx", "topic", "stance", "stance_conf"],
-            )
-        )
-    return (
-        pd.concat(outs, ignore_index=True)
-        if outs
-        else pd.DataFrame(
-            columns=["actor_type", "actor_idx", "topic", "stance", "stance_conf"]
-        )
-    )
-
-
-@torch.no_grad()
-def infer_influence(model, emb):
-    outs = []
-    for at in CFG.actor_types:
-        if at in emb:
-            x = torch.from_numpy(emb[at]).to(DEVICE).float()
-            I = model.influence(x).cpu().numpy()
-            outs.append(
-                pd.DataFrame(
-                    {
-                        "actor_type": at,
-                        "actor_idx": np.arange(x.size(0)),
-                        "influence": I,
-                    }
-                )
-            )
-    return (
-        pd.concat(outs, ignore_index=True)
-        if outs
-        else pd.DataFrame(columns=["actor_type", "actor_idx", "influence"])
-    )
-
-
-def build_actor_topic_outputs(final_graph, emb, save_prefix, topic_protos, model):
-    df = infer_actor_topic_stance(model, final_graph, emb, topic_protos, topk=10)
-    os.makedirs(CFG.save_dir, exist_ok=True)
-    df.to_parquet(
-        os.path.join(CFG.save_dir, f"{save_prefix}_actor_topic.parquet"), index=False
-    )
-
-
-def build_overall_influence_series(emb, save_prefix, model):
-    df = infer_influence(model, emb)
-    os.makedirs(CFG.save_dir, exist_ok=True)
-    df.to_parquet(
-        os.path.join(CFG.save_dir, f"{save_prefix}_overall_influence.parquet"),
-        index=False,
-    )
-
-
-@torch.no_grad()
-def calibrate_outcome_temperature(model, data):
-    if "bill" not in data.node_types:
-        return 1.0
-    input_nodes = ("bill", torch.arange(data["bill"].num_nodes))
-    loader = NeighborLoader(
-        data,
-        input_nodes=input_nodes,
-        num_neighbors={et: [-1] * CFG.layers for et in data.edge_types},
-        batch_size=4096,
-        shuffle=False,
-    )
-    logits = []
-    ys = []
-    model.eval()
-    for b in loader:
-        b = b.to(DEVICE)
-        with torch.autocast(
-            device_type=DEVICE.type, dtype=torch.bfloat16, enabled=True
-        ):
-            h = model(b)
-            y = _node_attr(b, "bill", "y", h["bill"].size(0))
-            if y is None:
+            if nt not in batch.node_types or nt not in h:
+                if device == "mps":
+                    torch.mps.empty_cache()
                 continue
-            logits.append(model.outcome(h["bill"]))
-            ys.append(y.to(DEVICE))
-    if not logits:
-        return 1.0
-    logits = torch.cat(logits)
-    y = torch.cat(ys).long()
-    T = torch.tensor(1.0, device=DEVICE, requires_grad=True)
-    opt = torch.optim.LBFGS([T], lr=0.1, max_iter=50)
 
-    def _closure():
-        opt.zero_grad()
-        loss = F.cross_entropy(logits / T, y)
-        loss.backward()
-        return loss
+            seed_n_id = batch[nt].n_id[: batch[nt].batch_size]
+            seed_h = h[nt][: batch[nt].batch_size].detach().cpu()
+            out[seed_n_id] = seed_h
 
-    opt.step(_closure)
-    return float(T.detach().cpu())
+            del batch, h, stance, infl, seed_h, seed_n_id
+            if device == "mps":
+                torch.mps.empty_cache()
+
+        embs[nt] = out
+
+    for at in cfg.actor_types:
+        if at in embs:
+            h_at = embs[at].to(device)
+            s = model.topic_module({at: h_at})
+            i = model.infl_module({at: h_at})
+            if at in s:
+                topic_pred[at] = s[at].detach().cpu()
+            if at in i:
+                inf_pred[at] = i[at].detach().cpu()
+            if at in s and at in i:
+                ti = i[at].unsqueeze(-1) * s[at]
+                topic_infl[at] = ti.detach().cpu()
+
+    model.to("cpu")
+    if device == "mps":
+        torch.mps.empty_cache()
+
+    return topic_pred, inf_pred, topic_infl
 
 
-def run_train(data_path, save_prefix="leginflu_v10"):
-    os.makedirs(CFG.save_dir, exist_ok=True)
-    data = load_hetero(data_path)
-    ensure_bidirectional(data)
-    normalize_node_features(data)
-    pe = per_type_laplacian_pe(data)
-    K = (
-        int(torch.max(data["bill"].cluster).item()) + 1
-        if "cluster" in data["bill"]
-        else 1
+# ---------- Diagnostics ----------
+
+
+@torch.no_grad()
+def _safe_corr(x, y):
+    x = x.view(-1).float()
+    y = y.view(-1).float()
+    m = torch.isfinite(x) & torch.isfinite(y)
+    x = x[m]
+    y = y[m]
+    if x.numel() < 3:
+        return float("nan")
+    x = x - x.mean()
+    y = y - y.mean()
+    xs = x.std()
+    ys = y.std()
+    if xs < 1e-8 or ys < 1e-8:
+        return float("nan")
+    x = x / xs
+    y = y / ys
+    return float((x * y).mean().item())
+
+
+@torch.no_grad()
+def _inspect_basic(topic_pred, inf_pred, topic_infl, actor_types):
+    print("\n=== BASIC DISTRIBUTIONS ===")
+    for at in actor_types:
+        if at in inf_pred:
+            p = inf_pred[at]
+            print(f"\n[{at}] influence:")
+            print("  shape:", tuple(p.shape))
+            print("  min/max:", float(p.min()), float(p.max()))
+            print("  mean/std:", float(p.mean()), float(p.std()))
+
+        if at in topic_pred:
+            T = topic_pred[at]
+            print(f"\n[{at}] topic stance:")
+            print("  shape:", tuple(T.shape))
+            print("  mean(|stance|):", float(T.abs().mean()))
+            print("  avg per-actor std:", float(T.std(dim=1).mean()))
+            print("  frac(|stance|>0.5):", float((T.abs() > 0.5).float().mean()))
+
+        if at in topic_infl:
+            TI = topic_infl[at]
+            print(f"\n[{at}] topic influence (i * stance):")
+            print("  shape:", tuple(TI.shape))
+            print("  mean:", float(TI.mean()))
+            print("  std:", float(TI.std()))
+            pos_frac = float((TI > 0).float().mean())
+            neg_frac = float((TI < 0).float().mean())
+            print("  frac(pos):", pos_frac, " frac(neg):", neg_frac)
+
+
+@torch.no_grad()
+def _check_non_collapse(topic_pred, inf_pred, topic_infl, actor_types):
+    print("\n=== NON-COLLAPSE CHECK ===")
+    for at in actor_types:
+        if at in inf_pred:
+            p = inf_pred[at]
+            uq = torch.unique(p.round(decimals=4))
+            print(f"[{at}] influence unique (rounded): {uq.numel()} values")
+
+        if at in topic_pred:
+            T = topic_pred[at]
+            uq_rows = torch.unique(T.round(decimals=3), dim=0)
+            print(f"[{at}] stance unique rows (rounded): {uq_rows.size(0)}")
+
+        if at in topic_infl:
+            TI = topic_infl[at]
+            uq_rows = torch.unique(TI.round(decimals=3), dim=0)
+            print(f"[{at}] topic influence unique rows (rounded): {uq_rows.size(0)}")
+
+
+@torch.no_grad()
+def _vote_alignment(data, topic_pred, inf_pred, num_topics):
+    print("\n=== VOTE ALIGNMENT CHECK ===")
+    if "legislator_term" not in topic_pred or "legislator_term" not in inf_pred:
+        print("missing legislator_term predictions, skip.")
+        return
+
+    et = ("legislator_term", "voted_on", "bill_version")
+    if et not in data.edge_types:
+        print("missing voted_on edges, skip.")
+        return
+
+    if not (
+        hasattr(data["bill_version"], "topic_id")
+        and hasattr(data["bill_version"], "has_topic")
+    ):
+        print("missing bill_version topic labels, skip.")
+        return
+
+    rel = data[et]
+    if rel.edge_attr is None or rel.edge_attr.size(0) == 0:
+        print("no vote edge_attr, skip.")
+        return
+
+    lt = rel.edge_index[0]
+    bv = rel.edge_index[1]
+    v = rel.edge_attr[:, -1].float()
+
+    tb = data["bill_version"].topic_id[bv]
+    has_t = data["bill_version"].has_topic[bv]
+
+    m = (v != 0) & has_t
+    if m.sum() == 0:
+        print("no usable votes, skip.")
+        return
+
+    lt = lt[m]
+    v = v[m]
+    topics = tb[m].clamp(min=0, max=num_topics - 1)
+
+    S_lt = topic_pred["legislator_term"]
+    I_lt = inf_pred["legislator_term"]
+
+    s_vals = S_lt[lt, topics]
+    i_vals = I_lt[lt]
+    vote_sign = torch.sign(v)
+
+    align_score = i_vals * s_vals
+    corr = _safe_corr(align_score, vote_sign)
+
+    yes_mean = (
+        float(align_score[vote_sign > 0].mean())
+        if (vote_sign > 0).any()
+        else float("nan")
     )
-    slices = build_time_slices(data)
-    if not slices:
-        slices = [None]
-    model = Model(data, CFG.d, CFG.layers, CFG.drop, pe, K).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.wd)
-    hist = []
-    full_graph = filter_graph_by_time(
-        data, slices[-1] if slices[0] is not None else None
+    no_mean = (
+        float(align_score[vote_sign < 0].mean())
+        if (vote_sign < 0).any()
+        else float("nan")
     )
-    with torch.no_grad():
-        emb_full = infer_embeddings(model, full_graph, bsz=min(4096, CFG.bsz))
-        protos = compute_topic_protos_from_full(full_graph, emb_full)
-        model.topic_bank.protos.data = protos
-    snap_ids = list(range(len(slices)))
-    for sid in tqdm(snap_ids, desc="snapshots"):
-        snap = filter_graph_by_time(
-            data, slices[sid] if slices[0] is not None else None
+
+    print("edges used:", int(m.sum().item()))
+    print("Pearson(align_score, vote_sign):", corr)
+    print("mean align_score | YES:", yes_mean)
+    print("mean align_score | NO:", no_mean)
+
+
+@torch.no_grad()
+def _donation_alignment(data, topic_pred):
+    print("\n=== DONATION ALIGNMENT CHECK ===")
+    if "donor" not in topic_pred or "legislator_term" not in topic_pred:
+        print("missing donor or legislator_term stance, skip.")
+        return
+
+    et = ("donor", "donated_to", "legislator_term")
+    if et not in data.edge_types:
+        print("no donated_to edges, skip.")
+        return
+    rel = data[et]
+    if rel.edge_attr is None or rel.edge_attr.size(0) == 0:
+        print("no donation edge_attr, skip.")
+        return
+
+    d = rel.edge_index[0]
+    lt = rel.edge_index[1]
+    amt = rel.edge_attr[:, 0].float()
+
+    m = amt > 0
+    if m.sum() == 0:
+        print("no positive donations, skip.")
+        return
+
+    d = d[m]
+    lt = lt[m]
+    amt = amt[m]
+
+    S_d = topic_pred["donor"][d]
+    S_lt = topic_pred["legislator_term"][lt]
+
+    sim = (S_d * S_lt).mean(dim=-1)
+    log_amt = torch.log1p(amt)
+
+    corr = _safe_corr(sim, log_amt)
+
+    print("edges used:", int(m.sum().item()))
+    print("Pearson(sim(donor, lt), log(amount)):", corr)
+
+
+@torch.no_grad()
+def _lobby_alignment(data, topic_pred):
+    print("\n=== LOBBY ALIGNMENT CHECK ===")
+    if "lobby_firm" not in topic_pred:
+        print("missing lobby_firm stance, skip.")
+        return
+
+    if (
+        "lobby_firm",
+        "lobbied",
+        "legislator_term",
+    ) in data.edge_types and "legislator_term" in topic_pred:
+        rel = data[("lobby_firm", "lobbied", "legislator_term")]
+        if rel.edge_attr is not None and rel.edge_attr.size(0) > 0:
+            lf = rel.edge_index[0]
+            lt = rel.edge_index[1]
+            amt = rel.edge_attr[:, 0].float()
+            m = amt > 0
+            if m.sum() > 0:
+                lf = lf[m]
+                lt = lt[m]
+                amt = amt[m]
+                S_lf = topic_pred["lobby_firm"][lf]
+                S_lt = topic_pred["legislator_term"][lt]
+                sim = (S_lf * S_lt).mean(dim=-1)
+                log_amt = torch.log1p(amt)
+                corr = _safe_corr(sim, log_amt)
+                print(" LF-LT Pearson(sim, log(amount)):", corr)
+
+    if (
+        "lobby_firm",
+        "lobbied",
+        "committee",
+    ) in data.edge_types and "committee" in topic_pred:
+        rel = data[("lobby_firm", "lobbied", "committee")]
+        if rel.edge_attr is not None and rel.edge_attr.size(0) > 0:
+            lf = rel.edge_index[0]
+            cm = rel.edge_index[1]
+            amt = rel.edge_attr[:, 0].float()
+            m = amt > 0
+            if m.sum() > 0:
+                lf = lf[m]
+                cm = cm[m]
+                amt = amt[m]
+                S_lf = topic_pred["lobby_firm"][lf]
+                S_cm = topic_pred["committee"][cm]
+                sim = (S_lf * S_cm).mean(dim=-1)
+                log_amt = torch.log1p(amt)
+                corr = _safe_corr(sim, log_amt)
+                print(" LF-CM Pearson(sim, log(amount)):", corr)
+
+
+def quick_diagnostics(data, topic_pred, inf_pred, topic_infl, cfg):
+    _inspect_basic(topic_pred, inf_pred, topic_infl, cfg.actor_types)
+    _check_non_collapse(topic_pred, inf_pred, topic_infl, cfg.actor_types)
+    _vote_alignment(data, topic_pred, inf_pred, cfg.num_topics)
+    _donation_alignment(data, topic_pred)
+    _lobby_alignment(data, topic_pred)
+
+
+# ---------- Entry ----------
+
+
+def run_training(data_path, pretrain_path=None):
+    cfg = CFG()
+    seed_all(42)
+
+    data = torch.load(data_path, weights_only=False)
+    data = ToUndirected()(data)
+    data = RemoveIsolatedNodes()(data)
+    attach_bill_version_labels(data, cfg.num_topics)
+
+    model = LegModel(data, cfg).to(cfg.device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    if pretrain_path is not None:
+        state_dict = torch.load(pretrain_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=False)
+
+    loader = make_loader(data, cfg)
+
+    for epoch in tqdm(range(1, cfg.epochs + 1)):
+        loss = train_epoch(model, loader, optimizer, cfg)
+        print(f"Epoch {epoch:03d} | Loss {loss:.4f}")
+
+    topic_pred, inf_pred, topic_infl = infer_all(model, data, cfg)
+
+    torch.save(model.state_dict(), "leg_model_final.pth")
+    torch.save(topic_pred, "topic_pred_final.pt")
+    torch.save(inf_pred, "influence_pred_final.pt")
+    torch.save(topic_infl, "topic_influence_final.pt")
+
+    return data, topic_pred, inf_pred, topic_infl
+
+
+def train_eval(pretrained=False):
+    if pretrained:
+        data, topic_pred, inf_pred, topic_infl = run_training(
+            "data5.pt", pretrain_path="leg_model_final.pth"
         )
-        for e in tqdm(range(CFG.epochs), desc=f"snapshot {sid} epochs", leave=False):
-            loss = train_one_snapshot(model, snap, opt, sid, protos)
-            hist.append({"snapshot": sid, "epoch": e, "loss": float(loss)})
-    pd.DataFrame(hist).to_parquet(
-        os.path.join(CFG.save_dir, f"{save_prefix}_train_hist.parquet"), index=False
-    )
-    final_graph = filter_graph_by_time(
-        data, slices[-1] if slices[0] is not None else None
-    )
-    emb = infer_embeddings(model, final_graph, bsz=min(4096, CFG.bsz))
-    topic_protos = compute_topic_protos_from_full(final_graph, emb)
-    T = calibrate_outcome_temperature(model, final_graph)
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "cfg": {
-                k: getattr(CFG, k)
-                for k in CFG.__dict__.keys()
-                if not k.startswith("__")
-            },
-            "temp": T,
-        },
-        os.path.join(CFG.save_dir, f"{save_prefix}_model.pt"),
-    )
-    torch.save(emb, os.path.join(CFG.save_dir, f"{save_prefix}_embeddings.pt"))
-    build_actor_topic_outputs(final_graph, emb, save_prefix, topic_protos, model)
-    build_overall_influence_series(emb, save_prefix, model)
-    return {
-        "model": os.path.join(CFG.save_dir, f"{save_prefix}_model.pt"),
-        "embeddings": os.path.join(CFG.save_dir, f"{save_prefix}_embeddings.pt"),
-        "hist": os.path.join(CFG.save_dir, f"{save_prefix}_train_hist.parquet"),
-    }
+    else:
+        data, topic_pred, inf_pred, topic_infl = run_training("data5.pt")
+    quick_diagnostics(data, topic_pred, inf_pred, topic_infl, CFG())
 
 
 if __name__ == "__main__":
-    outs = run_train("data5.pt", save_prefix="leginflu_v10")
-    print(json.dumps(outs, indent=2))
+    train_eval()
