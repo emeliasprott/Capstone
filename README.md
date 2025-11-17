@@ -60,7 +60,7 @@ Handles OCR and text extraction of Senate and Assembly Final Histories PDFs.
 
 | File                    | Description |
 | ----------------------- | -------------------------------------------------------------------- |
-| `LeGNN4.py`             | Full heterogeneous GNN architecture and training loop                |
+| `LeGNN5.py`             | Full heterogeneous GNN architecture and training loop                |
 | `preprocessing.ipynb`   | Pipeline to construct the heterogeneous graph                        |
 | `topic-embedding.ipynb` | Generates sentence-transformer embeddings for topics and text fields |
 | `combining.ipynb`       | Combines cleaned datasets from multiple sources                      |
