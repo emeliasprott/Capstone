@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:13-alpine
+    container_name: legislation_db
+    restart: always
+    environment:
+      POSTGRES_USER: legislation
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: legislation_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legislation -d legislation_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  etl:
+    build:
+      context: .
+      dockerfile: ./etl/Dockerfile
+    container_name: ca_legislation_etl
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_NAME: legislation_db
+      DB_USER: legislation
+      DB_PASSWORD: password
+    volumes:
+      - ./etl_data:/etl_data
+      - .legislation_data:/legislation_data
+    entrypoint:
+      ["/bin/bash", "-c", "/app/run_etl.sh"]
+
+volumes:
+  pg_data:

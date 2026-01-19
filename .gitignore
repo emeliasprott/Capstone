@@ -4,7 +4,6 @@ ca_leg/etl_data/temp
 ca_leg/legislation_data
 ca_leg/etl/*.xml
 .DS_Store
-docker-compose.yml
 calaccess
 pdf_parsing/*.csv
 pdf_parsing/*.pdf

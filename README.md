@@ -251,7 +251,6 @@ The dashboard integrates all cleaned data, model outputs, and derived metrics.
 
 ## Notes and Known Issues
 
-* The **2011 legislative SQL archive** is corrupted and excluded.
 * OCR introduces minor text errors in older PDFs; these are largely mitigated through cleaning.
 * The original Microsoft SQL schema was adapted for **PostgreSQL** compatibility.
 * Some lobbying disclosures list staffers instead of legislators; these were resolved via contextual matching where possible.

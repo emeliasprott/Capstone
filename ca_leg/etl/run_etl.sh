@@ -10,8 +10,10 @@ TEMP_DIR="/etl_data/temp"
 OUTPUT_DIR="/etl_data/LOB"
 mkdir -p "${TEMP_DIR}" "${OUTPUT_DIR}"
 
-# include both yearly and daily files from BATCH_DIR
-ZIP_FILES=$(ls "${BATCH_DIR}"/pubinfo_*.zip "${BATCH_DIR}"/pubinfo_daily_*.zip)
+# include yearly files, and daily files if they exist
+ZIP_FILES=$(ls "${BATCH_DIR}"/pubinfo_*.zip 2>/dev/null)
+# ZIP_FILES+=" $(ls "${BATCH_DIR}"/pubinfo_daily_*.zip 2>/dev/null || true)"
+# ZIP_FILES=$(echo "$ZIP_FILES" | xargs)  # remove extra whitespace
 
 # DATABASE CONNECTION
 PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -c "CREATE EXTENSION IF NOT EXISTS lo;"
@@ -46,9 +48,9 @@ for ZIP_FILE in ${ZIP_FILES}; do
     # default: try to extract 4-digit year
     YEAR=$(basename "${ZIP_FILE}" | grep -o '[0-9]\{4\}')
 
-    # if no 4-digit year and it's a daily file, force 2025
+    # if no 4-digit year and it's a daily file, force 2026
     if [[ -z "$YEAR" && "$(basename "${ZIP_FILE}")" == pubinfo_daily_*.zip ]]; then
-        YEAR=2025
+        YEAR=2026
     fi
 
     echo "Processing ${ZIP_FILE} as year ${YEAR}..."
