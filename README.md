@@ -60,12 +60,12 @@ Handles OCR and text extraction of Senate and Assembly Final Histories PDFs.
 
 | File                    | Description |
 | ----------------------- | -------------------------------------------------------------------- |
-| `LeGNN5.py`             | Full heterogeneous GNN architecture and training loop                |
+| `LeGNN4-5.py`             | Full heterogeneous GNN architecture and training loop                |
 | `preprocessing.ipynb`   | Pipeline to construct the heterogeneous graph                        |
-| `topic-embedding.ipynb` | Generates sentence-transformer embeddings for topics and text fields |
+| `topic-embedding-clustering.ipynb` | Generates sentence-transformer embeddings for topics and text fields |
 | `combining.ipynb`       | Combines cleaned datasets from multiple sources                      |
-| `comps.ipynb`           | Computes metrics used in the dashboard                               |
-| `eda1.html`             | Exploratory data analysis (static output)                            |
+| `comps.ipynb`           | Computes metrics used in the dashboard  |
+| `eda1.html`             | Exploratory data analysis |
 
 ---
 
@@ -94,6 +94,8 @@ All data sources are official, public, or historically archived. They include:
   * bill actions and referral paths
 
 #### CAL-ACCESS
+
+Raw campaign finance and lobbying activity data from [California Secretary of State, CAL-ACCESS](https://www.sos.ca.gov/campaign-lobbying/helpful-resources/raw-data-campaign-finance-and-lobbying-activity)
 
 * Campaign finance contributions
 * Lobbying registrations and expenditures
@@ -254,4 +256,3 @@ The dashboard integrates all cleaned data, model outputs, and derived metrics.
 * OCR introduces minor text errors in older PDFs; these are largely mitigated through cleaning.
 * The original Microsoft SQL schema was adapted for **PostgreSQL** compatibility.
 * Some lobbying disclosures list staffers instead of legislators; these were resolved via contextual matching where possible.
-* CAL-ACCESS data contains duplicated entities requiring extensive normalization.

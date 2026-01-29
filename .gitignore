@@ -5,8 +5,6 @@ ca_leg/legislation_data
 ca_leg/etl/*.xml
 .DS_Store
 calaccess/*
-!calaccess/CVR_LOBBY_DISCLOSURE_CD.csv
-!calaccess/LEXP_CD.csv
 pdf_parsing/*.csv
 FinalHistoryPDFs
 ca_leg/.python-version
@@ -47,3 +45,8 @@ raw_comps.ipynb
 outs/*
 subject_clusters.csv
 Untitled-*.py
+calaccess/*.csv
+comps.ipynb
+E-4_2010-2020-Internet-Version.csv
+LeGNN4.py
+Untitled-3.qmd

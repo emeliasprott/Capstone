@@ -999,62 +999,42 @@ def train(cfg):
 class Config:
     data_path: str = "data5.pt"
     out_dir: str = "dashboard/backend/data/outs"
-
     seed: int = 13
     device_preference: str = "mps"
     device: str = None
-
-    # model
     d_model: int = 128
     n_layers: int = 2
-    dropout: float = 0.12
+    dropout: float = 0.1
     actor_types: list = field(
         default_factory=lambda: ["legislator_term", "committee", "donor", "lobby_firm"]
     )
-
-    # optimization
     epochs: int = 10
     lr: float = 2e-4
     wd: float = 1e-3
     grad_clip: float = 1.0
     steps_per_epoch: int = 24
-
-    # sampling
     min_votes_per_batch = 8
     vote_edge_batch_size: int = 7500
     bill_batch_size: int = 1200
     actor_batch_size: int = 512
-
     num_neighbors_vote: list = field(default_factory=lambda: [14, 7])
     num_neighbors_bill: list = field(default_factory=lambda: [12, 8])
     num_neighbors_actor: list = field(default_factory=lambda: [20, 12])
-
-    # schedule (no split)
     vote_every: int = 1
     bill_every: int = 4
     vote_neg_ratio: float = 0.5
-
-    # losses
     vote_recon_weight: float = 1.0
     bill_outcome_weight: float = 0.35
     temp_smooth_weight: float = 0.10
     stance_l2: float = 1e-3
     influence_l1: float = 1e-4
-
-    # vote edge_attr interpretation
     vote_target_col: int = -1
-    vote_time_col: int = None  # set to int column index if a raw time column exists
-
-    # money
+    vote_time_col: int = None
     use_money_routing: bool = True
     money_amount_col: int = 0
-
-    # outputs
     export_after_train: bool = True
-    export_only = True
+    export_only: bool = True
     export_name: str = "actor_topic.parquet"
-
-    # stability
     standardize_x: bool = True
 
 
