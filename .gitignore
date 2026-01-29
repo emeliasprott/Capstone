@@ -4,9 +4,10 @@ ca_leg/etl_data/temp
 ca_leg/legislation_data
 ca_leg/etl/*.xml
 .DS_Store
-calaccess
+calaccess/*
+!calaccess/CVR_LOBBY_DISCLOSURE_CD.csv
+!calaccess/LEXP_CD.csv
 pdf_parsing/*.csv
-pdf_parsing/*.pdf
 FinalHistoryPDFs
 ca_leg/.python-version
 ca_leg/.legislation_data
@@ -32,6 +33,7 @@ clever.ipynb
 GNN/__pycache__
 __pycache__
 dashboard/backend
+dashboard/backend/*
 dashboard/rsconnect
 dashboard/shiny/data
 dashboard/shiny/rsconnect
@@ -44,4 +46,4 @@ automate
 raw_comps.ipynb
 outs/*
 subject_clusters.csv
-Untitled-1.py
+Untitled-*.py
