@@ -22,7 +22,6 @@
 - [Acknowledgments](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
 
 
-
 ## Project Overview
 
 This repository contains the core modeling and data-integration work for my computational social science capstone project that reconstructs the California legislative process as a temporal, heterogeneous graph and learns context-aware representations of bills, legislators, committees, donors, and lobbying firms using a self-supervised graph neural network (GNN).
