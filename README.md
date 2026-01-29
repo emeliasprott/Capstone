@@ -1,258 +1,221 @@
 # Decoding the California Legislative Process
 
-*A graph-based, self-supervised modeling system for understanding bills, stakeholders, and influence in California lawmaking.*
+## Table of Contents
 
-This repository contains the full pipeline for a computational social science capstone project that reconstructs the California legislative process as a heterogeneous graph and trains a graph neural network (GNN) to model procedural flow, policy similarity, and political influence.
+- [Project Overview](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Data Coverage and Sources](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Legislative Records (1980–2025)](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Senate and Assembly Final Histories (PDFs)](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Campaign Finance and Lobbying Data (CAL-ACCESS)](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Pipeline Overview](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Data Integration and Entity Resolution](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Graph Representation](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Node Types](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Edge Types and Semantics](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Features and Representations](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Graph Neural Network Model](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Model Characteristics](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+    - [Training Objective](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Outputs and Intended Use](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Limitations and Known Issues](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Notes on Reproducibility](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
+- [Acknowledgments](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
 
-The project integrates raw legislative data, historical PDFs, campaign finance and lobbying disclosures, and NLP embeddings to create a unified, machine-readable representation of how law is made in California.
 
-Links to external presentations summarizing intermediate project stages:
 
-* **Preliminary Data & EDA Overview:** [https://ca-leg-eda.my.canva.site/preliminary](https://ca-leg-eda.my.canva.site/preliminary)
-* **Full EDA Presentation:** [https://ca-leg-eda.my.canva.site](https://ca-leg-eda.my.canva.site)
-* **GNN Presentation:** [https://ca-leg-eda.my.canva.site/emelia-sprott](https://ca-leg-eda.my.canva.site/emelia-sprott)
+## Project Overview
 
----
+This repository contains the core modeling and data-integration work for my computational social science capstone project that reconstructs the California legislative process as a temporal, heterogeneous graph and learns context-aware representations of bills, legislators, committees, donors, and lobbying firms using a self-supervised graph neural network (GNN).
 
-## Overview of the Project Pipeline
+The project integrates multiple public data sources, including legislative archives, committee records extracted from historical PDFs, and campaign finance and lobbying disclosures, into a unified relational representation of how policy is written, amended, voted on, and influenced in California. Rather than treating legislation as a flat text corpus or a sequence of roll calls, the system explicitly models procedure, institutional structure, and stakeholder relationships.
 
-The repository is structured around five core phases:
+Supporting materials and presentations from intermediate project stages:
 
-1. **Data Collection and Extraction**
-2. **Data Cleaning, Standardization, and Integration**
-3. **Graph Construction with Node and Edge Types**
-4. **Self-Supervised GNN Development (PyTorch Geometric)**
-5. **Analysis and Dashboard for Insights**
+- **Preliminary Data & EDA Overview:** [https://ca-leg-eda.my.canva.site/preliminary](https://ca-leg-eda.my.canva.site/preliminary)
+- **Full EDA Presentation:** [https://ca-leg-eda.my.canva.site](https://ca-leg-eda.my.canva.site/)
+- **GNN Presentation:** [https://ca-leg-eda.my.canva.site/emelia-sprott](https://ca-leg-eda.my.canva.site/emelia-sprott)
 
-Each phase is implemented with reproducible notebooks, Python scripts, and R code.
 
----
 
-## Repository Structure
+## Data Coverage and Sources
 
-### `ca_leg/etl/` – Legislative Data ETL Pipeline
+### Legislative Records (1980–2025)
 
-These scripts process raw archives from the California Legislative Information system.
+- Sourced from [**California Legislative Information**](http://leginfo.legislature.ca.gov/) archives and daily update files
+- Includes bills, bill versions, actions, votes, committee referrals, and outcomes
+- The pipeline supports both historical archive files and daily legislative feeds
+- Earlier records (approximately 1980–2001) exhibit higher formatting inconsistency and missingness than later years
 
-| File              | Description |
-| ----------------- | --------------------------------------------------------------------- |
-| `Dockerfile`      | Creates the PostgreSQL container for loading `.dat` legislative files |
-| `run_etl.sh`      | Automated script to unzip raw archives and load them into SQL         |
-| `save-data.ipynb` | Exports cleaned SQL tables to CSV for downstream analysis             |
-| `xml_parse.ipynb` | Converts `.lob` XML files into JSON format                            |
+### Senate and Assembly Final Histories (PDFs)
 
-### `pdf_parsing/` – Final Histories Extraction
+- Approximately 25 years of Senate and Assembly Final Histories
+- Used to recover committee structures, rosters, and procedural information not reliably encoded in raw legislative files
+- PDFs are OCR-processed and cleaned prior to integration
+- Residual OCR noise is mitigated but not entirely eliminated
 
-Handles OCR and text extraction of Senate and Assembly Final Histories PDFs.
+### Campaign Finance and Lobbying Data (CAL-ACCESS)
 
-| File                    | Description |
-| ----------------------- | ------------------------------------------------------- |
-| `data-collection.ipynb` | Collects and parses PDFs from the past ~25 years        |
-| `text_cleaning.ipynb`   | Cleans OCR text and resolves formatting inconsistencies |
+- Raw campaign contribution and lobbying activity data from the [California Secretary of State & CAL-ACCESS](https://www.sos.ca.gov/campaign-lobbying/helpful-resources/raw-data-campaign-finance-and-lobbying-activity)
+- Includes donors, lobbying firms, expenditures, beneficiaries, and dates
+- Extensive entity standardization is applied to:
+    - normalize donor and firm names
+    - resolve legislators across terms
+    - match financial activity to the correct legislative recipients
 
-### `dashboard/shiny/` – Legislative Dashboard
 
-| File    |Description |
-| ------- | ---------------------------------------------------------------------------------------------- |
-| `app.R` | R Shiny dashboard for bill search, topic drilldown, funding analysis, and stakeholder insights |
 
-### Root Files
+## Pipeline Overview
 
-| File                    | Description |
-| ----------------------- | -------------------------------------------------------------------- |
-| `LeGNN4-5.py`             | Full heterogeneous GNN architecture and training loop                |
-| `preprocessing.ipynb`   | Pipeline to construct the heterogeneous graph                        |
-| `topic-embedding-clustering.ipynb` | Generates sentence-transformer embeddings for topics and text fields |
-| `combining.ipynb`       | Combines cleaned datasets from multiple sources                      |
-| `comps.ipynb`           | Computes metrics used in the dashboard  |
-| `eda1.html`             | Exploratory data analysis |
+The repository implements a multi-stage pipeline:
 
----
+1. **SQL Ingestion and Normalization**
+Legislative, financial, and lobbying records are ingested into a containerized PostgreSQL database that unifies records across all years.
+2. **PDF Parsing and Committee Reconstruction**
+Historical PDFs are parsed to reconstruct committee rosters, memberships, and institutional structure.
+3. **Entity Resolution and Standardization**
+Legislators, committees, donors, and firms are standardized across sources using rule-based cleaning, contextual matching, and similarity checks.
+4. **Feature and Embedding Preparation**
+Textual fields (e.g., bill digests, committee names, motion text) are converted into vector representations for downstream modeling.
+5. **Graph Construction**
+All entities and relationships are assembled into a heterogeneous, temporally ordered graph.
+6. **Self-Supervised GNN Training**
+A custom heterogeneous GNN is trained to learn relational embeddings without relying on labeled outcomes.
 
-## Detailed Explanation of the Entire Pipeline
 
-### I. Data Sources
 
-All data sources are official, public, or historically archived. They include:
+## Data Integration and Entity Resolution
 
-#### Legislative Information (1999–2025)
+A central challenge in this project is reconciling inconsistent, ambiguous, and typo-prone text fields across legislative records, PDFs, and financial disclosures.
 
-* Downloaded from **California Legislative Information** (leginfo.legislature.ca.gov)
-* Archives include `.dat` files, `.lob` XML files, committee records, bill versions, roll calls, and histories
-* Daily update feeds not included; the 2011 archive is corrupted and excluded
-* Data is extracted and standardized into a consistent SQL schema using Docker + PostgreSQL
+Key aspects of the integration methodology include:
 
-#### Senate and Assembly Final Histories
+- Canonicalization of legislator and committee names across chambers and terms
+- Construction of unified legislator–term records to prevent conflating identities across time
+- Multi-stage matching of lobbying beneficiaries and campaign expenditure targets using:
+    - exact and token-based matches
+    - chamber- and term-aware heuristics
+    - ranked fuzzy matching with confidence thresholds
+    - explicit tagging of match methods to track reliability
 
-* Approximately 25 years of PDFs
-* OCR processed using Adobe text recognition
-* Parsed to extract:
+This process produces cleaned, standardized linkages between financial activity and legislative actors that can be safely used in downstream modeling.
 
-  * committee rosters
-  * session summaries
-  * legislator names
-  * bill actions and referral paths
 
-#### CAL-ACCESS
+## Graph Representation
 
-Raw campaign finance and lobbying activity data from [California Secretary of State, CAL-ACCESS](https://www.sos.ca.gov/campaign-lobbying/helpful-resources/raw-data-campaign-finance-and-lobbying-activity)
+The legislative process is modeled as a heterogeneous graph in which nodes represent entities and edges represent institutional, procedural, and financial relationships. Temporal structure is preserved explicitly through bill versions, legislator terms, and dated interactions.
 
-* Campaign finance contributions
-* Lobbying registrations and expenditures
-* Donor and recipient entities
-* Standardized using:
+### Node Types
 
-  * Regex cleaning
-  * Fuzzy matching (Jaro, Levenshtein, token set ratios)
-  * Jaccard similarity
-  * spaCy sentence embeddings
+- **bill**
+A legislative measure as an abstract entity across its lifecycle.
+- **bill_version**
+A specific version of a bill, capturing amendments, procedural requirements, and text at a given point in time.
+- **legislator**
+A person-level identity node representing an individual legislator across their career.
+- **legislator_term**
+A legislator within a specific chamber and legislative term. This allows voting behavior, committee assignments, and financial relationships to vary over time without collapsing a legislator’s entire career into a single node.
+- **committee**
+A legislative committee in a given term and chamber.
+- **donor**
+An entity making campaign contributions.
+- **lobby_firm**
+A registered lobbying organization.
 
----
 
-### II. Data Cleaning and Integration
+### Edge Types and Semantics
 
-After collection, the data undergoes a multi-step integration process.
+Edges encode both structure and directionality. For most relationships, both forward and reverse edges are included to support symmetric message passing.
 
-#### Name and Entity Standardization
+Key relationships include:
 
-Across legislative archives, PDFs, and CAL-ACCESS, names appear inconsistently (e.g., "Asm. Smith", "Smith, John", "Assemblymember John Smith", initials, abbreviations).
+- **Versioning and procedure**
+    - `bill_version → bill` (version membership)
+    - `bill_version → bill_version` (temporal ordering of versions)
+- **Authorship and sponsorship**
+    - `legislator_term → bill_version` (authorship with role strength)
+    - Committee sponsorship where applicable
+- **Committee structure**
+    - `legislator_term → committee` (membership with positional attributes)
+    - `committee → bill / bill_version` (readings and referrals)
+- **Voting behavior**
+    - `legislator_term → bill_version` (votes with motion context and timestamps)
+- **Financial influence**
+    - `donor → legislator_term` (campaign contributions)
+    - `lobby_firm → legislator_term / committee` (lobbying activity)
+- **Identity linkage**
+    - `legislator_term → legislator` (same-person relationships across terms)
 
-Standardization methods include:
+This design allows the model to jointly reason about procedure, institutional roles, voting behavior, and financial relationships within a single relational structure.
 
-* Regular expression normalization
-* Removal of titles ("Sen.", "Asm.", "Rep.")
-* Conversion of `last, first` and `first last` to canonical form
-* NLP similarity scoring
-* Multi-source contextual checks (e.g., committee membership + vote patterns)
 
-#### Merging Across Sources
+## Features and Representations
 
-Merged tables include:
+Each node carries a mix of:
 
-* bill histories
-* bill versions and digests
-* final histories
-* legislator terms and district data
-* lobbying contacts
-* campaign finance donations
-* temporal relationships
+- **Text-derived features**
+Vector representations of bill digests, subjects, committee names, and motion text.
+- **Categorical encodings**
+Party affiliation, chamber, committee position, vote thresholds, sponsorship roles.
+- **Temporal attributes**
+Dates of actions, votes, versions, and financial transactions.
 
-Key challenges addressed:
+Text representations are used as input features, not as standalone outputs. The GNN learns higher-level embeddings that integrate text with relational and procedural context.
 
-* Multiple bill versions per session
-* Changing legislator names across terms
-* Missing or inconsistent committee names
-* OCR noise in older PDFs
-* Lobbying disclosures naming staffers instead of legislators
+## Graph Neural Network Model
 
----
+The heterogeneous graph is converted into a PyTorch Geometric `HeteroData` object and passed to a custom GNN architecture (`LeGNN4-5.py`).
 
-### III. Graph Construction
+### Model Characteristics
 
-The processed data is transformed into a heterogeneous graph representing California policymaking.
+- Relation-aware message passing across node and edge types
+- Type-specific transformations for heterogeneous features
+- Explicit handling of procedural order via version and action edges
+- Designed to scale to large, sparse graphs
 
-#### Nodes
+### Training Objective
 
-Nodes represent entities and actors:
+The model is trained in a self-supervised manner. Rather than relying on labeled ideological scores or outcomes, it learns representations by:
 
-* `bill`
-* `bill_version`
-* `legislator`
-* `legislator_term`
-* `committee`
-* `donor`
-* `lobby_firm`
+- reconstructing voting relationships,
+- aggregating procedural and financial signals across bill lifecycles,
+- encouraging consistency and smoothness across bill versions and actor roles.
 
-#### Edges
+This approach allows the model to learn meaningful structure directly from observed legislative behavior and institutional context.
 
-Edges encode relationships and legislative actions:
+## Outputs and Intended Use
 
-* Authorship (`legislator_term → bill_version`)
-* Committee referrals (`committee → bill_version`)
-* Bill version ordering (`bill_version → bill_version`)
-* Version–bill mapping (`bill_version → bill`)
-* Roll-call votes
-* Campaign contributions (`donor → legislator_term`)
-* Lobbying contacts (`lobby_firm → legislator_term`)
+Because of data size constraints, outputs are not distributed via GitHub. When run locally, the pipeline produces:
 
-#### Embeddings
+- A unified PostgreSQL database spanning all years and data sources
+- A relational graph representation of the legislative process
+- Learned embeddings for bills, legislators, committees, donors, and firms
 
-All textual components are embedded using sentence-transformers:
+These embeddings support downstream analysis such as:
 
-* bill digests
-* committee names
-* legislator names
-* donor and lobby firm names (where applicable)
+- policy similarity and clustering
+- procedural trajectory analysis
+- stakeholder alignment and influence mapping
+- institutional role analysis (e.g., committee gatekeeping)
 
-These embeddings support entity matching, semantic similarity, and GNN initialization.
+The system is designed for analysis and exploration, not for automated decision-making or policy prediction.
 
----
+## Limitations and Known Issues
 
-### IV. GNN Modeling (PyTorch Geometric)
+- Legislative data prior to approximately 2001 contains higher rates of missing or inconsistent records
+- OCR-derived text from older PDFs may contain residual errors
+- Lobbying disclosures sometimes reference staff or committees rather than individual legislators
+- Financial relationships are observational and should not be interpreted causally
 
-The graph is converted into a `HeteroData` object and passed to a custom heterogeneous GNN.
+## Notes on Reproducibility
 
-#### Architecture
+This repository documents methodology and modeling logic rather than serving as a lightweight, plug-and-play package. Full reproduction requires:
 
-* Relation-aware message passing layers
-* Type-specific linear transformations
-* Multi-layer aggregation across the graph
-* Encodes both structure and text features
+- access to large public data downloads
+- local database setup
+- significant compute and storage resources
 
-#### Training Objectives (Self-Supervised)
+Where possible, scripts are written to run end-to-end, but some steps (e.g., embedding generation) are intentionally modular.
 
-No labels are required.
-The model learns through:
+## Acknowledgments
 
-* Link reconstruction (predicting masked edges)
-* Feature denoising (reconstructing masked node features)
-* Contrastive learning (encouraging nodes in similar contexts to cluster together)
-* Topic alignment (integrating topic embeddings for semantic structure)
-
-#### Learned Representations
-
-The trained model embeds:
-
-* Bills by policy area and procedural similarity
-* Committees by issue domain and gatekeeping behavior
-* Legislators by voting patterns, authorship, and stakeholder networks
-* Donors and lobby firms by policy focus and alignment
-* Bill versions by semantic and procedural identity
-
-#### Downstream Uses
-
-Embeddings support:
-
-* Bill similarity search
-* Stakeholder alignment maps
-* Topic clusters
-* Influence modeling
-* Committee gatekeeping analysis
-* Legislative trajectory prediction
-* Dashboard-ready summaries
-
----
-
-### V. Dashboard and Analysis
-
-The R Shiny dashboard (`dashboard/shiny/app.R`) provides an interpretive layer over the trained embeddings.
-
-Features include:
-
-* Bill search via embedding similarity
-* Topic drilldowns with top bills, legislators, committees, donors, and lobby firms
-* County-level funding maps via shapefiles
-* Donor and lobby firm clustering
-* Legislator influence and topic alignment
-* Funding flows and partisan trends
-* Session-over-time metrics
-
-The dashboard integrates all cleaned data, model outputs, and derived metrics.
-
----
-
-## Notes and Known Issues
-
-* OCR introduces minor text errors in older PDFs; these are largely mitigated through cleaning.
-* The original Microsoft SQL schema was adapted for **PostgreSQL** compatibility.
-* Some lobbying disclosures list staffers instead of legislators; these were resolved via contextual matching where possible.
+This project relies entirely on public data sources provided by the California Legislature and the California Secretary of State. Any errors or interpretations are the responsibility of the author.
