@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os, math, gc, warnings, random, torch, numpy as np, pandas as pd
 from dataclasses import dataclass
 from torch import nn
@@ -38,7 +39,7 @@ class CFG:
     train_ratio = 0.8
     val_ratio = 0.1
     test_ratio = 0.1
-    topics_expected = 77
+    topics_expected = 67
     min_eff_votes = 5
     seed = 42
 
@@ -95,10 +96,6 @@ def brier(logits, target, C):
     return ((p - y) ** 2).mean()
 
 
-def idx_on(x, like):
-    return x.to(like.device).long()
-
-
 def macro_f1(logits, target):
     m = target.ge(0)
     if not m.any():
@@ -128,16 +125,20 @@ def attach_topics(data, expected=None):
     topic_ix = torch.full_like(raw, -1)
     topic_ix[mask] = torch.tensor([remap[int(v)] for v in raw[mask].tolist()])
     T = len(uniq)
+
     data["topic"].num_nodes = T
     src = topic_ix[mask]
     dst = torch.nonzero(mask, as_tuple=False).view(-1)
     data[("topic", "has", "bill")].edge_index = torch.stack([src, dst], 0)
     data[("topic", "has", "bill")].edge_attr = torch.ones(dst.numel(), 1)
+
     counts = torch.bincount(topic_ix[topic_ix >= 0], minlength=T).float()
     data["topic"].prev = (counts / counts.sum().clamp_min(1)).to(torch.float32)
     data["bill"].topic_ix = topic_ix
+
     if expected is not None and T != expected:
         print(f"[topic]={T}")
+
     return T, topic_ix
 
 
@@ -261,10 +262,12 @@ def build_in_dims(data):
 
 
 def build_version_to_bill(data):
+    if ("bill_version", "is_version", "bill") not in data.edge_types:
+        raise RuntimeError("Missing (bill_version, is_version, bill) edges for bv2b.")
     eb = data[("bill_version", "is_version", "bill")].edge_index
-    m = torch.zeros(data["bill_version"].num_nodes, dtype=torch.long)
-    m[eb[0]] = eb[1]
-    return m
+    m = torch.full((data["bill_version"].num_nodes,), -1, dtype=torch.long)
+    m[eb[0].long()] = eb[1].long()
+    return m  # CPU
 
 
 def split_indices(N, cfg, seed):
@@ -289,8 +292,8 @@ def cover_with_overrides(data, overrides, hops=2, default=0):
 def build_neighbor_caps(data):
     caps = {}
     caps[("legislator_term", "voted_on", "bill_version")] = [48, 24]
-    caps[("bill_version", "is_version", "bill")] = [2, 1]
-    caps[("bill_version", "priorVersion", "bill_version")] = [2, 1]
+    caps[("bill_version", "is_version", "bill")] = [1, 0]
+    caps[("bill_version", "priorVersion", "bill_version")] = [2, 0]
     caps[("bill_version", "read", "committee")] = [8, 4]
     caps[("legislator_term", "member_of", "committee")] = [8, 4]
     caps[("legislator_term", "wrote", "bill_version")] = [8, 4]
@@ -314,14 +317,17 @@ def make_num_neighbors(data, over):
 class Trainer:
     def __init__(self, data, cfg):
         self.cfg = cfg
+
         base = data.clone()
         base = ToUndirected()(base)
         base = RemoveIsolatedNodes()(base)
         for et in base.edge_types:
             base[et].edge_index = base[et].edge_index.long()
         self.data = base
+
         self.T, self.topic_ix = attach_topics(self.data, cfg.topics_expected)
         in_dims = build_in_dims(self.data)
+
         self.proj = Projector(in_dims, cfg.d).to(DEVICE)
         self.backbone = Backbone(self.data.metadata(), cfg.d, cfg.layers, cfg.drop).to(
             DEVICE
@@ -329,6 +335,7 @@ class Trainer:
         self.vote_head = VoteHead(cfg.d).to(DEVICE)
         self.out_head = OutcomeHead(cfg.d, cfg.outcome_classes).to(DEVICE)
         self.gate_head = GateHead(cfg.d).to(DEVICE)
+
         self.opt = torch.optim.AdamW(
             list(self.proj.parameters())
             + list(self.backbone.parameters())
@@ -338,8 +345,11 @@ class Trainer:
             lr=cfg.lr,
             weight_decay=cfg.wd,
         )
-        self.bv2b = build_version_to_bill(self.data)
+
+        self.bv2b = build_version_to_bill(self.data)  # CPU
+
         self.topic_emb = nn.Embedding(self.T, cfg.d).to(DEVICE)
+
         lt_train, lt_val, lt_test = split_indices(
             self.data["legislator_term"].num_nodes, cfg, cfg.seed + 1
         )
@@ -349,11 +359,13 @@ class Trainer:
         com_train, com_val, com_test = split_indices(
             self.data["committee"].num_nodes, cfg, cfg.seed + 3
         )
+
         self.split = {
             "lt": {"train": lt_train, "val": lt_val, "test": lt_test},
             "bill": {"train": bill_train, "val": bill_val, "test": bill_test},
             "committee": {"train": com_train, "val": com_val, "test": com_test},
         }
+
         self.vote_loader_train = self._build_vote_loader(
             self.split["lt"]["train"], shuffle=True
         )
@@ -366,13 +378,14 @@ class Trainer:
         self.gate_loader_val = self._build_gate_loader(
             self.split["committee"]["val"], shuffle=False
         )
+
         self.bill_ctx = None
         self.cached_bill_emb = None
 
     def _build_vote_loader(self, lt_nodes, shuffle):
         over = {}
         over[("legislator_term", "voted_on", "bill_version")] = [96, 48]
-        over[("bill_version", "is_version", "bill")] = [1, 0]
+        over[("bill_version", "is_version", "bill")] = [-1, -1]
         over[("bill_version", "priorVersion", "bill_version")] = [1, 1]
         over[("bill_version", "read", "committee")] = [16, 8]
         over[("legislator_term", "member_of", "committee")] = [16, 8]
@@ -396,7 +409,7 @@ class Trainer:
     def _build_gate_loader(self, committee_nodes, shuffle):
         over = {}
         over[("bill_version", "read", "committee")] = [16, 8]
-        over[("bill_version", "is_version", "bill")] = [1, 0]
+        over[("bill_version", "is_version", "bill")] = [-1, -1]
         over[("topic", "has", "bill")] = [96, 48]
         over[("legislator_term", "member_of", "committee")] = [8, 4]
         caps = cover_with_overrides(self.data, over, hops=2, default=0)
@@ -440,24 +453,27 @@ class Trainer:
         )
         all_bill = torch.zeros(self.data["bill"].num_nodes, self.cfg.d)
         all_committee = torch.zeros(self.data["bill"].num_nodes, self.cfg.d)
+
         for b in loader:
             h = self.encode_batch(b)
             all_bill[b["bill"].n_id.cpu()] = h["bill"].detach().cpu()
 
             if ("bill_version", "read", "committee") in b.edge_types:
                 r_src, r_dst = b[("bill_version", "read", "committee")].edge_index
-                r_src = idx_on(r_src, h["bill_version"])
-                r_dst = idx_on(r_dst, h["committee"])
+                r_src = r_src.to(DEVICE)
+                r_dst = r_dst.to(DEVICE)
+
                 bv_pool = scatter_mean(
                     h["committee"].index_select(0, r_dst),
                     r_src,
                     dim=0,
                     dim_size=h["bill_version"].size(0),
                 )
+
                 if ("bill_version", "is_version", "bill") in b.edge_types:
                     eb = b[("bill_version", "is_version", "bill")].edge_index
-                    eb0 = idx_on(eb[0], h["bill_version"])
-                    eb1 = idx_on(eb[1], h["bill"])
+                    eb0 = eb[0].to(DEVICE)
+                    eb1 = eb[1].to(DEVICE)
                     comm_bill = scatter_mean(
                         bv_pool.index_select(0, eb0),
                         eb1,
@@ -465,6 +481,7 @@ class Trainer:
                         dim_size=h["bill"].size(0),
                     )
                     all_committee[b["bill"].n_id.cpu()] = comm_bill.detach().cpu()
+
             del b, h
             gc.collect()
 
@@ -476,52 +493,68 @@ class Trainer:
         bill_margin = torch.zeros(self.data["bill"].num_nodes, device=DEVICE)
         nsteps = 0
         et = ("legislator_term", "voted_on", "bill_version")
+
         for batch in loader:
             h = self.encode_batch(batch)
-            et = ("legislator_term", "voted_on", "bill_version")
+
             if et not in batch.edge_types or batch[et].edge_index.numel() == 0:
                 del batch, h
                 continue
-            lt_i, bv_i = batch[et].edge_index
 
-            if ("bill_version", "is_version", "bill") in batch.edge_types:
-                eb = batch[("bill_version", "is_version", "bill")].edge_index
-                dev = eb.device
-                b_of = torch.full(
-                    (batch["bill_version"].num_nodes,), -1, dtype=torch.long, device=dev
-                )
-                b_of[eb[0].long()] = eb[1].long()
-                b_local = b_of[bv_i.to(dev)]
-            else:
+            if getattr(batch[et], "edge_attr", None) is None:
                 del batch, h
                 continue
 
-            m = b_local.ge(0)
+            lt_i, bv_i = batch[et].edge_index  # CPU
+            bv_global = batch["bill_version"].n_id[bv_i].long()  # CPU
+            bill_global = self.bv2b[bv_global]  # CPU
+
+            m = bill_global.ge(0)
             if not m.any():
                 del batch, h
                 continue
 
-            lt_idx = idx_on(lt_i[m], h["legislator_term"])
-            b_idx = idx_on(b_local[m], h["bill"])
+            lt_i = lt_i[m]
+            bill_global = bill_global[m]
+
+            bill_nid = batch["bill"].n_id.long()  # CPU
+            inv_bill = torch.full((self.data["bill"].num_nodes,), -1, dtype=torch.long)
+            inv_bill[bill_nid] = torch.arange(bill_nid.numel(), dtype=torch.long)
+
+            b_idx_local = inv_bill[bill_global]
+            m2 = b_idx_local.ge(0)
+            if not m2.any():
+                del batch, h
+                continue
+
+            lt_idx_local = lt_i[m2]  # CPU
+            b_idx_local = b_idx_local[m2]  # CPU
+            bill_global = bill_global[m2]  # CPU
+
+            # Targets
+            raw_full = batch[et].edge_attr[:, 0]  # CPU
+            raw = raw_full[m][m2]
+            target = remap_vote_targets(raw)
+            m_lbl = target.ge(0)
+            if not m_lbl.any():
+                del batch, h
+                continue
+
+            target = target[m_lbl].to(DEVICE)
+            lt_idx = lt_idx_local[m_lbl].to(DEVICE)
+            b_idx = b_idx_local[m_lbl].to(DEVICE)
+            bill_global_lbl = bill_global[m_lbl]  # CPU
 
             lt_h = h["legislator_term"].index_select(0, lt_idx)
             bill_h = h["bill"].index_select(0, b_idx)
-
-            t_idx_glob = self.topic_ix[batch["bill"].n_id[b_idx.cpu()]].clamp(min=0)
+            t_idx_glob = self.topic_ix[bill_global_lbl].clamp(min=0)
             topic_h = h["topic"].index_select(0, t_idx_glob.to(h["topic"].device))
 
-            raw = (
-                batch[et].edge_attr[:, 0]
-                if getattr(batch[et], "edge_attr", None) is not None
-                else torch.full((lt_i.size(0),), -1000)
-            )
-            target = remap_vote_targets(raw[m].to(h["bill"].device))
-
             logits = self.vote_head(lt_h, bill_h, topic_h)
-            target = remap_vote_targets(raw[m].to(DEVICE))
             loss = balanced_ce(logits, target, 3, self.cfg.ls) + 0.1 * brier(
                 logits, target, 3
             )
+
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(
@@ -531,144 +564,209 @@ class Trainer:
                 self.cfg.max_grad,
             )
             self.opt.step()
+
             with torch.no_grad():
                 p = F.softmax(logits, -1)
                 contrib = p[:, 2] - p[:, 0]
-                b_glob = batch["bill"].n_id[b_local[m]].cpu()
-                tmp = torch.zeros(self.data["bill"].num_nodes, device=DEVICE)
-                tmp.index_add_(0, b_glob.to(DEVICE), contrib)
+                tmp = torch.zeros_like(bill_margin)
+                tmp.index_add_(0, bill_global_lbl.to(DEVICE), contrib)
                 bill_margin += tmp
                 stats["loss_vote"] += float(loss.item())
                 nsteps += 1
+
             del batch, h, lt_h, bill_h, topic_h, logits, target
             gc.collect()
-        if nsteps > 0:
+
+        if nsteps == 0:
+            print("Warning: vote_pass saw no valid labeled vote edges.")
+        else:
             stats["loss_vote"] /= nsteps
+
         return stats, bill_margin.detach()
 
     def outcome_pass(self, bill_ids, bill_margin):
         stats = {"loss_out": 0.0, "out_f1": 0.0}
         N = bill_ids.numel()
+        if N == 0:
+            print("Warning: outcome_pass received empty bill_ids.")
+            return stats
+
+        tgt_all = getattr(self.data["bill"], "y", None)
+        if tgt_all is None:
+            print("Warning: data['bill'].y missing; skipping outcome head.")
+            return stats
+
+        steps = 0
         for s in range(0, N, self.cfg.bill_chunk):
-            idx = bill_ids[s : s + self.cfg.bill_chunk]
-            bill_h = self.cached_bill_emb[idx.cpu()].to(DEVICE)
-            topic_h = self.topic_emb.weight.index_select(
-                0, self.topic_ix[idx.cpu()].clamp(min=0).to(DEVICE)
-            )
-            comm_ctx = (
-                self.bill_ctx[idx.cpu()].to(DEVICE)
-                if self.bill_ctx is not None
-                else torch.zeros_like(bill_h)
-            )
+            idx = bill_ids[s : s + self.cfg.bill_chunk]  # CPU
+            bill_h = self.cached_bill_emb[idx].to(DEVICE)
+
+            topic_ids = self.topic_ix[idx].clamp(min=0)
+            topic_h = self.topic_emb(topic_ids.to(DEVICE))
+
+            if self.bill_ctx is not None:
+                comm_ctx = self.bill_ctx[idx].to(DEVICE)
+            else:
+                comm_ctx = torch.zeros_like(bill_h)
+
             margin = bill_margin[idx.to(DEVICE)].view(-1, 1)
+
             logits = self.out_head(bill_h, comm_ctx, topic_h, margin)
-            tgt = getattr(self.data["bill"], "y", None)
-            if tgt is None:
-                del bill_h, topic_h, comm_ctx, margin, logits
+
+            labels_raw = tgt_all[idx]
+            labels = remap_outcome_targets(labels_raw, self.cfg.outcome_classes)
+            m_lbl = labels.ge(0)
+            if not m_lbl.any():
+                del bill_h, topic_h, comm_ctx, margin, logits, labels
                 gc.collect()
                 continue
-            labels = remap_outcome_targets(
-                tgt[idx].to(DEVICE), self.cfg.outcome_classes
-            )
+
+            labels = labels[m_lbl].to(DEVICE)
+            logits_sub = logits[m_lbl]
+
             loss = balanced_ce(
-                logits, labels, self.cfg.outcome_classes, self.cfg.ls
-            ) + 0.1 * brier(logits, labels, self.cfg.outcome_classes)
+                logits_sub, labels, self.cfg.outcome_classes, self.cfg.ls
+            ) + 0.1 * brier(logits_sub, labels, self.cfg.outcome_classes)
+
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(
                 list(self.out_head.parameters()), self.cfg.max_grad
             )
             self.opt.step()
+
             with torch.no_grad():
                 stats["loss_out"] += float(loss.item())
-                stats["out_f1"] += float(macro_f1(logits, labels).item())
-            del bill_h, topic_h, comm_ctx, margin, logits, labels
+                stats["out_f1"] += float(macro_f1(logits_sub, labels).item())
+                steps += 1
+
+            del bill_h, topic_h, comm_ctx, margin, logits, labels, logits_sub
             gc.collect()
-        denom = max((N + self.cfg.bill_chunk - 1) // self.cfg.bill_chunk, 1)
-        stats["loss_out"] /= denom
-        stats["out_f1"] /= denom
+
+        if steps == 0:
+            print(
+                "Warning: outcome_pass found no labeled bills in the provided indices."
+            )
+            return stats
+
+        stats["loss_out"] /= steps
+        stats["out_f1"] /= steps
         return stats
 
     def gate_pass(self, loader):
         stats = {"loss_gate": 0.0}
-        n = 0
+        nsteps = 0
         et = ("bill_version", "read", "committee")
+
         for batch in loader:
             h = self.encode_batch(batch)
-            et = ("bill_version", "read", "committee")
+
             if et not in batch.edge_types or batch[et].edge_index.numel() == 0:
                 del batch, h
                 continue
-            bv_i, c_i = batch[et].edge_index
 
-            if ("bill_version", "is_version", "bill") in batch.edge_types:
-                eb = batch[("bill_version", "is_version", "bill")].edge_index
-                dev = eb.device
-                b_of = torch.full(
-                    (batch["bill_version"].num_nodes,), -1, dtype=torch.long, device=dev
-                )
-                b_of[eb[0].long()] = eb[1].long()
-                b_local = b_of[bv_i.to(dev)]
-            else:
-                del batch, h
-                continue
+            bv_i, c_i = batch[et].edge_index  # CPU
+            bv_global = batch["bill_version"].n_id[bv_i].long()
+            bill_global = self.bv2b[bv_global]
 
-            m = b_local.ge(0)
+            m = bill_global.ge(0)
             if not m.any():
                 del batch, h
                 continue
 
-            c_idx = idx_on(c_i[m], h["committee"])
-            b_idx = idx_on(b_local[m], h["bill"])
+            bv_i = bv_i[m]
+            c_i = c_i[m]
+            bill_global = bill_global[m]
+
+            bill_nid = batch["bill"].n_id.long()
+            inv_bill = torch.full((self.data["bill"].num_nodes,), -1, dtype=torch.long)
+            inv_bill[bill_nid] = torch.arange(bill_nid.numel(), dtype=torch.long)
+
+            b_idx_local = inv_bill[bill_global]
+            m2 = b_idx_local.ge(0)
+            if not m2.any():
+                del batch, h
+                continue
+
+            c_idx_local = c_i[m2]
+            b_idx_local = b_idx_local[m2]
+            bill_global = bill_global[m2]
+
+            c_idx = c_idx_local.to(DEVICE)
+            b_idx = b_idx_local.to(DEVICE)
 
             com_h = h["committee"].index_select(0, c_idx)
             bill_h = h["bill"].index_select(0, b_idx)
-
-            t_idx_glob = self.topic_ix[batch["bill"].n_id[b_idx.cpu()]].clamp(min=0)
+            t_idx_glob = self.topic_ix[bill_global].clamp(min=0)
             topic_h = h["topic"].index_select(0, t_idx_glob.to(h["topic"].device))
 
-            logits = self.gate_head(com_h, bill_h, topic_h)
             if getattr(batch[et], "edge_attr", None) is not None and batch[
                 et
-            ].edge_attr.size(0) == bv_i.size(0):
-                tgt = (
-                    batch[et]
-                    .edge_attr[m, 0]
-                    .long()
-                    .clamp(0, logits.size(-1) - 1)
-                    .to(DEVICE)
-                )
+            ].edge_attr.size(0) == batch[et].edge_index.size(1):
+                tgt_raw = batch[et].edge_attr[:, 0]
+                tgt = tgt_raw[m][m2].long()
+                tgt = tgt.clamp(0, self.gate_head.out.out_features - 1)
             else:
-                tgt = torch.zeros(logits.size(0), dtype=torch.long, device=DEVICE)
+                tgt = torch.zeros(com_h.size(0), dtype=torch.long)
+
+            m_lbl = tgt.ge(0)
+            if not m_lbl.any():
+                del batch, h, com_h, bill_h, topic_h, tgt
+                continue
+
+            tgt = tgt[m_lbl].to(DEVICE)
+            logits = self.gate_head(com_h[m_lbl], bill_h[m_lbl], topic_h[m_lbl])
+
             loss = balanced_ce(logits, tgt, logits.size(-1), self.cfg.ls)
+
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(
                 list(self.gate_head.parameters()), self.cfg.max_grad
             )
             self.opt.step()
+
             stats["loss_gate"] += float(loss.item())
-            n += 1
-            del batch, h, logits, tgt
+            nsteps += 1
+
+            del batch, h, com_h, bill_h, topic_h, tgt, logits
             gc.collect()
-        if n > 0:
-            stats["loss_gate"] /= n
+
+        if nsteps == 0:
+            print("Warning: gate_pass saw no valid training edges.")
+        else:
+            stats["loss_gate"] /= nsteps
+
         return stats
 
     def stance_legislator_term(self):
-        e = self.data[("legislator_term", "voted_on", "bill_version")]
+        et = ("legislator_term", "voted_on", "bill_version")
+        if et not in self.data.edge_types:
+            return torch.zeros(self.data["legislator_term"].num_nodes, self.T)
+
+        e = self.data[et]
+        if getattr(e, "edge_attr", None) is None:
+            return torch.zeros(self.data["legislator_term"].num_nodes, self.T)
+
         y = e.edge_attr[:, 0].float()
         bill = self.bv2b[e.edge_index[1]]
         topic = self.topic_ix[bill]
+
         m = topic.ge(0) & y.ne(0)
+        if not m.any():
+            return torch.zeros(self.data["legislator_term"].num_nodes, self.T)
+
         lt = e.edge_index[0][m]
         t = topic[m]
         v = y[m]
+
         Nlt = self.data["legislator_term"].num_nodes
         T = int(self.topic_ix.max().item() + 1)
+
         lin = lt * T + t
         num = scatter_add(v, lin, dim=0, dim_size=Nlt * T).view(Nlt, T)
         den = scatter_add(torch.ones_like(v), lin, dim=0, dim_size=Nlt * T).view(Nlt, T)
+
         stance = torch.zeros_like(num)
         m2 = den > 0
         stance[m2] = num[m2] / (den[m2] + 10.0)
@@ -677,15 +775,16 @@ class Trainer:
 
     def influence_inference(self):
         et = ("legislator_term", "voted_on", "bill_version")
-        e = self.data[et]
+        if et not in self.data.edge_types:
+            print("Warning: influence_inference no voted_on edges.")
+            return {
+                "edges": None,
+                "bill_margin": torch.zeros(self.data["bill"].num_nodes),
+            }
+
         caps = make_num_neighbors(self.data, build_neighbor_caps(self.data))
-        lt_all = []
-        bill_all = []
-        topic_all = []
-        yes_all = []
-        no_all = []
-        src = e.edge_index[0]
         idx_all = torch.arange(self.data["legislator_term"].num_nodes)
+
         loader = NeighborLoader(
             self.data,
             input_nodes=("legislator_term", idx_all),
@@ -696,61 +795,95 @@ class Trainer:
             pin_memory=False,
             persistent_workers=False,
         )
+
+        lt_all = []
+        bill_all = []
+        topic_all = []
+        yes_all = []
+        no_all = []
+
         for batch in loader:
             h = self.encode_batch(batch)
-            et = ("legislator_term", "voted_on", "bill_version")
+
             if et not in batch.edge_types or batch[et].edge_index.numel() == 0:
                 del batch, h
                 continue
-            lt_i, bv_i = batch[et].edge_index
 
-            if ("bill_version", "is_version", "bill") in batch.edge_types:
-                eb = batch[("bill_version", "is_version", "bill")].edge_index
-                dev = eb.device
-                b_of = torch.full(
-                    (batch["bill_version"].num_nodes,), -1, dtype=torch.long, device=dev
-                )
-                b_of[eb[0].long()] = eb[1].long()
-                b_local = b_of[bv_i.to(dev)]
-            else:
+            if getattr(batch[et], "edge_attr", None) is None:
                 del batch, h
                 continue
 
-            m = b_local.ge(0)
+            lt_i, bv_i = batch[et].edge_index  # CPU
+            bv_global = batch["bill_version"].n_id[bv_i].long()
+            bill_global = self.bv2b[bv_global]
+
+            m = bill_global.ge(0)
             if not m.any():
                 del batch, h
                 continue
 
-            lt_idx = idx_on(lt_i[m], h["legislator_term"])
-            b_idx = idx_on(b_local[m], h["bill"])
+            lt_i = lt_i[m]
+            bill_global = bill_global[m]
+
+            bill_nid = batch["bill"].n_id.long()
+            inv_bill = torch.full((self.data["bill"].num_nodes,), -1, dtype=torch.long)
+            inv_bill[bill_nid] = torch.arange(bill_nid.numel(), dtype=torch.long)
+
+            b_idx_local = inv_bill[bill_global]
+            m2 = b_idx_local.ge(0)
+            if not m2.any():
+                del batch, h
+                continue
+
+            lt_idx_local = lt_i[m2]
+            b_idx_local = b_idx_local[m2]
+            bill_global = bill_global[m2]
+
+            raw_full = batch[et].edge_attr[:, 0]
+            raw = raw_full[m][m2]
+            tgt = remap_vote_targets(raw)
+            m_lbl = tgt.ge(0)
+            if not m_lbl.any():
+                del batch, h
+                continue
+
+            lt_idx = lt_idx_local[m_lbl].to(DEVICE)
+            b_idx = b_idx_local[m_lbl].to(DEVICE)
+            bill_global_lbl = bill_global[m_lbl]
 
             lt_h = h["legislator_term"].index_select(0, lt_idx)
             bill_h = h["bill"].index_select(0, b_idx)
-
-            t_idx_glob = self.topic_ix[batch["bill"].n_id[b_idx.cpu()]].clamp(min=0)
+            t_idx_glob = self.topic_ix[bill_global_lbl].clamp(min=0)
             topic_h = h["topic"].index_select(0, t_idx_glob.to(h["topic"].device))
+
             logits = self.vote_head(lt_h, bill_h, topic_h)
             p = F.softmax(logits, -1).detach().cpu()
+
+            lt_all.append(batch["legislator_term"].n_id[lt_idx_local[m_lbl].cpu()])
+            bill_all.append(bill_global_lbl.cpu())
+            topic_all.append(t_idx_glob[m_lbl].cpu())
             yes_all.append(p[:, 2])
             no_all.append(p[:, 0])
-            lt_all.append(batch["legislator_term"].n_id[lt_i[m]].cpu())
-            gl_bv = batch["bill_version"].n_id[bv_i[m]].cpu()
-            bill_all.append(self.bv2b[gl_bv])
-            topic_all.append(self.topic_ix[self.bv2b[gl_bv]])
+
             del batch, h, lt_h, bill_h, topic_h, logits, p
             gc.collect()
+
         if len(lt_all) == 0:
+            print("Warning: influence_inference found no edges.")
             return {
                 "edges": None,
                 "bill_margin": torch.zeros(self.data["bill"].num_nodes),
             }
+
         lt_all = torch.cat(lt_all)
         bill_all = torch.cat(bill_all)
         topic_all = torch.cat(topic_all)
         p_yes = torch.cat(yes_all)
         p_no = torch.cat(no_all)
+
         bill_margin = torch.zeros(self.data["bill"].num_nodes)
         bill_margin.index_add_(0, bill_all, (p_yes - p_no))
+
         return {
             "edges": {
                 "lt": lt_all,
@@ -801,6 +934,7 @@ class Trainer:
             dn = self.data[("donor", "donated_to", "legislator_term")].edge_index
             dn_src, dn_dst = dn
             deg = torch.bincount(dn_dst, minlength=N_lt).clamp_min(1)
+
             nz = lt_topic_eng.nonzero(as_tuple=False)
             if nz.numel() > 0:
                 order = torch.argsort(dn_dst)
@@ -815,6 +949,7 @@ class Trainer:
                     s, e = int(ptr[a]), int(ptr[a + 1])
                     ids = dn_src_sorted[s:e]
                     dn_topic_eng[ids, t] += float(1.0 / max(1, int(deg[a].item())))
+
             nz = lt_topic_infl.nonzero(as_tuple=False)
             if nz.numel() > 0:
                 order = torch.argsort(dn_dst)
@@ -841,6 +976,7 @@ class Trainer:
             lb = self.data[("lobby_firm", "lobbied", "legislator_term")].edge_index
             lb_src, lb_dst = lb
             deg = torch.bincount(lb_dst, minlength=N_lt).clamp_min(1)
+
             nz = lt_topic_eng.nonzero(as_tuple=False)
             if nz.numel() > 0:
                 order = torch.argsort(lb_dst)
@@ -855,6 +991,7 @@ class Trainer:
                     s, e = int(ptr[a]), int(ptr[a + 1])
                     ids = lb_src_sorted[s:e]
                     lb_topic_eng[ids, t] += float(1.0 / max(1, int(deg[a].item())))
+
             nz = lt_topic_infl.nonzero(as_tuple=False)
             if nz.numel() > 0:
                 order = torch.argsort(lb_dst)
@@ -871,22 +1008,29 @@ class Trainer:
                     v = float(lt_topic_infl[a, t].item()) / max(1, int(deg[a].item()))
                     lb_topic_infl[ids, t] += v
 
-        if ("bill_version", "read", "committee") in self.data.edge_types and (
-            "bill_version",
-            "is_version",
-            "bill",
-        ) in self.data.edge_types:
+        if ("bill_version", "read", "committee") in self.data.edge_types:
             rd = self.data[("bill_version", "read", "committee")].edge_index
             bv, cm = rd
             b = self.bv2b[bv]
             t = self.topic_ix[b].clamp(min=0)
             c_topic_eng = torch.zeros(N_c, T)
             c_topic_infl = torch.zeros(N_c, T)
-            c_topic_eng.view(-1).index_add_(0, (cm * T + t), torch.ones_like(b).float())
-            b_deg = torch.bincount(b, minlength=N_bill).clamp_min(1)
-            share = (1.0 / b_deg[b]).float()
-            add = inf["bill_margin"][b.cpu()].to(torch.float32) * share.cpu()
-            c_topic_infl.view(-1).index_add_(0, (cm * T + t), add)
+
+            m = b.ge(0) & t.ge(0)
+            if m.any():
+                bv = bv[m]
+                cm = cm[m]
+                b = b[m]
+                t = t[m]
+
+                c_topic_eng.view(-1).index_add_(
+                    0, (cm * T + t), torch.ones_like(b).float()
+                )
+
+                b_deg = torch.bincount(b, minlength=N_bill).clamp_min(1)
+                share = (1.0 / b_deg[b]).float()
+                add = inf["bill_margin"][b.cpu()].to(torch.float32) * share.cpu()
+                c_topic_infl.view(-1).index_add_(0, (cm * T + t), add)
         else:
             c_topic_eng = torch.zeros(N_c, T)
             c_topic_infl = torch.zeros(N_c, T)
@@ -1008,7 +1152,10 @@ class Trainer:
             for a in range(A):
                 e = eng[a].numpy().astype(float)
                 W = e.sum()
-                ww = (e / W) if W > 0 else np.full(T, 1.0 / max(1, T))
+                if W > 0:
+                    ww = e / W
+                else:
+                    ww = np.full(T, 1.0 / max(1, T))
                 val = float((ww * tp * infl[a].numpy().astype(float)).sum())
                 out.append(
                     {
@@ -1036,12 +1183,17 @@ class Trainer:
         per_bill = [
             {
                 "bill_id": int(i),
-                "expected_margin": float(inf["bill_margin"][i].item()),
+                "expected_margin": (
+                    float(inf["bill_margin"][i].item())
+                    if inf["bill_margin"] is not None
+                    else 0.0
+                ),
                 "pivotal_actors": [],
                 "committee_bottlenecks": [],
             }
             for i in range(N_bill)
         ]
+
         if inf["edges"] is not None:
             lt_glob = inf["edges"]["lt"]
             bill_glob = inf["edges"]["bill"]
@@ -1060,9 +1212,11 @@ class Trainer:
                 per_bill[b]["pivotal_actors"] = [
                     {"actor_id": aid, "score": float(s)} for aid, s in top
                 ]
+
         per_bill_df = (
             pd.DataFrame(per_bill).sort_values("bill_id").reset_index(drop=True)
         )
+
         return {
             "per_bill": per_bill_df,
             "actor_topic": actor_topic_df,
@@ -1071,17 +1225,24 @@ class Trainer:
 
     def train(self, epochs=2):
         self.precompute_static()
+
         for ep in range(epochs):
             s1, bill_margin = self.vote_pass(self.vote_loader_train)
             bill_ids = self.split["bill"]["train"]
             s2 = self.outcome_pass(bill_ids.to(torch.long), bill_margin.detach())
             s3 = self.gate_pass(self.gate_loader_train)
+
             v_loss = s1.get("loss_vote", float("nan"))
             o_loss = s2.get("loss_out", float("nan"))
             o_f1 = s2.get("out_f1", float("nan"))
             g_loss = s3.get("loss_gate", float("nan"))
+
             print(
-                f"Epoch {ep+1}/{epochs}: vote_loss={v_loss:.4f} outcome_loss={o_loss:.4f} outcome_f1={o_f1:.4f} gate_loss={g_loss:.4f}"
+                f"Epoch {ep+1}/{epochs}: "
+                f"vote_loss={v_loss:.4f} "
+                f"outcome_loss={o_loss:.4f} "
+                f"outcome_f1={o_f1:.4f} "
+                f"gate_loss={g_loss:.4f}"
             )
 
         return
