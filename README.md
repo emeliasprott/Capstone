@@ -21,7 +21,6 @@
 - [Notes on Reproducibility](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
 - [Acknowledgments](https://www.notion.so/Decoding-the-California-Legislative-Process-2f7e716cc2478041907cfc3fd9de7013?pvs=21)
 
-
 ## Project Overview
 
 This repository contains the core modeling and data-integration work for my computational social science capstone project that reconstructs the California legislative process as a temporal, heterogeneous graph and learns context-aware representations of bills, legislators, committees, donors, and lobbying firms using a self-supervised graph neural network (GNN).
@@ -69,6 +68,7 @@ The repository implements a multi-stage pipeline:
 
 1. **SQL Ingestion and Normalization**
 Legislative, financial, and lobbying records are ingested into a containerized PostgreSQL database that unifies records across all years.
+*For more about the ETL process, see [here](ca_leg/README.md).*
 2. **PDF Parsing and Committee Reconstruction**
 Historical PDFs are parsed to reconstruct committee rosters, memberships, and institutional structure.
 3. **Entity Resolution and Standardization**
@@ -79,7 +79,6 @@ Textual fields (e.g., bill digests, committee names, motion text) are converted 
 All entities and relationships are assembled into a heterogeneous, temporally ordered graph.
 6. **Self-Supervised GNN Training**
 A custom heterogeneous GNN is trained to learn relational embeddings without relying on labeled outcomes.
-
 
 
 ## Data Integration and Entity Resolution
