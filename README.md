@@ -119,12 +119,9 @@ An entity making campaign contributions.
 - **lobby_firm**
 A registered lobbying organization.
 
-
 ### Edge Types and Semantics
 
 Edges encode both structure and directionality. For most relationships, both forward and reverse edges are included to support symmetric message passing.
-
-Key relationships include:
 
 - **Versioning and procedure**
     - `bill_version → bill` (version membership)
@@ -161,24 +158,21 @@ Text representations are used as input features, not as standalone outputs. The 
 
 ## Graph Neural Network Model
 
-The heterogeneous graph is converted into a PyTorch Geometric `HeteroData` object and passed to a custom GNN architecture (`LeGNN4-5.py`).
+The heterogeneous graph is converted into a PyTorch Geometric `HeteroData` object and passed to a custom GNN architecture (`LeGNN4-5.py`). The model is designed to jointly encode procedure, voting behavior, institutional structure, and financial relationships in a single learned representation.
 
 ### Model Characteristics
 
-- Relation-aware message passing across node and edge types
-- Type-specific transformations for heterogeneous features
-- Explicit handling of procedural order via version and action edges
-- Designed to scale to large, sparse graphs
+The core encoder is a multi-layer heterogeneous GraphSAGE variant with edge gating. Each node type is first projected into a shared latent space (d_model = 128) using a type-specific linear projection. Message passing is then performed separately for each edge type using an edge-gated aggregation mechanism: messages from source nodes are linearly transformed and, when edge attributes are present, modulated by a learned gate derived from those attributes. Messages are aggregated by mean over incoming edges. Residual connections and layer normalization are applied per node type at each layer to stabilize training across heterogeneous neighborhoods. To reflect legislative continuity, embeddings of adjacent bill versions are regularized to remain close in representation space, encouraging smooth temporal evolution rather than abrupt semantic shifts.
 
-### Training Objective
+On top of the shared encoder, the model learns topic-conditioned representations of political actors. For each actor type (legislator term, committee, donor, lobby firm) and each policy topic, the model predicts:
 
-The model is trained in a self-supervised manner. Rather than relying on labeled ideological scores or outcomes, it learns representations by:
+- Stance $\in [-1, 1]$, representing opposition versus support
+- Influence to pass $\geq 0$
+- Influence to fail $\geq 0$
 
-- reconstructing voting relationships,
-- aggregating procedural and financial signals across bill lifecycles,
-- encouraging consistency and smoothness across bill versions and actor roles.
+Influence to pass and influence to fail are modeled separately, allowing the model to distinguish actors who shape outcomes by advancing legislation from those who exert power by blocking it. Topic conditioning is implemented through learned topic embeddings concatenated with actor embeddings and passed through lightweight MLP heads.
 
-This approach allows the model to learn meaningful structure directly from observed legislative behavior and institutional context.
+Financial edge attributes (campaign donations and lobbying expenditures) are adjusted using CPI values and vote-year information to place all monetary amounts on a comparable real-value scale. These values are then log-transformed, standardized, and passed through smooth nonlinearities before being used to gate messages or weight influence contributions.
 
 ## Outputs and Intended Use
 
@@ -194,8 +188,6 @@ These embeddings support downstream analysis such as:
 - procedural trajectory analysis
 - stakeholder alignment and influence mapping
 - institutional role analysis (e.g., committee gatekeeping)
-
-The system is designed for analysis and exploration, not for automated decision-making or policy prediction.
 
 ## Limitations and Known Issues
 
