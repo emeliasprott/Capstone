@@ -164,7 +164,8 @@ ETL process complete.
 3. Rebuild and rerun using the commands in Section 6.
 
 Repeat until all batches are processed.
-
+> [!NOTE]
+> Once the sh portion of ETL is finished, the container holds a complete SQL database. This can be launched independently at any time to access all of the legislative data simultaneously.
 
 ## 8) Keep Docker Running and Run the Notebooks
 

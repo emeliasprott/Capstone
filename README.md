@@ -142,7 +142,6 @@ Edges encode both structure and directionality. For most relationships, both for
 
 This design allows the model to jointly reason about procedure, institutional roles, voting behavior, and financial relationships within a single relational structure.
 
-
 ## Features and Representations
 
 Each node carries a mix of:
@@ -154,25 +153,44 @@ Party affiliation, chamber, committee position, vote thresholds, sponsorship rol
 - **Temporal attributes**
 Dates of actions, votes, versions, and financial transactions.
 
-Text representations are used as input features, not as standalone outputs. The GNN learns higher-level embeddings that integrate text with relational and procedural context.
+Text representations are used as input features, not as standalone outputs. The GNN learns higher-level embeddings that integrate text with relational and procedural context. Monetary values are adjusted using CPI values to place all amounts on a comparable real-value scale.
 
 ## Graph Neural Network Model
 
-The heterogeneous graph is converted into a PyTorch Geometric `HeteroData` object and passed to a custom GNN architecture (`LeGNN4-5.py`). The model is designed to jointly encode procedure, voting behavior, institutional structure, and financial relationships in a single learned representation.
+The heterogeneous graph is converted into a PyTorch Geometric `HeteroData` object and passed to a custom GNN architecture (`LeGNN4-5.py`). The model is designed to learn a unified latent representation of legislative procedure, voting behavior, institutional roles, and financial activity, while producing interpretable, topic-conditioned measures of actor stance and influence.
 
 ### Model Characteristics
 
-The core encoder is a multi-layer heterogeneous GraphSAGE variant with edge gating. Each node type is first projected into a shared latent space (d_model = 128) using a type-specific linear projection. Message passing is then performed separately for each edge type using an edge-gated aggregation mechanism: messages from source nodes are linearly transformed and, when edge attributes are present, modulated by a learned gate derived from those attributes. Messages are aggregated by mean over incoming edges. Residual connections and layer normalization are applied per node type at each layer to stabilize training across heterogeneous neighborhoods. To reflect legislative continuity, embeddings of adjacent bill versions are regularized to remain close in representation space, encouraging smooth temporal evolution rather than abrupt semantic shifts.
+The core encoder is a multi-layer heterogeneous GraphSAGE variant with edge gating. Each node type is first projected into a shared latent space using a type-specific linear projection followed by normalization and dropout.
 
-On top of the shared encoder, the model learns topic-conditioned representations of political actors. For each actor type (legislator term, committee, donor, lobby firm) and each policy topic, the model predicts:
+For each edge type, messages are computed by transforming source node embeddings and (when present) modulating them with a learned gate derived from edge attributes. Messages are aggregated by mean over incoming edges, combined with a destination-node residual connection, and normalized per node type at each layer. This design allows the model to incorporate both relational structure and rich edge metadata while remaining stable across highly imbalanced neighborhoods.
 
-- Stance $\in [-1, 1]$, representing opposition versus support
-- Influence to pass $\geq 0$
-- Influence to fail $\geq 0$
+To reflect legislative continuity, embeddings of consecutive bill versions are regularized to remain close in representation space using a cosine-similarity smoothness loss, encouraging gradual semantic evolution across amendments rather than abrupt shifts.
 
-Influence to pass and influence to fail are modeled separately, allowing the model to distinguish actors who shape outcomes by advancing legislation from those who exert power by blocking it. Topic conditioning is implemented through learned topic embeddings concatenated with actor embeddings and passed through lightweight MLP heads.
+#### Topic Modeling and Bill Latents
 
-Financial edge attributes (campaign donations and lobbying expenditures) are adjusted using CPI values and vote-year information to place all monetary amounts on a comparable real-value scale. These values are then log-transformed, standardized, and passed through smooth nonlinearities before being used to gate messages or weight influence contributions.
+Each bill node is associated with a discrete policy topic label and, optionally, a learned soft topic mixture. When enabled, a lightweight MLP predicts a topic distribution over bills, trained with a label-smoothed cross-entropy loss. Additionally, the model learns two continuous latent attributes for each bill: ideological lean (stance bill takes on its topic) and salience (intensity). These bill latents are used as shared context in downstream modeling.
+
+Rather than predicting outcomes directly from the graph, the model learns low-rank actor–topic factors for political actors (legislator terms, donors, and lobbying firms). For each actor and topic, the model estimates:
+
+- Stance (real-valued, signed): degree of opposition versus support
+- Influence (non-negative): strength of the actor’s effect on outcomes
+
+Stance and influence are computed via a shared topic embedding matrix and actor-specific projections into a low-rank latent space, with additive topic and term-level biases. Separate projections are used for stance and influence, allowing actors to be strongly influential without being uniformly aligned. Influence is explicitly constrained to be positive, while stance is signed and scale-controlled.
+When bills have soft topic mixtures, expected stance and influence are computed as topic-weighted expectations, allowing uncertainty in bill classification to propagate through the model.
+
+#### Training
+
+Training alternates between multiple supervised and self-supervised objectives:
+
+- Vote direction loss: predicts yes / abstain / no votes using actor stance, bill lean, legislator–bill interaction terms, and vote-specific edge context
+- Expenditure stance loss: predicts whether donor expenditures support or oppose a bill
+- Expenditure amount loss: models log-scaled spending amounts as a function of bill salience, actor influence, stance magnitude, and contextual edge features
+- Bill topic loss (if included): predicts bill topic mixtures
+- Outcome auxiliary loss: predicts bill passage outcomes from aggregated actor signals
+- Temporal smoothness loss: enforces continuity across bill versions.
+
+Losses are scheduled across batches and edge types to avoid dominance by any single relation.
 
 ## Outputs and Intended Use
 

@@ -19,7 +19,7 @@ options(shiny.sanitize.errors = FALSE)
 # ----------------------------
 # Paths + lazy parquet loader
 # ----------------------------
-parquet_dir <- "../backend/data/outs"
+parquet_dir <- "data"
 lazy_cache <- new.env(parent = emptyenv())
 
 lazy_load <- function(key, loader) {
@@ -38,7 +38,7 @@ rdp <- function(fname) {
 
 get_counties <- function() {
     lazy_load("ca_counties", function() {
-        path <- "../backend/data/ca_counties.geojson"
+        path <- "data/ca_counties.geojson"
 
         read_sf(path) |>
             st_transform(4326)
@@ -162,12 +162,12 @@ landing_ui <- function() {
                     ),
                     div(
                         class = "stat-item",
-                        div(class = "stat-value", "20+"),
+                        div(class = "stat-value", "25+"),
                         div(class = "stat-label", "Years of Data")
                     ),
                     div(
                         class = "stat-item",
-                        div(class = "stat-value", "47,666"),
+                        div(class = "stat-value", "63,100"),
                         div(class = "stat-label", "Bills Analyzed")
                     )
                 )
@@ -217,10 +217,14 @@ regions_ui <- function() {
                 class = "page-description",
                 "County shading represents modeled legislative funding exposure on a percentile scale. ",
                 "Select a county to explore the top funders influencing that region."
+            ),
+            div(
+                class = "info-badge small regions", icon("info-circle"),
+                "Note: this data does not include ballot-specific funding, just reported campaign donations and lobbying activity."
             )
         ),
         div(
-            class = "content-grid",
+            class = "content-grid regions-grid",
             div(
                 class = "grid-main",
                 card(
@@ -237,9 +241,9 @@ regions_ui <- function() {
                 )
             ),
             div(
-                class = "grid-sidebar",
+                class = "grid-sidebar regions",
                 card(
-                    class = "detail-card",
+                    class = "detail-card county-detail-card",
                     div(
                         class = "card-header-custom",
                         h4("Top Funders"),
@@ -293,14 +297,10 @@ funding_ui <- function() {
             )
         ),
         card(
-            class = "data-card section-card-wide",
+            class = "data-card section-card-wide funders-card",
             div(
                 class = "card-header-custom",
-                h4("Complete Funding Records"),
-                div(
-                    class = "header-actions",
-                    span(class = "badge-count", "All transactions")
-                )
+                h4("Complete Funding Records")
             ),
             DTOutput("funders_dt")
         )
@@ -388,7 +388,7 @@ topics_ui <- function() {
                 plotOutput("topic_controversy_bar", height = 360)
             ),
             card(
-                class = "metric-card",
+                class = "metric-card hotspot-card",
                 div(
                     class = "card-header-custom",
                     h4(icon("crosshairs"), "Policy Hotspots"),
@@ -463,7 +463,7 @@ bills_ui <- function() {
             )
         ),
         card(
-            class = "results-card section-card-wide",
+            class = "results-card section-card-wide bills-card",
             div(
                 class = "card-header-custom",
                 h4("Search Results"),
@@ -521,7 +521,8 @@ ui <- page_fillable(
             class = "app-footer",
             div(
                 class = "footer-content",
-                p("California Legislative Insights Dashboard • Data updated through 2025"),
+                a(href = "https://github.com/emeliasprott/Capstone", "Learn more about how this works"),
+                p("Data updated through the end of 2025"),
                 p(class = "footer-meta", "Built with R Shiny")
             )
         )
@@ -709,7 +710,7 @@ server <- function(input, output, session) {
                 position = "bottomright",
                 labFormat = labelFormat(
                     transform = function(x) x * 100,
-                    suffix = "%ile"
+                    suffix = "%"
                 )
             )
     })
@@ -831,7 +832,7 @@ server <- function(input, output, session) {
             geom_vline(
                 xintercept = c(q50, q90),
                 linetype = "dashed",
-                color = "#d97706",
+                color = "#d2dd8b",
                 linewidth = 1,
                 alpha = 0.8
             ) +
@@ -840,7 +841,7 @@ server <- function(input, output, session) {
                 x = q50, y = Inf,
                 vjust = 1.3, hjust = -0.05,
                 label = "Median",
-                color = "#d97706",
+                color = "#d2dd8b",
                 fill = "white",
                 size = 3.8,
                 fontface = "bold",
@@ -850,8 +851,8 @@ server <- function(input, output, session) {
                 geom = "label",
                 x = q90, y = Inf,
                 vjust = 1.3, hjust = -0.05,
-                label = "90th %ile",
-                color = "#d97706",
+                label = "90th percentile",
+                color = "#d2dd8b",
                 fill = "white",
                 size = 3.8,
                 fontface = "bold",
@@ -900,11 +901,11 @@ server <- function(input, output, session) {
                 pageLength = 15,
                 scrollX = FALSE,
                 autoWidth = TRUE,
-                dom = "<'dt-top'Bf>t<'dt-bottom'lp>",
+                dom = "<'dt-top dt-top-split'Bf>t<'dt-bottom'lp>",
                 buttons = list(
                     list(
                         extend = "csv",
-                        text = "Download data",
+                        text = "<i class='fa-solid fa-download'></i> Download",
                         exportOptions = list(modifier = list(page = "all"))
                     )
                 )
@@ -1206,7 +1207,10 @@ server <- function(input, output, session) {
     })
 
     output$latest_conflict <- renderDT({
-        df <- rdp("latest_high_conflict.parquet")
+        df <- rdp("latest_high_conflict.parquet") %>%
+            select(`Topic`, `Total Funding`, `Relative Controversy`, `Pass Rate`, `Funding Percentile`) %>%
+            mutate(`Total Funding` = scales::dollar(round(`Total Funding`, 2)), `Relative Controversy` = scales::percent(`Relative Controversy`, scale = 100), `Pass Rate` = scales::percent(`Pass Rate`, scale = 1), `Funding Percentile` = scales::percent(`Funding Percentile`)) %>%
+            arrange(desc(`Funding Percentile`))
         datatable(
             df,
             rownames = FALSE,
@@ -1399,9 +1403,9 @@ server <- function(input, output, session) {
                 pageLength = 15,
                 scrollX = TRUE,
                 autoWidth = TRUE,
-                dom = "<'dt-top'B>t<'dt-bottom'lp>",
+                dom = "<'dt-top dt-top-right'B>t<'dt-bottom'lp>",
                 buttons = list(
-                    list(extend = "csv", text = "Download data")
+                    list(extend = "csv", text = "<i class='fa-solid fa-download'></i> Download")
                 )
             ),
             class = "display compact stripe"

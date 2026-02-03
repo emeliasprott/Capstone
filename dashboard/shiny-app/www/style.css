@@ -1,11 +1,12 @@
-/* ============================================
-   CALIFORNIA LEGISLATIVE INSIGHTS DASHBOARD
-   Modern, Professional Styling
-   ============================================ */
-
-/* ===== RESET & BASE ===== */
 * {
   box-sizing: border-box;
+}
+:root {
+  --Black: #020300;
+  --Dark-Khaki: #36311f;
+  --Stone-Brown: #59544b;
+  --Lavender-Grey: #7d8ca3;
+  --Sky-Reflection: #79a9d1;
 }
 
 html,
@@ -66,7 +67,7 @@ body {
 .brand-icon {
   width: 48px;
   height: 48px;
-  background: linear-gradient(135deg, #2c5f7d 0%, #3b82c5 100%);
+  background: linear-gradient(135deg, #405769 0%, var(--Sky-Reflection) 100%);
   border-radius: 12px;
   display: flex;
   align-items: center;
@@ -92,7 +93,7 @@ body {
 
 .brand-subtitle {
   font-size: 0.813rem;
-  color: #6b7280;
+  color: #586372;
   font-weight: 500;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -127,7 +128,7 @@ body {
 }
 
 .nav-item.active {
-  background: linear-gradient(135deg, #2c5f7d 0%, #3b82c5 100%);
+  background: linear-gradient(135deg, #405769 0%, var(--Sky-Reflection) 100%);
   color: white;
   font-weight: 600;
   box-shadow: 0 2px 8px rgba(44, 95, 125, 0.25);
@@ -152,7 +153,7 @@ body {
 }
 
 .landing-hero {
-  background: linear-gradient(135deg, #2c5f7d 0%, #3b82c5 100%);
+  background: linear-gradient(135deg, #405769 0%, var(--Sky-Reflection) 100%);
   border-radius: 16px;
   padding: 4rem 3rem;
   margin-bottom: 3rem;
@@ -261,13 +262,13 @@ body {
 .feature-card:hover {
   transform: translateY(-4px);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
-  border-color: #3b82c5;
+  border-color: var(--Sky-Reflection);
 }
 
 .card-icon {
   width: 56px;
   height: 56px;
-  background: linear-gradient(135deg, #3b82c5 0%, #2c5f7d 100%);
+  background: llinear-gradient(135deg, #405769, #79a9d1 100%);
   border-radius: 12px;
   display: flex;
   align-items: center;
@@ -282,7 +283,7 @@ body {
   font-size: 1.5rem;
   font-weight: 700;
   margin: 0;
-  color: #1a1a1a;
+  color: var(--Black);
 }
 
 .feature-card p {
@@ -329,7 +330,7 @@ body {
   font-family: "Outfit", sans-serif;
   font-size: 2.5rem;
   font-weight: 700;
-  color: #1a1a1a;
+  color: var(--Black);
   margin: 0 0 0.5rem 0;
   display: flex;
   align-items: center;
@@ -337,7 +338,7 @@ body {
 }
 
 .page-title i {
-  color: #3b82c5;
+  color: var(--Sky-Reflection);
 }
 
 .page-description {
@@ -411,7 +412,7 @@ body {
   align-items: center;
   gap: 0.5rem;
   background: #eff6ff;
-  color: #3b82c5;
+  color: var(--Sky-Reflection);
   padding: 0.5rem 0.875rem;
   border-radius: 6px;
   font-size: 0.875rem;
@@ -430,12 +431,18 @@ body {
   animation: fadeInUp 0.5s ease-in 0.1s both;
 }
 
+.regions-grid {
+  grid-template-columns: 1fr;
+}
+
 .grid-main {
   min-width: 0;
 }
 
 .grid-sidebar {
   min-width: 0;
+  align-self: start;
+  height: fit-content;
 }
 
 .metrics-grid {
@@ -452,18 +459,33 @@ body {
 /* ===== VISUALIZATIONS ===== */
 .viz-card {
   padding: 1.5rem;
+  overflow-x: hidden;
 }
 
 .viz-card .card-header-custom {
   padding: 0 0 1.5rem 0;
 }
 
+.viz-card .row {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.viz-card .row > [class*="col-"] {
+  padding-left: 0.75rem;
+  padding-right: 0.75rem;
+}
+
+.metric-card {
+  overflow-x: hidden;
+}
+
 /* ===== INSIGHT BOXES ===== */
 .insight-box {
-  background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+  background: linear-gradient(135deg, #e6ebc4 0%, #d2dd8b 100%);
   border-radius: 10px;
   padding: 1.5rem;
-  border: 1px solid #fbbf24;
+  border: 1px solid #cdda77;
   display: flex;
   gap: 1rem;
   margin-top: 1rem;
@@ -472,12 +494,12 @@ body {
 .insight-icon {
   width: 40px;
   height: 40px;
-  background: rgba(217, 119, 6, 0.2);
+  background: rgba(230, 235, 196, 0.2);
   border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #d97706;
+  color: #b9c56c;
   font-size: 20px;
   flex-shrink: 0;
 }
@@ -486,14 +508,14 @@ body {
   font-family: "Outfit", sans-serif;
   font-size: 1rem;
   font-weight: 700;
-  color: #78350f;
+  color: #363825;
   margin: 0 0 0.5rem 0;
 }
 
 .insight-content p {
   font-size: 0.875rem;
   line-height: 1.5;
-  color: #92400e;
+  color: #5e5f52;
   margin: 0;
 }
 
@@ -520,7 +542,10 @@ body {
   margin: 0 0 1rem 0;
 }
 
-/* ===== COUNTY SELECTION ===== */
+/* ===== REGIONS ===== */
+.info-badge.small.regions {
+  margin-top: 2.5%;
+}
 .selection-prompt {
   display: flex;
   align-items: center;
@@ -607,6 +632,26 @@ body {
   font-size: 0.938rem;
 }
 
+.dt-top {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.dt-top-split {
+  justify-content: space-between;
+}
+
+.dt-top-split .dataTables_filter {
+  margin-left: auto;
+}
+
+.dt-top-right {
+  justify-content: flex-end;
+}
+
 .dataTables_wrapper .dataTables_filter input {
   border: 1px solid #d1d5db;
   border-radius: 8px;
@@ -656,13 +701,14 @@ body {
 }
 
 .dataTables_wrapper .dataTables_paginate .paginate_button {
-  padding: 0.5rem 0.875rem;
+  padding: 0.35rem 0.65rem;
   margin: 0 0.125rem;
-  border-radius: 6px;
+  border-radius: 5px;
   border: 1px solid #e5e7eb;
   background: white;
   color: #4b5563 !important;
   font-weight: 500;
+  font-size: 0.8125rem;
 }
 
 .dataTables_wrapper .dataTables_paginate .paginate_button:hover {
@@ -678,24 +724,48 @@ body {
 }
 
 .dt-buttons {
-  margin-bottom: 1rem;
+  margin: 0;
 }
 
 .dt-button {
   background: linear-gradient(135deg, #2c5f7d 0%, #3b82c5 100%) !important;
   color: white !important;
   border: none !important;
-  padding: 0.625rem 1.25rem !important;
-  border-radius: 8px !important;
+  padding: 0.45rem 0.85rem !important;
+  border-radius: 6px !important;
   font-weight: 600 !important;
-  font-size: 0.875rem !important;
+  font-size: 0.8125rem !important;
   transition: all 0.2s ease !important;
   box-shadow: 0 2px 6px rgba(44, 95, 125, 0.2) !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 0.35rem !important;
 }
 
 .dt-button:hover {
   transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(44, 95, 125, 0.3) !important;
+}
+
+.dt-button i {
+  font-size: 0.75rem;
+}
+
+.county-detail-card {
+  height: auto !important;
+  max-height: none;
+}
+
+.funders-card {
+  min-height: 1500px;
+}
+
+.hotspot-card {
+  min-height: 500px;
+}
+
+.bills-card {
+  min-height: 1500px;
 }
 
 /* ===== BADGES ===== */
