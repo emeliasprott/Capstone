@@ -3,10 +3,26 @@
 }
 :root {
   --Black: #020300;
-  --Dark-Khaki: #36311f;
-  --Stone-Brown: #59544b;
-  --Lavender-Grey: #7d8ca3;
-  --Sky-Reflection: #79a9d1;
+  --sky-reflection: #72b5b3;
+  --sky-reflection-10: #4d9391;
+  --sky-reflection-20: #386b69;
+  --sky-reflection-30: #445050;
+  --sky-reflection-40: #828a8a;
+  --sky-reflection-50: #a1cecc;
+  --sky-reflection-60: #bcdcda;
+  --sky-reflection-70: #d7eae9;
+  --clr-primary-a0: #688882;
+  --clr-primary-a10: #56706b;
+  --clr-primary-a20: #455955;
+  --clr-primary-a30: #354340;
+  --clr-primary-a40: #252e2c;
+  --clr-primary-a50: #161a1a;
+  --clr-accent-a0: #88686e;
+  --clr-accent-a10: #70565b;
+  --clr-accent-a20: #594549;
+  --clr-accent-a30: #433537;
+  --clr-accent-a40: #2e2527;
+  --clr-accent-a50: #1b1617;
 }
 
 html,
@@ -26,7 +42,7 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  color: #1a1a1a;
+  color: var(--Black);
   background-color: #f8f9fa;
 }
 
@@ -67,7 +83,11 @@ body {
 .brand-icon {
   width: 48px;
   height: 48px;
-  background: linear-gradient(135deg, #405769 0%, var(--Sky-Reflection) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-20) 0%,
+    var(--sky-reflection) 100%
+  );
   border-radius: 12px;
   display: flex;
   align-items: center;
@@ -83,17 +103,17 @@ body {
 }
 
 .brand-title {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 1.5rem;
   font-weight: 700;
-  color: #1a1a1a;
+  color: var(--Black);
   line-height: 1.2;
   letter-spacing: -0.02em;
 }
 
 .brand-subtitle {
   font-size: 0.813rem;
-  color: #586372;
+  color: var(--sky-reflection-30);
   font-weight: 500;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -114,7 +134,7 @@ body {
   border-radius: 8px;
   font-size: 0.938rem;
   font-weight: 500;
-  color: #4b5563;
+  color: var(--sky-reflection-30);
   text-decoration: none;
   transition: all 0.2s ease;
   border: 1px solid transparent;
@@ -123,15 +143,18 @@ body {
 
 .nav-item:hover {
   background-color: #f3f4f6;
-  color: #2c5f7d;
+  color: var(--sky-reflection-20);
   text-decoration: none;
 }
 
 .nav-item.active {
-  background: linear-gradient(135deg, #405769 0%, var(--Sky-Reflection) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-20) 0%,
+    var(--sky-reflection) 100%
+  );
   color: white;
   font-weight: 600;
-  box-shadow: 0 2px 8px rgba(44, 95, 125, 0.25);
 }
 
 .nav-item i {
@@ -153,7 +176,11 @@ body {
 }
 
 .landing-hero {
-  background: linear-gradient(135deg, #405769 0%, var(--Sky-Reflection) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-30) 0%,
+    var(--sky-reflection) 100%
+  );
   border-radius: 16px;
   padding: 4rem 3rem;
   margin-bottom: 3rem;
@@ -198,7 +225,7 @@ body {
 }
 
 .hero-title {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 3.5rem;
   font-weight: 800;
   margin: 0 0 1rem 0;
@@ -227,7 +254,7 @@ body {
 }
 
 .stat-value {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 2.5rem;
   font-weight: 700;
   line-height: 1;
@@ -268,7 +295,11 @@ body {
 .card-icon {
   width: 56px;
   height: 56px;
-  background: linear-gradient(135deg, #405769, #79a9d1 100%);
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-20) 0%,
+    var(--sky-reflection) 100%
+  );
   border-radius: 12px;
   display: flex;
   align-items: center;
@@ -279,7 +310,7 @@ body {
 }
 
 .feature-card h3 {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 1.5rem;
   font-weight: 700;
   margin: 0;
@@ -289,7 +320,7 @@ body {
 .feature-card p {
   font-size: 0.938rem;
   line-height: 1.6;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   margin: 0;
   flex-grow: 1;
 }
@@ -298,7 +329,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  color: #2c5f7d;
+  color: var(--sky-reflection-20);
   font-weight: 600;
   font-size: 0.938rem;
   text-decoration: none;
@@ -307,7 +338,7 @@ body {
 }
 
 .card-link:hover {
-  color: #3b82c5;
+  color: var(--sky-reflection);
   gap: 0.75rem;
   text-decoration: none;
 }
@@ -327,7 +358,7 @@ body {
 }
 
 .page-title {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 2.5rem;
   font-weight: 700;
   color: var(--Black);
@@ -343,7 +374,7 @@ body {
 
 .page-description {
   font-size: 1.063rem;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   line-height: 1.6;
   margin: 0;
   max-width: 900px;
@@ -375,10 +406,10 @@ body {
 }
 
 .card-header-custom h4 {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 1.25rem;
   font-weight: 600;
-  color: #1a1a1a;
+  color: var(--Black);
   margin: 0;
   display: flex;
   align-items: center;
@@ -387,7 +418,7 @@ body {
 
 .card-subtitle {
   font-size: 0.875rem;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   margin: 0.25rem 0 0 0;
   font-weight: 400;
 }
@@ -400,7 +431,7 @@ body {
 
 .badge-count {
   background: #f3f4f6;
-  color: #4b5563;
+  color: #4b6060;
   padding: 0.375rem 0.75rem;
   border-radius: 6px;
   font-size: 0.813rem;
@@ -482,10 +513,14 @@ body {
 
 /* ===== INSIGHT BOXES ===== */
 .insight-box {
-  background: linear-gradient(135deg, #e6ebc4 0%, #d2dd8b 100%);
+  background: linear-gradient(
+    135deg,
+    var(--clr-primary-a20) 0%,
+    var(--clr-primary-a0) 100%
+  );
   border-radius: 10px;
   padding: 1.5rem;
-  border: 1px solid #cdda77;
+  border: 1px solid var(--clr-primary-a30);
   display: flex;
   gap: 1rem;
   margin-top: 1rem;
@@ -499,23 +534,23 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #b9c56c;
+  color: var(--clr-primary-a20);
   font-size: 20px;
   flex-shrink: 0;
 }
 
 .insight-content h5 {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 1rem;
   font-weight: 700;
-  color: #363825;
+  color: var(--clr-primary-a50);
   margin: 0 0 0.5rem 0;
 }
 
 .insight-content p {
   font-size: 0.875rem;
   line-height: 1.5;
-  color: #5e5f52;
+  color: var(--clr-primary-a30);
   margin: 0;
 }
 
@@ -528,16 +563,16 @@ body {
 }
 
 .control-panel h5 {
-  font-family: "Outfit", sans-serif;
+  font-family: "Libre Franklin", sans-serif;
   font-size: 1rem;
   font-weight: 600;
-  color: #1a1a1a;
+  color: var(--Black);
   margin: 0 0 0.5rem 0;
 }
 
 .control-description {
   font-size: 0.875rem;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   line-height: 1.5;
   margin: 0 0 1rem 0;
 }
@@ -554,7 +589,7 @@ body {
   background: #f3f4f6;
   border-radius: 8px;
   font-size: 0.938rem;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   margin-bottom: 1rem;
 }
 
@@ -563,12 +598,16 @@ body {
   align-items: center;
   gap: 0.5rem;
   padding: 0.75rem 1rem;
-  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-60) 0%,
+    var(--sky-reflection-50) 100%
+  );
   border-radius: 8px;
   font-size: 1rem;
-  color: #1e40af;
+  color: var(--sky-reflection-20);
   margin-bottom: 1rem;
-  border: 1px solid #93c5fd;
+  border: 1px solid var(--sky-reflection);
 }
 
 .selected-county strong {
@@ -598,12 +637,12 @@ body {
   gap: 0.5rem;
   font-size: 0.875rem;
   font-weight: 600;
-  color: #4b5563;
+  color: var(--sky-reflection-40);
   margin-bottom: 0.25rem;
 }
 
 .search-label i {
-  color: #3b82c5;
+  color: var(--sky-reflection-10);
   font-size: 0.875rem;
 }
 
@@ -617,14 +656,14 @@ body {
   align-items: center;
   gap: 0.5rem;
   font-size: 0.875rem;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   background: #f9fafb;
   padding: 0.625rem 1rem;
   border-radius: 6px;
 }
 
 .results-info i {
-  color: #3b82c5;
+  color: var(--sky-reflection-10);
 }
 
 /* ===== DATA TABLES ===== */
@@ -662,7 +701,7 @@ body {
 
 .dataTables_wrapper .dataTables_filter input:focus {
   outline: none;
-  border-color: #3b82c5;
+  border-color: var(--sky-reflection);
   box-shadow: 0 0 0 3px rgba(59, 130, 197, 0.1);
 }
 
@@ -675,7 +714,7 @@ body {
 
 .dataTables_wrapper table.dataTable thead th {
   background: #f9fafb;
-  color: #374151;
+  color: var(--sky-reflection-30);
   font-weight: 600;
   padding: 1rem 0.75rem;
   border-bottom: 2px solid #e5e7eb;
@@ -706,21 +745,26 @@ body {
   border-radius: 5px;
   border: 1px solid #e5e7eb;
   background: white;
-  color: #4b5563 !important;
+  color: var(--sky-reflection-30) !important;
   font-weight: 500;
   font-size: 0.8125rem;
 }
 
 .dataTables_wrapper .dataTables_paginate .paginate_button:hover {
   background: #f3f4f6 !important;
-  border-color: #d1d5db;
-  color: #1a1a1a !important;
+  border-color: var(--sky-reflection-70);
+  color: var(--Black) !important;
 }
 
 .dataTables_wrapper .dataTables_paginate .paginate_button.current {
-  background: linear-gradient(135deg, #2c5f7d 0%, #3b82c5 100%) !important;
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-20) 0%,
+    var(--sky-reflection),
+    var(--sky-reflection-50) 100%
+  ) !important;
   color: white !important;
-  border-color: #2c5f7d;
+  border-color: var(--sky-reflection-30);
 }
 
 .dt-buttons {
@@ -728,7 +772,11 @@ body {
 }
 
 .dt-button {
-  background: linear-gradient(135deg, #2c5f7d 0%, #3b82c5 100%) !important;
+  background: linear-gradient(
+    135deg,
+    var(--sky-reflection-20) 0%,
+    var(--sky-reflection) 100%
+  ) !important;
   color: white !important;
   border: none !important;
   padding: 0.45rem 0.85rem !important;
@@ -802,7 +850,7 @@ body {
 .form-control:focus,
 .form-select:focus {
   outline: none;
-  border-color: #3b82c5;
+  border-color: var(--sky-reflection-10);
   box-shadow: 0 0 0 3px rgba(59, 130, 197, 0.1);
 }
 
@@ -819,7 +867,7 @@ body {
 
 .bootstrap-select .dropdown-menu li a:hover {
   background-color: #eff6ff;
-  color: #2c5f7d;
+  color: var(--sky-reflection-20);
 }
 
 /* ===== LEAFLET MAP ===== */
@@ -849,7 +897,7 @@ body {
   max-width: 1600px;
   margin: 0 auto;
   text-align: center;
-  color: #6b7280;
+  color: var(--sky-reflection-40);
   font-size: 0.875rem;
 }
 
@@ -859,7 +907,7 @@ body {
 
 .footer-meta {
   font-size: 0.813rem;
-  color: #9ca3af;
+  color: #959d9d;
 }
 
 /* ===== ANIMATIONS ===== */

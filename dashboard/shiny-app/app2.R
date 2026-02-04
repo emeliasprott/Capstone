@@ -81,7 +81,7 @@ theme_app <- bs_theme(
     "input-border-radius" = "8px",
     "btn-border-radius" = "8px",
     base_font = font_google("Inter"),
-    heading_font = font_google("Outfit")
+    heading_font = font_google("Libre Franklin")
 )
 
 theme_project <- function(base_size = 13) {
@@ -89,7 +89,7 @@ theme_project <- function(base_size = 13) {
         theme(
             text = element_text(family = "Inter", color = "#1a1a1a"),
             plot.title = element_textbox_simple(
-                family = "Outfit",
+                family = "Inter",
                 face = "bold",
                 size = 18,
                 color = "#1a1a1a",
@@ -98,13 +98,13 @@ theme_project <- function(base_size = 13) {
             plot.subtitle = element_textbox_simple(
                 family = "Inter",
                 size = 13,
-                color = "#6b7280",
+                color = "#828282",
                 margin = margin(b = 12),
                 lineheight = 1.4
             ),
             plot.caption = element_text(
                 size = 11,
-                color = "#9ca3af",
+                color = "#acacac",
                 hjust = 0,
                 margin = margin(t = 10)
             ),
@@ -114,17 +114,17 @@ theme_project <- function(base_size = 13) {
             axis.title.x = element_text(
                 margin = margin(t = 12),
                 size = 12,
-                color = "#4b5563",
+                color = "#616161",
                 face = "bold"
             ),
             axis.title.y = element_text(
                 margin = margin(r = 12),
                 size = 12,
-                color = "#4b5563",
+                color = "#616161",
                 face = "bold"
             ),
-            axis.text = element_text(size = 11, color = "#6b7280"),
-            axis.ticks = element_line(color = "#e5e7eb"),
+            axis.text = element_text(size = 11, color = "#7a7a7a"),
+            axis.ticks = element_line(color = "#eaeaea"),
             plot.background = element_rect(fill = "white", color = NA),
             panel.background = element_rect(fill = "white", color = NA),
             legend.position = "bottom",
@@ -492,7 +492,7 @@ ui <- page_fillable(
         tags$link(href = "https://fonts.googleapis.com", rel = "preconnect"),
         tags$link(href = "https://fonts.gstatic.com", rel = "preconnect", crossorigin = "crossorigin"),
         tags$link(
-            href = "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap",
+            href = "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Libre+Franklin:ital,wght@0,100..900;1,100..900&display=swap",
             rel = "stylesheet"
         ),
         tags$link(
@@ -685,7 +685,7 @@ server <- function(input, output, session) {
     output$money_map <- renderLeaflet({
         df <- county_sf()
         pal <- colorNumeric(
-            palette = c("#f0f9ff", "#bae6fd", "#7dd3fc", "#38bdf8", "#0ea5e9", "#0284c7", "#0369a1", "#075985"),
+            palette = c("#d7eae9", "#bcdcda", "#a1cecc", "#72b5b3", "#4d9391", "#386b69", "#2A504F", "#234342"),
             domain = df$funding_quantile,
             na.color = "#f3f4f6"
         )
@@ -702,7 +702,7 @@ server <- function(input, output, session) {
                 label = ~NAMELSAD,
                 highlightOptions = highlightOptions(
                     weight = 3,
-                    color = "#2c5f7d",
+                    color = "#4d9391",
                     fillOpacity = 0.9,
                     bringToFront = TRUE
                 )
@@ -792,7 +792,8 @@ server <- function(input, output, session) {
                     Funder = str_to_title(str_to_lower(funder)),
                     `Total Amount` = dollar(total_amount),
                     `Top Supported Topics` = top_supported_topics,
-                    `Top Opposed Topics` = top_opposed_topics
+                    `Top Opposed Topics` = top_opposed_topics,
+                    `Concentration in Region` = scales::percent(regional_concentration, scale = 1)
                 ),
             rownames = FALSE,
             options = list(
@@ -825,7 +826,7 @@ server <- function(input, output, session) {
         ggplot(df, aes(x = total_funding + 1)) +
             geom_histogram(
                 bins = 35,
-                fill = "#3b82c5",
+                fill = "#4d9391",
                 color = "white",
                 linewidth = 0.3,
                 alpha = 0.9
@@ -837,7 +838,7 @@ server <- function(input, output, session) {
             geom_vline(
                 xintercept = c(q50, q90),
                 linetype = "dashed",
-                color = "#d2dd8b",
+                color = "#72b5b3",
                 linewidth = 1,
                 alpha = 0.8
             ) +
@@ -846,7 +847,7 @@ server <- function(input, output, session) {
                 x = q50, y = Inf,
                 vjust = 1.3, hjust = -0.05,
                 label = "Median",
-                color = "#9fa961",
+                color = "#445050",
                 fill = "white",
                 size = 3.8,
                 fontface = "bold",
@@ -857,7 +858,7 @@ server <- function(input, output, session) {
                 x = q90, y = Inf,
                 vjust = 1.3, hjust = -0.05,
                 label = "90th percentile",
-                color = "#9fa961",
+                color = "#445050",
                 fill = "white",
                 size = 3.8,
                 fontface = "bold",
@@ -1035,7 +1036,7 @@ server <- function(input, output, session) {
         ggplot(df, aes(x = term, y = controversy_index, group = topic)) +
             geom_line(
                 data = df |> filter(!topic %in% highlight_topics),
-                color = "#e5e7eb",
+                color = "#eaeaeb",
                 linewidth = 0.5,
                 alpha = 0.6
             ) +
@@ -1047,10 +1048,10 @@ server <- function(input, output, session) {
             geom_hline(
                 yintercept = 1,
                 linetype = "dashed",
-                color = "#9ca3af",
+                color = "#b0b0b0",
                 linewidth = 0.7
             ) +
-            scale_color_brewer(palette = "Set2") +
+            scale_color_manual(values = c("#72B5B3", "#89A894", "#EDD892", "#A37B73", "#3F292B")) +
             labs(
                 title = "Policy Controversy Over Time",
                 subtitle = "Indexed to each topic's historical average (baseline = 1.0)",
@@ -1105,10 +1106,10 @@ server <- function(input, output, session) {
                 size = 10,
                 color = ~intensity,
                 colorscale = list(
-                    c(0, "#E8EAF6"),
-                    c(0.3, "#7986CB"),
-                    c(0.6, "#3F51B5"),
-                    c(1, "#1A237E")
+                    c(0, "#D7EAE9"),
+                    c(0.3, "#a1cecc"),
+                    c(0.6, "#72b5b3"),
+                    c(1, "#315E5C")
                 ),
                 showscale = TRUE,
                 colorbar = list(
@@ -1117,7 +1118,7 @@ server <- function(input, output, session) {
                         font = list(
                             family = "SF Pro Display, -apple-system, system-ui, sans-serif",
                             size = 12,
-                            color = "#37474F"
+                            color = "#445050"
                         )
                     ),
                     thickness = 15,
@@ -1125,7 +1126,7 @@ server <- function(input, output, session) {
                     x = 1.02,
                     tickfont = list(
                         size = 10,
-                        color = "#546E7A"
+                        color = "#445050"
                     )
                 ),
                 line = list(
@@ -1141,15 +1142,15 @@ server <- function(input, output, session) {
             )),
             hovertemplate = paste(
                 "<b style='font-size: 13px; color: #1A237E;'>%{customdata[0]}</b><br>",
-                "<span style='color: #37474F;'><b>Average Polarization:</b> %{x:.3f}</span><br>",
-                "<span style='color: #37474F;'><b>Volatility:</b> %{y:.3f}</span><br>",
-                "<span style='color: #546E7A;'>Terms Observed: %{customdata[1]}</span>",
+                "<span style='color: #4B5858;'><b>Average Polarization:</b> %{x:.3f}</span><br>",
+                "<span style='color: #4B5858;'><b>Volatility:</b> %{y:.3f}</span><br>",
+                "<span style='color: #828a8a;'>Terms Observed: %{customdata[1]}</span>",
                 "<extra></extra>"
             )
         ) %>%
             layout(
                 title = list(
-                    text = "<sub style='font-size: 14px; color: #546E7A;'>Structural vs. Episodic Political Conflict</sub>",
+                    text = "<sub style='font-size: 14px; color: #828a8a;'>Structural vs. Episodic Political Conflict</sub>",
                     x = 0.5,
                     xanchor = "center",
                     font = list(
@@ -1174,7 +1175,7 @@ server <- function(input, output, session) {
                     zeroline = FALSE,
                     tickfont = list(
                         size = 11,
-                        color = "#546E7A",
+                        color = "#828a8a",
                         family = "SF Mono, Consolas, monospace"
                     ),
                     showline = TRUE,
@@ -1187,7 +1188,7 @@ server <- function(input, output, session) {
                         font = list(
                             family = "SF Pro Display, -apple-system, system-ui, sans-serif",
                             size = 13,
-                            color = "#37474F"
+                            color = "#4B5858"
                         )
                     ),
                     range = c(y_min - (2.5 * y_pad), y_max + y_pad),
@@ -1197,7 +1198,7 @@ server <- function(input, output, session) {
                     zeroline = FALSE,
                     tickfont = list(
                         size = 11,
-                        color = "#546E7A",
+                        color = "#828a8a",
                         family = "SF Mono, Consolas, monospace"
                     ),
                     showline = TRUE,
@@ -1232,15 +1233,15 @@ server <- function(input, output, session) {
                     list(
                         x = 0.25,
                         y = 0.15,
-                        text = "<b>High Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Persistently divisive<br>& highly volatile</span>",
+                        text = "<b>High Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Persistently divisive<br>& highly volatile</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
-                            color = "#455A64",
+                            color = "#4B5858",
                             family = "SF Pro Display, -apple-system, system-ui, sans-serif"
                         ),
                         bgcolor = "rgba(255, 255, 255, 0.85)",
-                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        bordercolor = "rgba(114, 181, 179, 0.3)",
                         borderwidth = 1,
                         borderpad = 6,
                         xanchor = "center"
@@ -1248,15 +1249,15 @@ server <- function(input, output, session) {
                     list(
                         x = 0.05,
                         y = 0.15,
-                        text = "<b>Low Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Event-driven<br>polarization</span>",
+                        text = "<b>Low Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Event-driven<br>polarization</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
-                            color = "#455A64",
+                            color = "#4B5858",
                             family = "SF Pro Display, -apple-system, system-ui, sans-serif"
                         ),
                         bgcolor = "rgba(255, 255, 255, 0.85)",
-                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        bordercolor = "rgba(114, 181, 179, 0.3)",
                         borderwidth = 1,
                         borderpad = 6,
                         xanchor = "center"
@@ -1264,15 +1265,15 @@ server <- function(input, output, session) {
                     list(
                         x = 0.25,
                         y = 0.03,
-                        text = "<b>High Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Consistently<br>polarized</span>",
+                        text = "<b>High Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Consistently<br>polarized</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
-                            color = "#455A64",
+                            color = "#4B5858",
                             family = "SF Pro Display, -apple-system, system-ui, sans-serif"
                         ),
                         bgcolor = "rgba(255, 255, 255, 0.85)",
-                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        bordercolor = "rgba(114, 181, 179, 0.3)",
                         borderwidth = 1,
                         borderpad = 6,
                         xanchor = "center"
@@ -1280,15 +1281,15 @@ server <- function(input, output, session) {
                     list(
                         x = 0.05,
                         y = 0.03,
-                        text = "<b>Low Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Consensus<br>topics</span>",
+                        text = "<b>Low Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Consensus<br>topics</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
-                            color = "#455A64",
+                            color = "#4B5858",
                             family = "SF Pro Display, -apple-system, system-ui, sans-serif"
                         ),
                         bgcolor = "rgba(255, 255, 255, 0.85)",
-                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        bordercolor = "rgba(114, 181, 179, 0.3)",
                         borderwidth = 1,
                         borderpad = 6,
                         xanchor = "center"
@@ -1300,7 +1301,7 @@ server <- function(input, output, session) {
                         showarrow = FALSE,
                         font = list(
                             size = 9,
-                            color = "#546E7A",
+                            color = "#828a8a",
                             family = "SF Mono, Consolas, monospace"
                         ),
                         xanchor = "center",
@@ -1313,7 +1314,7 @@ server <- function(input, output, session) {
                         showarrow = FALSE,
                         font = list(
                             size = 9,
-                            color = "#546E7A",
+                            color = "#828a8a",
                             family = "SF Mono, Consolas, monospace"
                         ),
                         yanchor = "bottom",
@@ -1326,11 +1327,11 @@ server <- function(input, output, session) {
                 hovermode = "closest",
                 hoverlabel = list(
                     bgcolor = "rgba(255, 255, 255, 0.95)",
-                    bordercolor = "#3F51B5",
+                    bordercolor = "#386b69",
                     font = list(
                         family = "SF Pro Display, -apple-system, system-ui, sans-serif",
                         size = 12,
-                        color = "#37474F"
+                        color = "#445050"
                     ),
                     align = "left"
                 ),
@@ -1360,7 +1361,7 @@ server <- function(input, output, session) {
         ggplot(d, aes(y = topic, x = delta_controversy, fill = direction)) +
             geom_vline(xintercept = 0, linewidth = 0.8, color = "#d1d5db") +
             geom_col(alpha = 0.9, width = 0.7) +
-            scale_fill_manual(values = c("Increased" = "#dc2626", "Decreased" = "#2d7a4f")) +
+            scale_fill_manual(values = c("Increased" = "#715056", "Decreased" = "#a1cecc")) +
             scale_x_continuous(labels = number_format(accuracy = 0.01)) +
             labs(
                 x = "Change in Controversy Score",
@@ -1393,12 +1394,12 @@ server <- function(input, output, session) {
             )
 
         ggplot(latest, aes(x = topic_amount, y = topic)) +
-            geom_col(fill = "#3b82c5", alpha = 0.9, width = 0.7) +
+            geom_col(fill = "#72b5b3", alpha = 0.9, width = 0.7) +
             geom_text(
                 aes(label = dollar(topic_amount, accuracy = 1)),
                 hjust = -0.1,
                 size = 3.2,
-                color = "#4b5563",
+                color = "#445050",
                 fontface = "bold"
             ) +
             scale_x_continuous(
@@ -1433,9 +1434,9 @@ server <- function(input, output, session) {
                 aes(x = 0, xend = avg_controversy, yend = topic),
                 linewidth = 1.2,
                 alpha = 0.6,
-                color = "#d97706"
+                color = "#A37B73"
             ) +
-            geom_point(size = 4, color = "#d97706", alpha = 0.9) +
+            geom_point(size = 4, color = "#A37B73", alpha = 0.9) +
             labs(x = "Average Controversy Score", y = NULL) +
             theme_project(12) +
             theme(
@@ -1467,8 +1468,8 @@ server <- function(input, output, session) {
         }
 
         ggplot(d, aes(x = term, y = topic_amount, group = 1)) +
-            geom_line(linewidth = 1.3, color = "#2c5f7d") +
-            geom_point(size = 3, color = "#2c5f7d") +
+            geom_line(linewidth = 1.3, color = "#386b69") +
+            geom_point(size = 3, color = "#386b69") +
             scale_y_continuous(
                 labels = dollar_format(),
                 expand = expansion(mult = c(0.05, 0.1))
@@ -1655,9 +1656,9 @@ server <- function(input, output, session) {
         out <- df |>
             mutate(
                 yes_rate = scales::percent(yes_rate_y),
-                n_votes = as.integer(n_votes),
                 controv = scales::percent(controversy_pct, scale = 1),
-                Outcome = if_else(outcome == 1, "Passed", "Failed")
+                Outcome = if_else(outcome == 1, "Passed", "Failed"),
+                Polarization = scales::percent(polarization, scale = 100)
             ) |>
             transmute(
                 `Bill ID` = bill_link,
@@ -1667,8 +1668,8 @@ server <- function(input, output, session) {
                 Outcome,
                 `Lifetime (days)` = lifespan_days,
                 `Voting Support` = yes_rate,
-                `Total Votes Cast` = n_votes,
-                `Relative controversy` = controv
+                `Relative controversy` = controv,
+                Polarization
             ) |>
             distinct()
 
