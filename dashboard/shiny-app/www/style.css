@@ -268,7 +268,7 @@ body {
 .card-icon {
   width: 56px;
   height: 56px;
-  background: llinear-gradient(135deg, #405769, #79a9d1 100%);
+  background: linear-gradient(135deg, #405769, #79a9d1 100%);
   border-radius: 12px;
   display: flex;
   align-items: center;

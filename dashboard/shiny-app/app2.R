@@ -10,6 +10,7 @@ library(scales)
 library(stringr)
 library(ggtext)
 library(ggrepel)
+library(plotly)
 
 options(shiny.fullstacktrace = TRUE)
 options(shiny.sanitize.errors = FALSE)
@@ -145,13 +146,12 @@ landing_ui <- function() {
                 div(
                     class = "hero-badge",
                     icon("chart-line"),
-                    span("Legislative Intelligence Platform")
+                    span("California Legislative Power & Policy Explorer")
                 ),
-                h1(class = "hero-title", "California Legislative Insights"),
+                h1(class = "hero-title", "How Money, Power, and Policy Interact in California"),
                 p(
                     class = "hero-subtitle",
-                    "Transforming California's legislative record into actionable intelligence. ",
-                    "Explore funding patterns, policy dynamics, and legislative outcomes across the state."
+                    "An interactive view of California's legislative process combining campaign finance, lobbying activity, voting behavior, and policy outcomes to reveal who influences what, where, and why.",
                 ),
                 div(
                     class = "hero-stats",
@@ -220,7 +220,7 @@ regions_ui <- function() {
             ),
             div(
                 class = "info-badge small regions", icon("info-circle"),
-                "Note: this data does not include ballot-specific funding, just reported campaign donations and lobbying activity."
+                "Includes reported campaign contributions and lobbying activity only. Ballot-measure spending is excluded."
             )
         ),
         div(
@@ -285,11 +285,9 @@ funding_ui <- function() {
                         div(class = "insight-icon", icon("lightbulb")),
                         div(
                             class = "insight-content",
-                            h5("Key Insight"),
+                            h5("What does this mean?"),
                             p(
-                                "Funding is highly concentrated among a small number of legislators. ",
-                                "The median and 90th percentile markers help contextualize what constitutes ",
-                                "significant funding in California's legislative landscape."
+                                "Most legislators fall into the central, more normal range of funding, but the highest funding is concentrated around a small group."
                             )
                         )
                     )
@@ -315,7 +313,7 @@ topics_ui <- function() {
             h2(class = "page-title", icon("fire"), "Policy Topics"),
             p(
                 class = "page-description",
-                "Track how controversy and funding have evolved across policy areas over two decades."
+                "Compare policy areas by controversy, funding intensity, and polarization to see which topics dominate legislative attention."
             )
         ),
         card(
@@ -336,8 +334,7 @@ topics_ui <- function() {
                         h5("Customize View"),
                         p(
                             class = "control-description",
-                            "Highlight up to 5 topics to track their controversy trajectories. ",
-                            "Default selection shows topics with the most dramatic shifts."
+                            "Select up to five policy areas to compare their controversy trajectories. By default, the most volatile topics are shown."
                         ),
                         pickerInput(
                             "topic_highlight",
@@ -354,6 +351,14 @@ topics_ui <- function() {
                     )
                 )
             )
+        ),
+        card(
+            class = "viz-card section-card-wide",
+            div(
+                class = "card-header-custom",
+                h4("Topic Polarization")
+            ),
+            plotlyOutput("topic_polarization", height = 500)
         ),
         div(
             class = "metrics-grid",
@@ -495,7 +500,7 @@ ui <- page_fillable(
             href = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
         ),
         tags$link(rel = "stylesheet", type = "text/css", href = "style.css"),
-        tags$title("California Legislative Insights"),
+        tags$title("California Legislative Power & Policy Explorer"),
         tags$meta(name = "viewport", content = "width=device-width, initial-scale=1")
     ),
     div(
@@ -509,8 +514,8 @@ ui <- page_fillable(
                     div(class = "brand-icon", icon("landmark")),
                     div(
                         class = "brand-text",
-                        div(class = "brand-title", "CA Legislative Insights"),
-                        div(class = "brand-subtitle", "Data-Driven Policy Analysis")
+                        div(class = "brand-title", "California Legislative Policy Explorer"),
+                        div(class = "brand-subtitle", "Legislative finance, voting, and policy dynamics - mapped and measured")
                     )
                 ),
                 tags$nav(class = "app-nav", uiOutput("header_nav"))
@@ -841,7 +846,7 @@ server <- function(input, output, session) {
                 x = q50, y = Inf,
                 vjust = 1.3, hjust = -0.05,
                 label = "Median",
-                color = "#d2dd8b",
+                color = "#9fa961",
                 fill = "white",
                 size = 3.8,
                 fontface = "bold",
@@ -852,15 +857,13 @@ server <- function(input, output, session) {
                 x = q90, y = Inf,
                 vjust = 1.3, hjust = -0.05,
                 label = "90th percentile",
-                color = "#d2dd8b",
+                color = "#9fa961",
                 fill = "white",
                 size = 3.8,
                 fontface = "bold",
                 label.padding = unit(0.3, "lines")
             ) +
             labs(
-                title = "Legislative Funding Distribution",
-                subtitle = "Most legislators receive similar funding levels, while a small elite receives substantially more",
                 x = "Total Funding Received (log scale)",
                 y = "Number of Legislators"
             ) +
@@ -1064,6 +1067,280 @@ server <- function(input, output, session) {
             ) +
             guides(color = guide_legend(nrow = 2))
     })
+    output$topic_polarization <- renderPlotly({
+        df <- topic_term()
+
+        topic_stability <- df %>%
+            group_by(topic) %>%
+            summarise(
+                avg_polarization = mean(topic_polarization, na.rm = TRUE),
+                sd_polarization = sd(topic_polarization, na.rm = TRUE),
+                n_terms = n(),
+                .groups = "drop"
+            ) %>%
+            filter(n_terms >= 2)
+
+        x_ref <- median(topic_stability$avg_polarization, na.rm = TRUE)
+        y_ref <- median(topic_stability$sd_polarization, na.rm = TRUE)
+        x_min <- min(topic_stability$avg_polarization, na.rm = TRUE)
+        x_max <- max(topic_stability$avg_polarization, na.rm = TRUE)
+        y_min <- min(topic_stability$sd_polarization, na.rm = TRUE)
+        y_max <- max(topic_stability$sd_polarization, na.rm = TRUE)
+
+        x_pad <- 0.1 * (x_max - x_min)
+        y_pad <- 0.1 * (y_max - y_min)
+
+        topic_stability$intensity <- sqrt(
+            (topic_stability$avg_polarization / max(topic_stability$avg_polarization, na.rm = TRUE))^2 +
+                (topic_stability$sd_polarization / max(topic_stability$sd_polarization, na.rm = TRUE))^2
+        )
+
+        plot_ly(
+            data = topic_stability,
+            x = ~avg_polarization,
+            y = ~sd_polarization,
+            type = "scatter",
+            mode = "markers",
+            marker = list(
+                size = 10,
+                color = ~intensity,
+                colorscale = list(
+                    c(0, "#E8EAF6"),
+                    c(0.3, "#7986CB"),
+                    c(0.6, "#3F51B5"),
+                    c(1, "#1A237E")
+                ),
+                showscale = TRUE,
+                colorbar = list(
+                    title = list(
+                        text = "Conflict<br>Intensity",
+                        font = list(
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif",
+                            size = 12,
+                            color = "#37474F"
+                        )
+                    ),
+                    thickness = 15,
+                    len = 0.7,
+                    x = 1.02,
+                    tickfont = list(
+                        size = 10,
+                        color = "#546E7A"
+                    )
+                ),
+                line = list(
+                    width = 1.5,
+                    color = "rgba(255, 255, 255, 0.8)"
+                ),
+                opacity = 0.85
+            ),
+            customdata = I(Map(
+                function(t, n) list(t, n),
+                topic_stability$topic,
+                topic_stability$n_terms
+            )),
+            hovertemplate = paste(
+                "<b style='font-size: 13px; color: #1A237E;'>%{customdata[0]}</b><br>",
+                "<span style='color: #37474F;'><b>Average Polarization:</b> %{x:.3f}</span><br>",
+                "<span style='color: #37474F;'><b>Volatility:</b> %{y:.3f}</span><br>",
+                "<span style='color: #546E7A;'>Terms Observed: %{customdata[1]}</span>",
+                "<extra></extra>"
+            )
+        ) %>%
+            layout(
+                title = list(
+                    text = "<sub style='font-size: 14px; color: #546E7A;'>Structural vs. Episodic Political Conflict</sub>",
+                    x = 0.5,
+                    xanchor = "center",
+                    font = list(
+                        family = "SF Pro Display, -apple-system, system-ui, sans-serif",
+                        size = 18
+                    ),
+                    pad = list(t = 10, b = 10)
+                ),
+                xaxis = list(
+                    title = list(
+                        text = "<b>Average Polarization →</b><br><sub style='font-size: 11px;'>Structural Conflict Intensity</sub>",
+                        font = list(
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif",
+                            size = 13,
+                            color = "#37474F"
+                        )
+                    ),
+                    range = c(x_min - x_pad, x_max + x_pad),
+                    showgrid = TRUE,
+                    gridcolor = "rgba(176, 190, 197, 0.15)",
+                    gridwidth = 1,
+                    zeroline = FALSE,
+                    tickfont = list(
+                        size = 11,
+                        color = "#546E7A",
+                        family = "SF Mono, Consolas, monospace"
+                    ),
+                    showline = TRUE,
+                    linecolor = "rgba(120, 144, 156, 0.3)",
+                    linewidth = 1.5
+                ),
+                yaxis = list(
+                    title = list(
+                        text = "<b>Volatility Across Terms →</b>",
+                        font = list(
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif",
+                            size = 13,
+                            color = "#37474F"
+                        )
+                    ),
+                    range = c(y_min - (2.5 * y_pad), y_max + y_pad),
+                    showgrid = TRUE,
+                    gridcolor = "rgba(176, 190, 197, 0.15)",
+                    gridwidth = 1,
+                    zeroline = FALSE,
+                    tickfont = list(
+                        size = 11,
+                        color = "#546E7A",
+                        family = "SF Mono, Consolas, monospace"
+                    ),
+                    showline = TRUE,
+                    linecolor = "rgba(120, 144, 156, 0.3)",
+                    linewidth = 1.5
+                ),
+                shapes = list(
+                    list(
+                        type = "line",
+                        x0 = x_ref, x1 = x_ref,
+                        y0 = 0, y1 = max(topic_stability$sd_polarization, na.rm = TRUE) * 1.05,
+                        line = list(
+                            color = "rgba(63, 81, 181, 0.4)",
+                            dash = "dash",
+                            width = 2
+                        ),
+                        layer = "below"
+                    ),
+                    list(
+                        type = "line",
+                        x0 = 0, x1 = 1,
+                        y0 = y_ref, y1 = y_ref,
+                        line = list(
+                            color = "rgba(63, 81, 181, 0.4)",
+                            dash = "dash",
+                            width = 2
+                        ),
+                        layer = "below"
+                    )
+                ),
+                annotations = list(
+                    list(
+                        x = 0.25,
+                        y = 0.15,
+                        text = "<b>High Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Persistently divisive<br>& highly volatile</span>",
+                        showarrow = FALSE,
+                        font = list(
+                            size = 11,
+                            color = "#455A64",
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif"
+                        ),
+                        bgcolor = "rgba(255, 255, 255, 0.85)",
+                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        borderwidth = 1,
+                        borderpad = 6,
+                        xanchor = "center"
+                    ),
+                    list(
+                        x = 0.05,
+                        y = 0.15,
+                        text = "<b>Low Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Event-driven<br>polarization</span>",
+                        showarrow = FALSE,
+                        font = list(
+                            size = 11,
+                            color = "#455A64",
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif"
+                        ),
+                        bgcolor = "rgba(255, 255, 255, 0.85)",
+                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        borderwidth = 1,
+                        borderpad = 6,
+                        xanchor = "center"
+                    ),
+                    list(
+                        x = 0.25,
+                        y = 0.03,
+                        text = "<b>High Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Consistently<br>polarized</span>",
+                        showarrow = FALSE,
+                        font = list(
+                            size = 11,
+                            color = "#455A64",
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif"
+                        ),
+                        bgcolor = "rgba(255, 255, 255, 0.85)",
+                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        borderwidth = 1,
+                        borderpad = 6,
+                        xanchor = "center"
+                    ),
+                    list(
+                        x = 0.05,
+                        y = 0.03,
+                        text = "<b>Low Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #78909C;'>Consensus<br>topics</span>",
+                        showarrow = FALSE,
+                        font = list(
+                            size = 11,
+                            color = "#455A64",
+                            family = "SF Pro Display, -apple-system, system-ui, sans-serif"
+                        ),
+                        bgcolor = "rgba(255, 255, 255, 0.85)",
+                        bordercolor = "rgba(63, 81, 181, 0.3)",
+                        borderwidth = 1,
+                        borderpad = 6,
+                        xanchor = "center"
+                    ),
+                    list(
+                        x = x_ref,
+                        y = -0.02,
+                        text = sprintf("Median: %.3f", x_ref),
+                        showarrow = FALSE,
+                        font = list(
+                            size = 9,
+                            color = "#546E7A",
+                            family = "SF Mono, Consolas, monospace"
+                        ),
+                        xanchor = "center",
+                        yshift = -20
+                    ),
+                    list(
+                        x = 0.01,
+                        y = y_ref,
+                        text = sprintf("Median: %.3f", y_ref),
+                        showarrow = FALSE,
+                        font = list(
+                            size = 9,
+                            color = "#546E7A",
+                            family = "SF Mono, Consolas, monospace"
+                        ),
+                        yanchor = "bottom",
+                        xshift = 20
+                    )
+                ),
+                margin = list(l = 90, r = 120, t = 100, b = 80),
+                paper_bgcolor = "#FAFBFC",
+                plot_bgcolor = "#FFFFFF",
+                hovermode = "closest",
+                hoverlabel = list(
+                    bgcolor = "rgba(255, 255, 255, 0.95)",
+                    bordercolor = "#3F51B5",
+                    font = list(
+                        family = "SF Pro Display, -apple-system, system-ui, sans-serif",
+                        size = 12,
+                        color = "#37474F"
+                    ),
+                    align = "left"
+                ),
+                plot_bgcolor = "#FFFFFF"
+            ) %>%
+            config(
+                displayModeBar = FALSE,
+                displaylogo = FALSE
+            )
+    })
 
     output$topic_delta_bar <- renderPlot({
         df <- topic_term()
@@ -1210,7 +1487,8 @@ server <- function(input, output, session) {
         df <- rdp("latest_high_conflict.parquet") %>%
             select(`Topic`, `Total Funding`, `Relative Controversy`, `Pass Rate`, `Funding Percentile`) %>%
             mutate(`Total Funding` = scales::dollar(round(`Total Funding`, 2)), `Relative Controversy` = scales::percent(`Relative Controversy`, scale = 100), `Pass Rate` = scales::percent(`Pass Rate`, scale = 1), `Funding Percentile` = scales::percent(`Funding Percentile`)) %>%
-            arrange(desc(`Funding Percentile`))
+            arrange(desc(`Total Funding`)) %>%
+            head(7)
         datatable(
             df,
             rownames = FALSE,
