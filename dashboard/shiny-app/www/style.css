@@ -631,6 +631,11 @@ body {
   gap: 0.5rem;
 }
 
+.search-grid .action-button {
+  min-height: 44px;
+  margin-top: 0.125rem;
+}
+
 .search-label {
   display: flex;
   align-items: center;

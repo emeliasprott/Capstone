@@ -3,13 +3,13 @@ library(bslib)
 library(shinyWidgets)
 library(DT)
 library(arrow)
-library(sf)
-library(tidyverse)
+library(dplyr)
+library(ggplot2)
 library(leaflet)
 library(scales)
+library(forcats)
 library(stringr)
 library(ggtext)
-library(ggrepel)
 library(plotly)
 
 options(shiny.fullstacktrace = TRUE)
@@ -30,19 +30,22 @@ lazy_load <- function(key, loader) {
     get(key, envir = lazy_cache, inherits = FALSE)
 }
 
-rdp <- function(fname) {
+rdp <- function(fname, col_select = NULL) {
     fpath <- file.path(parquet_dir, fname)
-    lazy_load(fpath, function() {
-        if (file.exists(fpath)) read_parquet(fpath) else NULL
-    })
-}
-
-get_counties <- function() {
-    lazy_load("ca_counties", function() {
-        path <- "data/ca_counties.geojson"
-
-        read_sf(path) |>
-            st_transform(4326)
+    key <- if (is.null(col_select)) {
+        fpath
+    } else {
+        paste0(fpath, "::", paste(col_select, collapse = ","))
+    }
+    lazy_load(key, function() {
+        if (!file.exists(fpath)) {
+            return(NULL)
+        }
+        if (is.null(col_select)) {
+            read_parquet(fpath)
+        } else {
+            read_parquet(fpath, col_select = col_select)
+        }
     })
 }
 
@@ -220,7 +223,7 @@ regions_ui <- function() {
             ),
             div(
                 class = "info-badge small regions", icon("info-circle"),
-                "Includes reported campaign contributions and lobbying activity only. Ballot-measure spending is excluded."
+                "Includes reported campaign contributions and lobbying activity only. Ballot-measure spending and funding outside of the legislature are excluded."
             )
         ),
         div(
@@ -438,15 +441,18 @@ bills_ui <- function() {
                     div(class = "search-label", icon("user"), "Author"),
                     textInput("bill_author",
                         label = NULL,
-                        placeholder = "e.g., Smith, Garcia"
+                        placeholder = "Full or Last Name"
                     )
                 ),
                 div(
                     class = "search-field",
-                    div(class = "search-label", icon("hashtag"), "Bill ID"),
-                    textInput("bill_id",
+                    div(class = "search-label", icon("hashtag"), "Results Shown"),
+                    selectInput(
+                        "n_bills",
                         label = NULL,
-                        placeholder = "e.g., AB123, SB456"
+                        choices = c(100, 500, 1000, 2500, 5000, "All"),
+                        selected = 100,
+                        multiple = FALSE
                     )
                 ),
                 div(
@@ -464,6 +470,23 @@ bills_ui <- function() {
                             liveSearchPlaceholder = "Search terms..."
                         )
                     )
+                ),
+                div(
+                    class = "search-field",
+                    div(class = "search-label", icon("hashtag"), "Bill ID"),
+                    textInput("bill_id",
+                        label = NULL,
+                        placeholder = "e.g., AB123, SB456"
+                    )
+                ),
+                div(
+                    class = "search-field",
+                    div(class = "search-label", icon("search"), "Search"),
+                    actionButton(
+                        "bill_search",
+                        "Search",
+                        class = "btn btn-primary w-100"
+                    )
                 )
             )
         ),
@@ -475,7 +498,11 @@ bills_ui <- function() {
                 div(
                     class = "results-info",
                     icon("info-circle"),
-                    "Controversy percentile shows how contentious a bill was relative to others in its term"
+                    p(
+                        "Controversy percentile shows how contentious a bill was relative to others in its term.",
+                        br(),
+                        "Polarization measures how differently Democrats and Republicans voted on an issue relative to how evenly divided the legislature was at the time, with higher values indicating stronger partisan divides."
+                    )
                 )
             ),
             DTOutput("bills_dt")
@@ -603,6 +630,7 @@ listcol_to_str <- function(x, max_n = 6) {
 # Server
 # ----------------------------
 server <- function(input, output, session) {
+    library(sf)
     current_page <- reactiveVal("landing")
 
     output$header_nav <- renderUI({
@@ -650,9 +678,49 @@ server <- function(input, output, session) {
     # ----------------------------
     # Regions
     # ----------------------------
+    wkb_col_to_sfc <- function(x) {
+        if (is.list(x) && length(x) > 0 && is.raw(x[[1]])) {
+            return(st_as_sfc(x))
+        }
+
+        if (is.list(x) && length(x) > 0 && is.integer(x[[1]])) {
+            return(st_as_sfc(lapply(x, as.raw)))
+        }
+
+        if (inherits(x, "blob")) {
+            return(st_as_sfc(lapply(x, as.raw)))
+        }
+
+        if (is.raw(x)) {
+            return(st_as_sfc(list(x)))
+        }
+
+        stop("geometry_wkb column is not in a recognized WKB format. str(geometry_wkb) needed.")
+    }
+
+    load_counties_sf <- function() {
+        df <- open_dataset("data/ca_counties.parquet") |> collect()
+
+        if (!"geometry_wkb" %in% names(df)) {
+            stop("Expected column 'geometry_wkb' not found in collected data.")
+        }
+
+        geom <- wkb_col_to_sfc(df$geometry_wkb)
+        df$geometry_wkb <- NULL
+
+        counties_sf <- st_sf(df, geometry = geom)
+        sf::st_crs(counties_sf) <- 3857
+        counties_sf <- sf::st_transform(counties_sf, 4326)
+        counties_sf
+    }
+
+
     county_sf <- reactive({
-        counties <- get_counties()
-        county_funding <- rdp("county_funding.parquet")
+        counties <- load_counties_sf()
+        county_funding <- rdp(
+            "county_funding.parquet",
+            c("county_id", "county_name", "total_amount")
+        )
 
         counties |>
             left_join(
@@ -663,6 +731,7 @@ server <- function(input, output, session) {
                 funding_quantile = percent_rank(total_amount)
             )
     })
+
 
 
     selected_county <- reactiveVal(NULL)
@@ -722,7 +791,18 @@ server <- function(input, output, session) {
 
 
     county_top_tbl <- reactive({
-        df <- rdp("county_top_funders.parquet")
+        df <- rdp(
+            "county_top_funders.parquet",
+            c(
+                "county_id",
+                "county_name",
+                "funder",
+                "total_amount",
+                "top_supported_topics",
+                "top_opposed_topics",
+                "region_concentration"
+            )
+        )
         if (is.null(df)) {
             return(NULL)
         }
@@ -735,7 +815,10 @@ server <- function(input, output, session) {
     })
 
     county_term <- reactive({
-        df <- rdp("county_term_funding.parquet")
+        df <- rdp(
+            "county_term_funding.parquet",
+            c("county_name", "term", "total_amount")
+        )
         if (is.null(df)) {
             return(NULL)
         }
@@ -793,7 +876,7 @@ server <- function(input, output, session) {
                     `Total Amount` = dollar(total_amount),
                     `Top Supported Topics` = top_supported_topics,
                     `Top Opposed Topics` = top_opposed_topics,
-                    `Concentration in Region` = scales::percent(region_concentration, scale = 100)
+                    `Concentration in Region` = scales::percent(region_concentration, scale = 100, accuracy = 0.01)
                 ),
             rownames = FALSE,
             options = list(
@@ -811,7 +894,7 @@ server <- function(input, output, session) {
     # Funding
     # ----------------------------
     leg_funding <- reactive({
-        rdp("legislator_funding.parquet")
+        rdp("legislator_funding.parquet", c("total_funding"))
     })
 
     output$funding_dist <- renderPlot({
@@ -872,7 +955,10 @@ server <- function(input, output, session) {
     })
 
     output$funders_dt <- renderDT({
-        df <- rdp("funding.parquet")
+        df <- rdp(
+            "funding.parquet",
+            c("Firm", "amount", "term", "party", "house", "kind", "Name")
+        )
         if (is.null(df)) {
             return(datatable(
                 rownames = FALSE,
@@ -923,7 +1009,11 @@ server <- function(input, output, session) {
     # Topics
     # ----------------------------
     topic_term <- reactive({
-        df <- rdp("topic_term_summary.parquet")
+        req(current_page() == "topics")
+        df <- rdp(
+            "topic_term_summary.parquet",
+            c("topic", "term", "avg_controversy", "topic_amount", "topic_polarization")
+        )
         if (is.null(df)) {
             return(NULL)
         }
@@ -964,7 +1054,7 @@ server <- function(input, output, session) {
 
 
     observeEvent(
-        list(topic_defaults(), current_page()),
+        current_page(),
         {
             if (current_page() != "topics") {
                 return()
@@ -1481,7 +1571,10 @@ server <- function(input, output, session) {
     })
 
     output$latest_conflict <- renderDT({
-        df <- rdp("latest_high_conflict.parquet") %>%
+        df <- rdp(
+            "latest_high_conflict.parquet",
+            c("Topic", "Total Funding", "Relative Controversy", "Pass Rate", "Funding Percentile")
+        ) %>%
             select(`Topic`, `Total Funding`, `Relative Controversy`, `Pass Rate`, `Funding Percentile`) %>%
             mutate(`Total Funding` = scales::dollar(round(`Total Funding`, 2)), `Relative Controversy` = scales::percent(`Relative Controversy`, scale = 100), `Pass Rate` = scales::percent(`Pass Rate`, scale = 1), `Funding Percentile` = scales::percent(`Funding Percentile`)) %>%
             arrange(desc(`Total Funding`)) %>%
@@ -1498,7 +1591,23 @@ server <- function(input, output, session) {
     # Bills
     # ----------------------------
     bills <- reactive({
-        df <- rdp("bill_stats.parquet")
+        req(current_page() == "bills")
+        df <- rdp(
+            "bill_stats.parquet",
+            c(
+                "bill_ID",
+                "yes_rate",
+                "term",
+                "polarization_adj",
+                "lifespan_days",
+                "controversy",
+                "outcome",
+                "Name",
+                "Subject",
+                "author_tokens",
+                "controversy_pct"
+            )
+        )
         if (is.null(df)) {
             return(NULL)
         }
@@ -1519,9 +1628,27 @@ server <- function(input, output, session) {
     })
 
     bm25_obj <- reactiveVal(NULL)
-
-    observeEvent(bills(),
+    search_params <- eventReactive(
+        input$bill_search,
         {
+            list(
+                kw = tokenize_simple(input$bill_keyword),
+                au = tokenize_simple(input$bill_author),
+                bid = toupper(gsub("\\s+", "", input$bill_id %||% "")),
+                num_bills = input$n_bills,
+                terms = input$bill_terms
+            )
+        },
+        ignoreInit = FALSE
+    )
+
+    observeEvent(
+        current_page(),
+        {
+            if (current_page() != "bills") {
+                return()
+            }
+
             df <- bills()
             if (is.null(df) || nrow(df) == 0) {
                 return()
@@ -1545,9 +1672,14 @@ server <- function(input, output, session) {
             return(tibble())
         }
 
+        params <- search_params()
+        if (is.null(params)) {
+            return(tibble())
+        }
+
         # term filter
         terms_all <- sort(unique(df$term))
-        sel_terms <- input$bill_terms
+        sel_terms <- params$terms
 
         if (!is.null(sel_terms) && length(sel_terms) > 0 && length(sel_terms) < length(terms_all)) {
             df <- df |> filter(term %in% sel_terms)
@@ -1555,9 +1687,10 @@ server <- function(input, output, session) {
 
 
         # inputs
-        kw <- tokenize_simple(input$bill_keyword)
-        au <- tokenize_simple(input$bill_author)
-        bid <- toupper(gsub("\\s+", "", input$bill_id %||% ""))
+        kw <- params$kw %||% ""
+        au <- params$au %||% ""
+        bid <- params$bid %||% ""
+        num_bills <- params$num_bills %||% "100"
 
         df <- df |> mutate(score = 0)
 
@@ -1628,8 +1761,17 @@ server <- function(input, output, session) {
                 desc(controversy_num %||% 0)
             )
 
-        df |>
-            distinct()
+        if (identical(num_bills, "All")) {
+            df <- df |> distinct()
+        } else {
+            num_bills_n <- suppressWarnings(as.integer(num_bills))
+            if (is.na(num_bills_n) || num_bills_n < 1) {
+                num_bills_n <- 100
+            }
+            df <- df |>
+                distinct(bill_ID, .keep_all = TRUE) |>
+                head(n = num_bills_n)
+        }
     })
 
     output$bills_dt <- renderDT({
@@ -1645,10 +1787,10 @@ server <- function(input, output, session) {
 
         out <- df |>
             mutate(
-                yes_rate = scales::percent(yes_rate),
-                controv = scales::percent(controversy_pct, scale = 1),
+                yes_rate = scales::percent(yes_rate, accuracy = 0.01),
+                controv = scales::percent(controversy_pct, scale = 1, accuracy = 0.01),
                 Outcome = if_else(outcome == 1, "Passed", "Failed"),
-                Polarization = scales::percent(polarization, scale = 100)
+                Polarization = round(polarization_adj, 2)
             ) |>
             transmute(
                 `Bill ID` = bill_link,
