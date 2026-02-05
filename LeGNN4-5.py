@@ -1228,19 +1228,19 @@ class Config:
     vote_dir_weight: float = 1.0
     vote_label_smooth: float = 0.03
 
-    exp_stance_weight: float = 1.0
-    exp_amount_weight: float = 0.25
+    exp_stance_weight: float = 0.25
+    exp_amount_weight: float = 0.05
 
     topic_ce_weight: float = 0.15
     topic_label_smooth: float = 0.05
 
     version_smooth_weight: float = 0.05
 
-    outcome_weight: float = 0.10
+    outcome_weight: float = 0.5
     out_lam_w: float = 0.35
     out_kap_w: float = 0.15
-    out_vote_w: float = 0.04
-    out_exp_w: float = 0.02
+    out_vote_w: float = 0.1
+    out_exp_w: float = 0.01
     out_exp_amt_clip: float = 12.0
 
     amt_a0: float = 0.0
