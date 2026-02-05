@@ -515,7 +515,7 @@ ui <- page_fillable(
                     div(
                         class = "brand-text",
                         div(class = "brand-title", "California Legislative Policy Explorer"),
-                        div(class = "brand-subtitle", "Legislative finance, voting, and policy dynamics - mapped and measured")
+                        div(class = "brand-subtitle", "Finance, voting, and policy dynamics")
                     )
                 ),
                 tags$nav(class = "app-nav", uiOutput("header_nav"))
@@ -793,7 +793,7 @@ server <- function(input, output, session) {
                     `Total Amount` = dollar(total_amount),
                     `Top Supported Topics` = top_supported_topics,
                     `Top Opposed Topics` = top_opposed_topics,
-                    `Concentration in Region` = scales::percent(regional_concentration, scale = 1)
+                    `Concentration in Region` = scales::percent(region_concentration, scale = 100)
                 ),
             rownames = FALSE,
             options = list(
@@ -890,6 +890,7 @@ server <- function(input, output, session) {
             select(
                 Firm,
                 Amount = amount,
+                Kind = kind,
                 Term = term,
                 Party = party,
                 House,
@@ -937,12 +938,7 @@ server <- function(input, output, session) {
         if (is.null(df) || nrow(df) == 0) {
             return(NULL)
         }
-        df |>
-            group_by(topic) |>
-            mutate(
-                controversy_index = avg_controversy / mean(avg_controversy, na.rm = TRUE)
-            ) |>
-            ungroup()
+        df
     })
 
     topic_defaults <- reactive({
@@ -954,7 +950,7 @@ server <- function(input, output, session) {
         topic_slopes <- df |>
             group_by(topic) |>
             summarise(
-                movement = sum(abs(diff(controversy_index)), na.rm = TRUE),
+                movement = sum(abs(diff(avg_controversy)), na.rm = TRUE),
                 .groups = "drop"
             ) |>
             arrange(desc(movement))
@@ -1033,7 +1029,7 @@ server <- function(input, output, session) {
             sel
         }
 
-        ggplot(df, aes(x = term, y = controversy_index, group = topic)) +
+        ggplot(df, aes(x = term, y = avg_controversy, group = topic)) +
             geom_line(
                 data = df |> filter(!topic %in% highlight_topics),
                 color = "#eaeaeb",
@@ -1057,7 +1053,7 @@ server <- function(input, output, session) {
                 subtitle = "Indexed to each topic's historical average (baseline = 1.0)",
                 x = NULL,
                 y = "Controversy Index",
-                color = "Selected Topics"
+                color = "Topics"
             ) +
             theme_project(13) +
             theme(
@@ -1233,7 +1229,7 @@ server <- function(input, output, session) {
                     list(
                         x = 0.25,
                         y = 0.15,
-                        text = "<b>High Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Persistently divisive<br>& highly volatile</span>",
+                        text = "<b>High Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #7d9c9a;'>Persistently divisive<br>& highly volatile</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
@@ -1249,7 +1245,7 @@ server <- function(input, output, session) {
                     list(
                         x = 0.05,
                         y = 0.15,
-                        text = "<b>Low Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Event-driven<br>polarization</span>",
+                        text = "<b>Low Structural &<br>High Episodic</b><br><span style='font-size: 10px; color: #7d9c9a;'>Event-driven<br>polarization</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
@@ -1265,7 +1261,7 @@ server <- function(input, output, session) {
                     list(
                         x = 0.25,
                         y = 0.03,
-                        text = "<b>High Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Consistently<br>polarized</span>",
+                        text = "<b>High Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #7d9c9a;'>Consistently<br>polarized</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
@@ -1281,7 +1277,7 @@ server <- function(input, output, session) {
                     list(
                         x = 0.05,
                         y = 0.03,
-                        text = "<b>Low Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #a1cecc;'>Consensus<br>topics</span>",
+                        text = "<b>Low Structural &<br>Low Episodic</b><br><span style='font-size: 10px; color: #7d9c9a;'>Consensus<br>topics</span>",
                         showarrow = FALSE,
                         font = list(
                             size = 11,
@@ -1614,9 +1610,7 @@ server <- function(input, output, session) {
         }
 
         if (!any_input) {
-            if ("salience" %in% names(df)) {
-                df <- df |> mutate(score = as.numeric(salience %||% 0))
-            } else if ("controversy" %in% names(df)) {
+            if ("controversy" %in% names(df)) {
                 df <- df |> mutate(score = as.numeric(controversy %||% 0))
             } else {
                 df <- df |> mutate(score = 0)
@@ -1627,19 +1621,15 @@ server <- function(input, output, session) {
         sort_key <- "score"
         df <- df |>
             mutate(
-                salience_num = as.numeric(salience %||% NA),
                 controversy_num = as.numeric(controversy %||% NA)
             ) |>
             arrange(
                 desc(.data[[sort_key]]),
-                desc(salience_num %||% 0),
                 desc(controversy_num %||% 0)
             )
 
-        n <- input$bill_n %||% 200
         df |>
-            distinct() |>
-            slice_head(n = n)
+            distinct()
     })
 
     output$bills_dt <- renderDT({
@@ -1655,7 +1645,7 @@ server <- function(input, output, session) {
 
         out <- df |>
             mutate(
-                yes_rate = scales::percent(yes_rate_y),
+                yes_rate = scales::percent(yes_rate),
                 controv = scales::percent(controversy_pct, scale = 1),
                 Outcome = if_else(outcome == 1, "Passed", "Failed"),
                 Polarization = scales::percent(polarization, scale = 100)

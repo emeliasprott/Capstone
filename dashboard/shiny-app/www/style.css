@@ -442,7 +442,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  background: #eff6ff;
+  background: #eaf1f1;
   color: var(--Sky-Reflection);
   padding: 0.5rem 0.875rem;
   border-radius: 6px;
@@ -515,8 +515,8 @@ body {
 .insight-box {
   background: linear-gradient(
     135deg,
-    var(--clr-primary-a20) 0%,
-    var(--clr-primary-a0) 100%
+    var(--sky-reflection-50) 0%,
+    var(--sky-reflection-70) 100%
   );
   border-radius: 10px;
   padding: 1.5rem;
@@ -529,7 +529,7 @@ body {
 .insight-icon {
   width: 40px;
   height: 40px;
-  background: rgba(230, 235, 196, 0.2);
+  background: rgba(161, 181, 179, 0.2);
   border-radius: 8px;
   display: flex;
   align-items: center;
@@ -586,7 +586,7 @@ body {
   align-items: center;
   gap: 0.5rem;
   padding: 0.75rem 1rem;
-  background: #f3f4f6;
+  background: var(--sky-reflection-70);
   border-radius: 8px;
   font-size: 0.938rem;
   color: var(--sky-reflection-40);
