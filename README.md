@@ -2,30 +2,35 @@
 
 ## Table of Contents
 
-- [Project Overview](#project-overview)
-- [Data Coverage and Sources](#data-coverage-and-sources)
+- [Decoding the California Legislative Process](#decoding-the-california-legislative-process)
+  - [Table of Contents](#table-of-contents)
+  - [Project Overview](#project-overview)
+  - [Data Coverage and Sources](#data-coverage-and-sources)
     - [Legislative Records (1980–2025)](#legislative-records-19802025)
     - [Senate and Assembly Final Histories (PDFs)](#senate-and-assembly-final-histories-pdfs)
     - [Campaign Finance and Lobbying Data (CAL-ACCESS)](#campaign-finance-and-lobbying-data-cal-access)
-- [Pipeline Overview](#pipeline-overview)
-- [Data Integration and Entity Resolution](#data-integration-and-entity-resolution)
-- [Graph Representation](#graph-representation)
+  - [Pipeline Overview](#pipeline-overview)
+  - [Data Integration and Entity Resolution](#data-integration-and-entity-resolution)
+  - [Graph Representation](#graph-representation)
     - [Node Types](#node-types)
     - [Edge Types and Semantics](#edge-types-and-semantics)
-- [Features and Representations](#features-and-representations)
-- [Graph Neural Network Model](#graph-neural-network-model)
+  - [Features and Representations](#features-and-representations)
+  - [Graph Neural Network Model](#graph-neural-network-model)
     - [Model Characteristics](#model-characteristics)
-    - [Training](#training)
-- [Outputs and Intended Use](#outputs-and-intended-use)
-- [Limitations and Known Issues](#limitations-and-known-issues)
-- [Notes on Reproducibility](#notes-on-reproducibility)
-- [Acknowledgments](#acknowledgments)
+      - [Topic Modeling and Bill Latents](#topic-modeling-and-bill-latents)
+      - [Training](#training)
+  - [Outputs and Intended Use](#outputs-and-intended-use)
+  - [Limitations and Known Issues](#limitations-and-known-issues)
+  - [Notes on Reproducibility](#notes-on-reproducibility)
+  - [Acknowledgments](#acknowledgments)
 
 ## Project Overview
 
 This repository contains the core modeling and data-integration work for my computational social science capstone project that reconstructs the California legislative process as a temporal, heterogeneous graph and learns context-aware representations of bills, legislators, committees, donors, and lobbying firms using a self-supervised graph neural network (GNN).
 
 The project integrates multiple public data sources, including legislative archives, committee records extracted from historical PDFs, and campaign finance and lobbying disclosures, into a unified relational representation of how policy is written, amended, voted on, and influenced in California. Rather than treating legislation as a flat text corpus or a sequence of roll calls, the system explicitly models procedure, institutional structure, and stakeholder relationships.
+
+Dashboard: [emeliasprott.shinyapps.io/CA-Legis/](https://emeliasprott.shinyapps.io/CA-Legis/)
 
 Supporting materials and presentations from intermediate project stages:
 
