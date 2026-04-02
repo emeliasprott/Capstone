@@ -115,14 +115,7 @@ def build_bv2bill(batch):
 
 
 def build_bv_lookup_tensors(data, bill_term_idx_full):
-    """Precompute per-bill-version topic and term-index arrays indexed by global bill_version ID.
-
-    The vote LinkNeighborLoader samples neighbours by following edges INTO bill_version
-    nodes (legislators, committees, authors).  The is_version edge goes bill_version→bill,
-    so bill nodes are never included in vote batches and build_bv2bill always returns None.
-    Precomputing these arrays lets vote_direction_loss resolve topics and terms directly
-    from the global bill_version ID without bill nodes being present in the mini-batch.
-    """
+    """Precompute per-bill-version topic and term-index arrays indexed by global bill_version ID."""
     n_bv = int(data["bill_version"].num_nodes)
     bv2topic = torch.zeros(n_bv, dtype=torch.long)
     bv2term = torch.zeros(n_bv, dtype=torch.long)
@@ -346,20 +339,19 @@ class ActorTopicFactorHead(nn.Module):
         self.topic_bias = nn.Embedding(self.num_topics, 1)
         nn.init.zeros_(self.topic_bias.weight)
 
-        # Learned temperature parameters (not clamped during forward, only regularized)
+        # Learned temperature parameters
         self.infl_scale = nn.Parameter(torch.tensor(1.0))
         self.stance_scale = nn.Parameter(torch.tensor(1.0))
 
     def stance(self, h_actor, topic_ids, term_ids):
         """Compute stance: positive = support, negative = oppose."""
-        r = self.topic_factor(topic_ids)  # [B, R]
-        p = self.actor_to_p(h_actor)  # [B, R]
-        base = (p * r).sum(dim=-1)  # [B]
+        r = self.topic_factor(topic_ids)
+        p = self.actor_to_p(h_actor)
+        base = (p * r).sum(dim=-1)
 
         tb = self.topic_bias(topic_ids).squeeze(-1)
         tr = self.term_bias(term_ids).squeeze(-1)
 
-        # Scale controls sharpness (higher = sharper distinctions)
         scale = F.softplus(self.stance_scale) + 0.1
         return (base + tb + tr) / scale
 
@@ -375,9 +367,9 @@ class ActorTopicFactorHead(nn.Module):
 
     def expected_stance(self, h_actor, topic_probs, term_ids):
         """Expected stance over topic distribution."""
-        p = self.actor_to_p(h_actor)  # [B, R]
-        r = self.topic_factor.weight  # [T, R]
-        z = torch.einsum("br,tr->bt", p, r)  # [B, T]
+        p = self.actor_to_p(h_actor)
+        r = self.topic_factor.weight
+        z = torch.einsum("br,tr->bt", p, r)
         z = z + self.topic_bias.weight.T
         z = z + self.term_bias(term_ids)
         scale = F.softplus(self.stance_scale) + 0.1
@@ -589,14 +581,7 @@ def label_smooth_ce(logits, target, eps=0.05):
 
 
 def vote_direction_loss(model, batch, h, bv2topic_full, bv2term_full, cfg):
-    """Loss for vote direction: -1 (no), 0 (abstain), +1 (yes).
-
-    bill nodes are never present in vote mini-batches because the LinkNeighborLoader
-    samples neighbours by following edges INTO bill_version nodes; the is_version edge
-    (bill_version→bill) is outgoing, so the sampler never walks it.  Topic and term
-    information is resolved via precomputed global lookup arrays indexed by the
-    batch-local bill_version n_id, with no bill nodes required.
-    """
+    """Loss for vote direction: -1 (no), 0 (abstain), +1 (yes)."""
     et = ("legislator_term", "voted_on", "bill_version")
     device = next(model.parameters()).device
 
@@ -604,8 +589,6 @@ def vote_direction_loss(model, batch, h, bv2topic_full, bv2term_full, cfg):
         return torch.tensor(0.0, device=device)
 
     store = batch[et]
-    # LinkNeighborLoader places the supervised edges in edge_label_index / edge_label;
-    # edge_index holds only neighbourhood context edges and is typically empty.
     ei = getattr(store, "edge_label_index", None)
     if ei is None or ei.numel() == 0:
         return torch.tensor(0.0, device=device)
@@ -618,7 +601,7 @@ def vote_direction_loss(model, batch, h, bv2topic_full, bv2term_full, cfg):
     bv = ei[1]
     y = y.long()
 
-    # Resolve topic and term via global bill_version IDs — no bill nodes needed.
+    # Resolve topic and term via global bill_version IDs
     if not hasattr(batch["bill_version"], "n_id"):
         return torch.tensor(0.0, device=device)
     bv_gids = batch["bill_version"].n_id[bv].cpu()
@@ -632,20 +615,13 @@ def vote_direction_loss(model, batch, h, bv2topic_full, bv2term_full, cfg):
 
     # Compute stance
     z = model.head_leg.stance(h_leg, topic_hard, term_ids)
-
-    # Bill lean (absent — bill nodes not in batch)
     lam = None
 
     # Interaction term
     inter = (h_leg * h_bv).sum(dim=-1) / math.sqrt(model.d_model)
-
-    # Context from edge features (not available via LinkNeighborLoader without
-    # edge_label_attr support; ctx_val falls back to zeros inside the head).
     ctx_logits = None
 
-    # 3-class asymmetric vote head.
-    # Stance z and bill lean lam are interpretable latents; the MLP is free to
-    # weight them independently for each class rather than forcing logit_no = -logit_yes.
+    # Stance z and bill lean lam are interpretable latents
     scale = model.rel_scale["vote"]
     lam_val = lam if lam is not None else torch.zeros_like(z)
     ctx_val = (
@@ -921,7 +897,6 @@ def export_actor_topic_tables(model, data, cfg, out_path, device):
             h_exp = h_a.repeat_interleave(num_topics, dim=0)
             t_exp = topic_ids.repeat(bs)
 
-            # Use per-session term ids for legislator_term; zero for actor-level exports.
             if actor_type == "legislator_term" and leg_term_idx_full is not None:
                 node_term_ids = leg_term_idx_full[batch[actor_type].n_id[:bs].cpu()].to(
                     device
@@ -985,8 +960,6 @@ def train(cfg):
     bill_term_idx_full, term_to_idx, term_values = build_term_index(bill_term_raw)
     num_terms = int(len(term_to_idx))
 
-    # Precompute global bill_version → topic/term lookups.
-    # bill nodes never appear in vote mini-batches (the sampler doesn't follow the outgoing is_version edge), so the vote loss resolves these via n_id directly.
     bv2topic_full, bv2term_full = build_bv_lookup_tensors(data, bill_term_idx_full)
 
     vote_edge_dim = infer_edge_dims(
@@ -1084,7 +1057,7 @@ def train(cfg):
                     cfg.topic_ce_weight > 0 or cfg.outcome_weight > 0
                 ) and step % int(cfg.bill_every) == 0
 
-                # --- Vote loss: always runs on its own vote batch ---
+                # Vote loss
                 v_batch, vote_iter = next_batch(vote_iter, vote_loader)
                 v_batch = v_batch.to(dev)
                 vote_et = ("legislator_term", "voted_on", "bill_version")
@@ -1104,7 +1077,7 @@ def train(cfg):
                 losses["smooth"].append(float(ls.item()))
                 losses["reg"].append(float(lr.item()))
 
-                # --- Expenditure loss: runs on its own exp batch ---
+                # Expenditure loss
                 if do_exp:
                     e_batch, exp_iter = next_batch(exp_iter, exp_loader)
                     e_batch = e_batch.to(dev)
@@ -1122,7 +1095,7 @@ def train(cfg):
                     losses["exp_s"].append(float(les.item()))
                     losses["exp_m"].append(float(lem.item()))
 
-                # --- Topic/outcome loss: runs on its own bill batch ---
+                # Topic/outcome loss
                 if do_bill:
                     b_batch, bill_iter = next_batch(bill_iter, bill_loader)
                     b_batch = b_batch.to(dev)
