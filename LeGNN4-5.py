@@ -1,24 +1,13 @@
-import os
-import json
-import math
-import time
-import random
+import os, torch, json, math, time, random
 from dataclasses import dataclass, field
-
 import numpy as np
 import pandas as pd
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader, LinkNeighborLoader
-from torch_geometric.transforms import (
-    RemoveDuplicatedEdges,
-    RemoveIsolatedNodes,
-    ToUndirected,
-)
+from torch_geometric.transforms import RemoveDuplicatedEdges, RemoveIsolatedNodes
 
 
 def set_seed(seed):
@@ -125,6 +114,31 @@ def build_bv2bill(batch):
     return out
 
 
+def build_bv_lookup_tensors(data, bill_term_idx_full):
+    """Precompute per-bill-version topic and term-index arrays indexed by global bill_version ID.
+
+    The vote LinkNeighborLoader samples neighbours by following edges INTO bill_version
+    nodes (legislators, committees, authors).  The is_version edge goes bill_version→bill,
+    so bill nodes are never included in vote batches and build_bv2bill always returns None.
+    Precomputing these arrays lets vote_direction_loss resolve topics and terms directly
+    from the global bill_version ID without bill nodes being present in the mini-batch.
+    """
+    n_bv = int(data["bill_version"].num_nodes)
+    bv2topic = torch.zeros(n_bv, dtype=torch.long)
+    bv2term = torch.zeros(n_bv, dtype=torch.long)
+
+    et = ("bill_version", "is_version", "bill")
+    if et in data.edge_types:
+        ei = data[et].edge_index
+        bv_idx = ei[0]
+        bill_idx = ei[1]
+        bill_topics = get_bill_topic_tensor(data)
+        bv2topic[bv_idx] = bill_topics[bill_idx]
+        bv2term[bv_idx] = bill_term_idx_full[bill_idx]
+
+    return bv2topic, bv2term
+
+
 MONETARY_EDGES = [
     ("donor", "expenditure", "bill"),
     ("donor", "donated_to", "legislator_term"),
@@ -133,11 +147,26 @@ MONETARY_EDGES = [
 ]
 
 
+def _add_reverse_edges_for_isolated_nodes(data):
+    to_reverse = [
+        ("donor", "donated_to", "legislator_term"),
+        ("lobby_firm", "lobbied", "legislator_term"),
+        ("lobby_firm", "lobbied", "committee"),
+    ]
+    for src, rel, dst in to_reverse:
+        et = (src, rel, dst)
+        if et not in data.edge_types:
+            continue
+        store = data[et]
+        ei = store.edge_index
+        rev_et = (dst, f"rev_{rel}", src)
+        data[rev_et].edge_index = torch.stack([ei[1], ei[0]], dim=0)
+        if hasattr(store, "edge_attr") and store.edge_attr is not None:
+            data[rev_et].edge_attr = store.edge_attr.clone()
+
+
 def preprocess_data(data, standardize_x=True, keep_bidir=True):
     data = data.clone()
-    if keep_bidir:
-        data = ToUndirected()(data)
-
     data = RemoveDuplicatedEdges()(data)
     data = RemoveIsolatedNodes()(data)
 
@@ -160,6 +189,9 @@ def preprocess_data(data, standardize_x=True, keep_bidir=True):
                 ea[:, 0] = inflate_to_2024_dollars(amount, year)
 
             store.edge_attr = ea
+
+    if keep_bidir:
+        _add_reverse_edges_for_isolated_nodes(data)
 
     return data
 
@@ -455,7 +487,11 @@ class LegislativeStanceModel(nn.Module):
             }
         )
 
-        self.abstain_bias = nn.Parameter(torch.tensor(0.0))
+        # Asymmetric 3-class vote head.
+        # Input: [z, lam, inter] scaled by rel_scale, plus ctx_logits (3 dims,
+        # zeroed when no vote edge features are present) = 6 dims total.
+        self.vote_head = MLP(6, 2 * d_model, 3, dropout=dropout, norm=True)
+
         self.out_bias = nn.Parameter(torch.tensor(0.0))
         self.amount_sigma = nn.Parameter(torch.tensor(0.6))
 
@@ -552,8 +588,15 @@ def label_smooth_ce(logits, target, eps=0.05):
     return -(true * logp).sum(dim=-1).mean()
 
 
-def vote_direction_loss(model, batch, h, bill_term_idx_full, cfg):
-    """Loss for vote direction: -1 (no), 0 (abstain), +1 (yes)."""
+def vote_direction_loss(model, batch, h, bv2topic_full, bv2term_full, cfg):
+    """Loss for vote direction: -1 (no), 0 (abstain), +1 (yes).
+
+    bill nodes are never present in vote mini-batches because the LinkNeighborLoader
+    samples neighbours by following edges INTO bill_version nodes; the is_version edge
+    (bill_version→bill) is outgoing, so the sampler never walks it.  Topic and term
+    information is resolved via precomputed global lookup arrays indexed by the
+    batch-local bill_version n_id, with no bill nodes required.
+    """
     et = ("legislator_term", "voted_on", "bill_version")
     device = next(model.parameters()).device
 
@@ -561,76 +604,65 @@ def vote_direction_loss(model, batch, h, bill_term_idx_full, cfg):
         return torch.tensor(0.0, device=device)
 
     store = batch[et]
-    ei = store.edge_index
+    # LinkNeighborLoader places the supervised edges in edge_label_index / edge_label;
+    # edge_index holds only neighbourhood context edges and is typically empty.
+    ei = getattr(store, "edge_label_index", None)
     if ei is None or ei.numel() == 0:
         return torch.tensor(0.0, device=device)
 
-    y = store.edge_attr[:, -1]
+    y = getattr(store, "edge_label", None)
+    if y is None:
+        return torch.tensor(0.0, device=device)
+
     leg = ei[0]
     bv = ei[1]
+    y = y.long()
 
-    bv2bill = build_bv2bill(batch)
-    if bv2bill is None:
+    # Resolve topic and term via global bill_version IDs — no bill nodes needed.
+    if not hasattr(batch["bill_version"], "n_id"):
         return torch.tensor(0.0, device=device)
-
-    bill = bv2bill[bv]
-    m = bill >= 0
-    if m.sum().item() == 0:
-        return torch.tensor(0.0, device=device)
-
-    leg, bv, bill, y = leg[m], bv[m], bill[m], y[m].long()
+    bv_gids = batch["bill_version"].n_id[bv].cpu()
+    topic_hard = bv2topic_full[bv_gids].to(device)
+    term_ids = bv2term_full[bv_gids].to(device)
 
     h_leg = h["legislator_term"][leg]
     h_bv = h["bill_version"][bv]
-    h_bill = h.get("bill")
-    h_bill = h_bill[bill] if h_bill is not None else None
-
-    topic_hard = get_bill_topic_tensor(batch)[bill]
-    term_global = batch["bill"].n_id[bill] if hasattr(batch["bill"], "n_id") else None
-    term_ids = (
-        bill_term_idx_full[term_global.cpu()].to(device)
-        if term_global is not None
-        else torch.zeros_like(topic_hard)
-    )
+    # bill nodes are absent from vote batches; lam falls back to zeros downstream
+    h_bill = None
 
     # Compute stance
-    topic_probs = (
-        model._topic_probs(h_bill)
-        if model.use_soft_topics and h_bill is not None
-        else None
-    )
-    if topic_probs is None:
-        z = model.head_leg.stance(h_leg, topic_hard, term_ids)
-    else:
-        z, _ = model.head_leg.expected_stance(h_leg, topic_probs, term_ids)
+    z = model.head_leg.stance(h_leg, topic_hard, term_ids)
 
-    # Bill lean
-    lam = 0.0
-    if h_bill is not None:
-        lam, _ = model.bill_latents(h_bill)
+    # Bill lean (absent — bill nodes not in batch)
+    lam = None
 
     # Interaction term
     inter = (h_leg * h_bv).sum(dim=-1) / math.sqrt(model.d_model)
 
-    # Context from edge features
-    ea = getattr(store, "edge_attr", None)
+    # Context from edge features (not available via LinkNeighborLoader without
+    # edge_label_attr support; ctx_val falls back to zeros inside the head).
     ctx_logits = None
-    if model.vote_ctx is not None and ea is not None and ea.size(0) == ei.size(1):
-        ctx_logits = model.vote_ctx(ea[m])
 
-    # Combine signals
-    base = model.rel_scale["vote"] * (z + 0.5 * lam + inter)
-    logit_no = -base
-    logit_abs = model.abstain_bias + (
-        ctx_logits[:, 1] if ctx_logits is not None else 0.0
+    # 3-class asymmetric vote head.
+    # Stance z and bill lean lam are interpretable latents; the MLP is free to
+    # weight them independently for each class rather than forcing logit_no = -logit_yes.
+    scale = model.rel_scale["vote"]
+    lam_val = lam if lam is not None else torch.zeros_like(z)
+    ctx_val = (
+        ctx_logits
+        if ctx_logits is not None
+        else torch.zeros(z.size(0), 3, device=z.device)
     )
-    logit_yes = base
-
-    if ctx_logits is not None:
-        logit_no = logit_no + ctx_logits[:, 0]
-        logit_yes = logit_yes + ctx_logits[:, 2]
-
-    logits = torch.stack([logit_no, logit_abs, logit_yes], dim=-1)
+    inp = torch.cat(
+        [
+            scale * z.unsqueeze(-1),
+            scale * lam_val.unsqueeze(-1),
+            scale * inter.unsqueeze(-1),
+            ctx_val,
+        ],
+        dim=-1,
+    )
+    logits = model.vote_head(inp)
     loss = label_smooth_ce(logits, y, eps=float(cfg.vote_label_smooth))
     return loss * float(cfg.vote_dir_weight)
 
@@ -652,7 +684,8 @@ def exp_stance_and_amount_loss(model, batch, h, bill_term_idx_full, cfg):
     if ea is None or ea.numel() == 0:
         return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
-    y = ea[:, -1]
+    # Convert raw stance {-1=oppose, +1=support} to binary {0, 1} for BCE.
+    y = (ea[:, -1] > 0).float()
     donor = ei[0]
     bill = ei[1]
 
@@ -831,7 +864,11 @@ def outcome_aux_loss(model, batch, h, bill_term_idx_full, cfg):
                     w = torch.log1p(amt).clamp(min=0.0, max=float(cfg.out_exp_amt_clip))
                 logits.index_add_(0, idx, float(cfg.out_exp_w) * (z * w))
 
-    loss = F.binary_cross_entropy_with_logits(logits, y)
+    # Reweight positives to compensate for the extreme pass/fail imbalance
+    n_pos = y.sum().clamp(min=1.0)
+    n_neg = (1.0 - y).sum().clamp(min=1.0)
+    pw = (n_neg / n_pos).clamp(max=100.0)
+    loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pw)
     return loss * float(cfg.outcome_weight)
 
 
@@ -850,6 +887,12 @@ def export_actor_topic_tables(model, data, cfg, out_path, device):
     num_topics = int(model.num_topics)
     rows = []
 
+    # Build per-legislator_term term index so each session uses its own learned bias.
+    leg_term_idx_full = None
+    if "legislator_term" in data.node_types:
+        leg_term_raw = data["legislator_term"].x[:, 3].long()  # term_year column
+        leg_term_idx_full, _, _ = build_term_index(leg_term_raw)
+
     def _export_actor(actor_type, head):
         if actor_type not in data.node_types:
             return
@@ -867,7 +910,6 @@ def export_actor_topic_tables(model, data, cfg, out_path, device):
         )
 
         topic_ids = torch.arange(num_topics, device=device)
-        term_ids = torch.zeros_like(topic_ids)
 
         for batch in tqdm(loader, desc=f"export {actor_type}"):
             batch = batch.to(device)
@@ -878,7 +920,15 @@ def export_actor_topic_tables(model, data, cfg, out_path, device):
 
             h_exp = h_a.repeat_interleave(num_topics, dim=0)
             t_exp = topic_ids.repeat(bs)
-            term_exp = term_ids.repeat(bs)
+
+            # Use per-session term ids for legislator_term; zero for actor-level exports.
+            if actor_type == "legislator_term" and leg_term_idx_full is not None:
+                node_term_ids = leg_term_idx_full[batch[actor_type].n_id[:bs].cpu()].to(
+                    device
+                )
+                term_exp = node_term_ids.repeat_interleave(num_topics)
+            else:
+                term_exp = torch.zeros_like(t_exp)
 
             z = head.stance(h_exp, t_exp, term_exp).view(bs, num_topics)
             infl = head.influence(h_exp, t_exp, term_exp).view(bs, num_topics)
@@ -886,12 +936,14 @@ def export_actor_topic_tables(model, data, cfg, out_path, device):
             infl_norm = infl / (infl.sum(dim=1, keepdim=True) + 1e-8)
             impact = z * infl_norm
 
+            z_np = z.cpu().numpy().reshape(-1)
             df = pd.DataFrame(
                 {
                     "actor_type": actor_type,
                     "actor_index": np.repeat(global_ids, num_topics),
                     "topic_id": np.tile(np.arange(num_topics), bs),
-                    "stance": z.cpu().numpy().reshape(-1),
+                    "stance": z_np,
+                    "stance_tanh": np.tanh(z_np),
                     "influence": infl.cpu().numpy().reshape(-1),
                     "influence_norm": infl_norm.cpu().numpy().reshape(-1),
                     "impact": impact.cpu().numpy().reshape(-1),
@@ -932,6 +984,10 @@ def train(cfg):
     bill_term_raw = get_bill_term_tensor(data)
     bill_term_idx_full, term_to_idx, term_values = build_term_index(bill_term_raw)
     num_terms = int(len(term_to_idx))
+
+    # Precompute global bill_version → topic/term lookups.
+    # bill nodes never appear in vote mini-batches (the sampler doesn't follow the outgoing is_version edge), so the vote loss resolves these via n_id directly.
+    bv2topic_full, bv2term_full = build_bv_lookup_tensors(data, bill_term_idx_full)
 
     vote_edge_dim = infer_edge_dims(
         data, ("legislator_term", "voted_on", "bill_version")
@@ -1019,7 +1075,6 @@ def train(cfg):
                 opt.zero_grad(set_to_none=True)
                 total = torch.tensor(0.0, device=dev)
 
-                do_vote = True
                 do_exp = (
                     exp_loader is not None
                     and (cfg.exp_stance_weight > 0 or cfg.exp_amount_weight > 0)
@@ -1029,62 +1084,60 @@ def train(cfg):
                     cfg.topic_ce_weight > 0 or cfg.outcome_weight > 0
                 ) and step % int(cfg.bill_every) == 0
 
-                # Select batch
-                if do_vote:
-                    batch, vote_iter = next_batch(vote_iter, vote_loader)
-                    batch = batch.to(dev)
-                elif do_exp:
-                    batch, exp_iter = next_batch(exp_iter, exp_loader)
-                    batch = batch.to(dev)
-                else:
-                    batch, bill_iter = next_batch(bill_iter, bill_loader)
-                    batch = batch.to(dev)
+                # --- Vote loss: always runs on its own vote batch ---
+                v_batch, vote_iter = next_batch(vote_iter, vote_loader)
+                v_batch = v_batch.to(dev)
+                vote_et = ("legislator_term", "voted_on", "bill_version")
+                h_v = model.encoder(
+                    v_batch,
+                    active_edge_types=(
+                        [vote_et] if vote_et in v_batch.edge_types else []
+                    ),
+                )
+                lv = vote_direction_loss(
+                    model, v_batch, h_v, bv2topic_full, bv2term_full, cfg
+                )
+                ls = version_smooth_loss(model, v_batch, h_v, cfg)
+                lr = regularize_factors(model, cfg)
+                total = total + lv + ls + lr
+                losses["vote"].append(float(lv.item()))
+                losses["smooth"].append(float(ls.item()))
+                losses["reg"].append(float(lr.item()))
 
-                # Select active edge types
-                active = set()
-                if do_vote:
-                    active.add(("legislator_term", "voted_on", "bill_version"))
+                # --- Expenditure loss: runs on its own exp batch ---
                 if do_exp:
-                    active.add(("donor", "expenditure", "bill"))
-                if do_bill:
-                    active.add(("bill_version", "priorVersion", "bill_version"))
-                if not active:
-                    active = set(batch.edge_types)
-
-                h = model.encoder(batch, active_edge_types=active)
-
-                # Compute losses
-                if do_vote:
-                    lv = vote_direction_loss(model, batch, h, bill_term_idx_full, cfg)
-                    ls = version_smooth_loss(model, batch, h, cfg)
-                    lr = regularize_factors(model, cfg)
-                    total = total + lv + ls + lr
-                    losses["vote"].append(float(lv.item()))
-                    losses["smooth"].append(float(ls.item()))
-                    losses["reg"].append(float(lr.item()))
-
-                if do_exp:
-                    les, lem = exp_stance_and_amount_loss(
-                        model, batch, h, bill_term_idx_full, cfg
+                    e_batch, exp_iter = next_batch(exp_iter, exp_loader)
+                    e_batch = e_batch.to(dev)
+                    exp_et = ("donor", "expenditure", "bill")
+                    h_e = model.encoder(
+                        e_batch,
+                        active_edge_types=(
+                            [exp_et] if exp_et in e_batch.edge_types else []
+                        ),
                     )
-                    ls = version_smooth_loss(model, batch, h, cfg)
-                    lr = regularize_factors(model, cfg)
-                    total = total + les + lem + ls + lr
+                    les, lem = exp_stance_and_amount_loss(
+                        model, e_batch, h_e, bill_term_idx_full, cfg
+                    )
+                    total = total + les + lem
                     losses["exp_s"].append(float(les.item()))
                     losses["exp_m"].append(float(lem.item()))
-                    losses["smooth"].append(float(ls.item()))
-                    losses["reg"].append(float(lr.item()))
 
+                # --- Topic/outcome loss: runs on its own bill batch ---
                 if do_bill:
-                    lt = bill_topic_mixture_loss(model, batch, h, cfg)
-                    lo = outcome_aux_loss(model, batch, h, bill_term_idx_full, cfg)
-                    ls = version_smooth_loss(model, batch, h, cfg)
-                    lr = regularize_factors(model, cfg)
-                    total = total + lt + lo + ls + lr
+                    b_batch, bill_iter = next_batch(bill_iter, bill_loader)
+                    b_batch = b_batch.to(dev)
+                    pv_et = ("bill_version", "priorVersion", "bill_version")
+                    h_b = model.encoder(
+                        b_batch,
+                        active_edge_types=(
+                            [pv_et] if pv_et in b_batch.edge_types else []
+                        ),
+                    )
+                    lt = bill_topic_mixture_loss(model, b_batch, h_b, cfg)
+                    lo = outcome_aux_loss(model, b_batch, h_b, bill_term_idx_full, cfg)
+                    total = total + lt + lo
                     losses["topic"].append(float(lt.item()))
                     losses["out"].append(float(lo.item()))
-                    losses["smooth"].append(float(ls.item()))
-                    losses["reg"].append(float(lr.item()))
 
                 if not torch.isfinite(total):
                     continue
@@ -1205,21 +1258,21 @@ class Config:
     standardize_x: bool = True
     use_soft_topics: bool = True
 
-    epochs: int = 15
+    epochs: int = 30
     lr: float = 2e-4
     wd: float = 1e-3
     grad_clip: float = 1.0
     steps_per_epoch: int = 24
 
-    vote_edge_batch_size: int = 6000
+    vote_edge_batch_size: int = 8000
     exp_edge_batch_size: int = 512
     bill_batch_size: int = 1024
     actor_batch_size: int = 512
 
-    num_neighbors_vote: list = field(default_factory=lambda: [14, 7])
-    num_neighbors_exp: list = field(default_factory=lambda: [20, 12])
-    num_neighbors_bill: list = field(default_factory=lambda: [12, 8])
-    num_neighbors_actor_export: list = field(default_factory=lambda: [25, 12])
+    num_neighbors_vote: list = field(default_factory=lambda: [48, 24])
+    num_neighbors_exp: list = field(default_factory=lambda: [32, 12])
+    num_neighbors_bill: list = field(default_factory=lambda: [24, 16])
+    num_neighbors_actor_export: list = field(default_factory=lambda: [36, 16])
 
     vote_target_col: int = -1
     exp_stance_col: int = -1
@@ -1234,7 +1287,7 @@ class Config:
     topic_ce_weight: float = 0.15
     topic_label_smooth: float = 0.05
 
-    version_smooth_weight: float = 0.05
+    version_smooth_weight: float = 0.0
 
     outcome_weight: float = 0.5
     out_lam_w: float = 0.35
@@ -1255,7 +1308,7 @@ class Config:
     bill_every: int = 4
 
     export_after_train: bool = True
-    export_only: bool = False
+    export_only: bool = True
     start_from_ckpt: bool = False
     export_ckpt_name: str = "final.pt"
     export_name: str = "actor_topic.parquet"
